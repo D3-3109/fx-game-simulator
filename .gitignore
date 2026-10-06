@@ -1,0 +1,20 @@
+# Live accounts, balances, tokens and SQLite sidecars
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+fx_state.json
+
+# Administrator secrets, backups, logs and observations
+tiingo_apikeys.txt
+.pi/
+*.log
+.env
+.env.*
+!.env.example
+
+# Python and local machine artifacts
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store

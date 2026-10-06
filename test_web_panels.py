@@ -60,9 +60,33 @@ class WebPanelTests(unittest.TestCase):
         self.assertIn('v4.2.3',self.request('/charts.js')[1],'old HTML lost compatible chart file')
         html=self.request('/')[1]
         self.assertNotIn('<script src="/charts.js">',html)
-        self.assertIn('chart.addSeries(LightweightCharts.CandlestickSeries',html)
-        self.assertIn('https://unpkg.com/lightweight-charts@5.2.1/',html)
+        self.assertIn('<script src="/app.js"></script>',html)
+        app=self.request('/app.js')[1]
+        self.assertIn('chart.addSeries(LightweightCharts.CandlestickSeries',app)
+        self.assertIn('https://unpkg.com/lightweight-charts@5.2.1/',app)
         self.assertEqual(self.request('/assets/../.pi/admin-key.json')[0],404)
+
+    def test_static_allowlist_mime_cache_and_working_directory(self):
+        import os
+        before=os.getcwd()
+        try:
+            os.chdir(tempfile.gettempdir())
+            for url,(_,mime) in web.STATIC_ROUTES.items():
+                with self.subTest(url=url):
+                    req=urllib.request.Request('http://127.0.0.1:%d%s'%(self.server.server_port,url))
+                    with self.opener.open(req,timeout=3) as response:
+                        self.assertEqual(response.headers['Content-Type'],mime)
+                        self.assertTrue(response.read())
+                        if url in ('/','/admin','/app.js','/app.css','/admin.js','/admin.css','/charts.js'):
+                            self.assertEqual(response.headers['Cache-Control'],'no-cache')
+            for url in ('/assets/../.pi/admin-key.json','/assets/%2e%2e/.pi/admin-key.json',
+                        '/%2e%2e/fx_sim.db','/.pi/admin-key.json','/fx_sim.db','/assets/',
+                        '/static/index.html','/admin.html','/%252e%252e/fx_sim.db'):
+                self.assertEqual(self.request(url)[0],404,url)
+            self.assertIn('<link rel="stylesheet" href="/app.css">',self.request('/')[1])
+            self.assertIn('<script src="/admin.js"></script>',self.request('/admin')[1])
+        finally:
+            os.chdir(before)
 
     def test_symbol_whitelist_auth_providers_validation_persistence_and_audit(self):
         defaults=self.request('/api/symbols',token='invalid')[1]

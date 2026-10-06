@@ -1,49 +1,4 @@
-<!doctype html>
-<html lang="zh">
-<head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>FXSIM · 管理员</title>
-<style>
-@font-face{font-family:'Noto Sans';font-style:normal;font-weight:100 900;font-display:swap;src:url('/assets/noto-sans-latin.woff2') format('woff2')}
-body{margin:0;background:#0e1117;color:#d1d5db;font:14px/1.6 'Noto Sans','Noto Sans SC',system-ui,sans-serif;font-variant-numeric:tabular-nums}
-main{max-width:1100px;margin:auto;padding:24px}h1{font-size:22px}h2{font-size:16px}
-section{background:#161b22;border:1px solid #273040;border-radius:8px;padding:20px;margin-bottom:20px}
-input,select,button{font:inherit;background:#1f2937;color:#eee;border:1px solid #475569;border-radius:5px;padding:8px;max-width:100%;box-sizing:border-box}
-button{cursor:pointer}button:disabled{opacity:.5;cursor:wait}.danger{color:#f87171;border-color:#f87171}
-label{display:inline-block;margin:4px 12px 4px 0}table{border-collapse:collapse;width:100%;white-space:nowrap}
-th,td{text-align:left;padding:8px;border-bottom:1px solid #273040}th{color:#94a3b8;font-weight:normal}
-.scroll{overflow:auto}[hidden]{display:none!important}#message{white-space:pre-wrap;color:#fbbf24;min-height:24px}.muted{color:#94a3b8}
-a{color:#60a5fa}.toolbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.toolbar h1{flex:1}
-@media(max-width:600px){main{padding:12px}section{padding:12px}label{display:block}}
-</style>
-</head>
-<body><main>
-<div class="toolbar"><h1>FXSIM 管理员</h1><a href="/">返回交易</a><button id="logout" hidden>退出管理</button></div>
-<p class="muted">仅操作模拟资金，无真实支付。HTTP 未加密，请仅在本机或可信 VPN 网络使用。</p>
-<div id="message" role="status" aria-live="polite"></div>
-<section id="login">
- <h2>管理员登录</h2>
- <form id="login-form"><label>PSK <input id="psk" type="password" autocomplete="off" required maxlength="256"></label><button id="login-button">登录</button></form>
-</section>
-<div id="panel" hidden>
- <section>
-  <h2>模拟余额充值 · USD</h2>
-  <form id="fund-form"><label>目标账号 <select id="target" required></select></label>
-   <label>金额（美元） <input id="amount" type="number" min="0.01" max="1000000000" step="0.01" value="1000.00" required></label>
-   <button id="fund-button">确认充值</button></form>
-  <p class="muted">充值不会计为交易盈利；排行榜收益以初始资金＋累计充值为基数。单次最多 $1000000000.00。</p>
- </section>
- <section><h2>币种白名单</h2>
-  <p class="muted">关闭后禁止新开仓；已有持仓仍可平仓、强平。Provider 为数据源策略，外汇主源失败会使用备用源。</p>
-  <div class="scroll"><table><thead><tr><th>币种对</th><th>Provider</th><th>启用</th></tr></thead><tbody id="symbols"></tbody></table></div>
- </section>
- <section><div class="toolbar"><h2>账号管理</h2><button id="refresh">刷新</button></div>
-  <p class="muted">删除不可恢复：余额、持仓、登录态、该账号的成交和聊天记录一并删除；管理员审计保留。</p>
-  <div class="scroll"><table><thead><tr><th>账号</th><th>余额</th><th>累计充值</th><th>持仓数</th><th>操作</th></tr></thead><tbody id="users"></tbody></table></div>
- </section>
- <section><h2>管理员审计 · 最近100条</h2><div class="scroll"><table><thead><tr><th>时间</th><th>操作</th><th>账号</th><th>金额</th><th>操作后余额 / 删除前余额</th><th>操作者</th></tr></thead><tbody id="audit"></tbody></table></div></section>
-</div>
-<script>
+
 const $=id=>document.getElementById(id);
 const money=n=>`${n<0?'-':''}$${Math.abs(n).toFixed(2)}`;
 let token=sessionStorage.fx_admin_token||'',busy=false,pendingFunding=null;
@@ -118,4 +73,3 @@ async function deleteUser(name){
 $('refresh').onclick=()=>refresh().catch(error=>notice(error.message));
 $('logout').onclick=async()=>{try{await call('logout',{})}finally{token='';sessionStorage.removeItem('fx_admin_token');view()}};
 view();if(token)refresh().catch(error=>notice(error.message));
-</script></main></body></html>

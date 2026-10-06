@@ -1,6 +1,6 @@
 # rewrite-rust 计划
 
-状态：仅完成代码盘点与计划；未开分支、未创建 Cargo 项目、未抽离资源、未更改服务或运行数据。
+状态：基线 `2c7a210`，分支 `rewrite-rust`。阶段 1 静态抽离已完成：app/admin CSS/JS 与基线逐字节一致；Python 53 项测试及 Node 图表回归通过（`.pi/static-tests.log`）。继续 Rust 实现；真实服务、数据库及密钥保持不动。
 
 ## 目标与范围
 
@@ -13,7 +13,7 @@
 
 ## 已核查的现状
 
-- Git 当前为 `main`，但尚无首个 commit，项目文件均未跟踪。必须先保存源码基线，才有可靠回滚点。
+- 已在 `main` 保存基线 `2c7a210`，当前开发分支为 `rewrite-rust`，可从基线恢复旧实现。
 - `.gitignore` 已排除数据库及 sidecar、`fx_state.json`、`.pi/`、环境变量文件等。提交前仍需检查 staged diff，不能提交真实账号、token、管理员密钥或备份。
 - `fx_sim_web.py`：HTTP、WS、行情、SQLite、账号、管理员功能，以及 `INDEX` 内嵌的 HTML/CSS/JS。
 - `fx_sim.py`：交易计算、USD 换算、点差、保证金、强平，以及旧 CLI。
@@ -21,7 +21,7 @@
 - `assets/`：Lightweight Charts 5.2.1 本地兜底、字体及许可证；根目录 `charts.js` 为旧 4.2.3 兼容路由，不能当废文件直接删。
 - 当前回归：`test_fx_sim.py`、`test_currency.py`、`test_stopout.py`、`test_web_panels.py`、`test_chart.js`。
 - 部分测试直接解析 `web.INDEX`，或在首页 HTML 中查 JS；资源抽离时必须改为读取真实外部 JS，不能删除这些断言。
-- 本机已有 Cargo、rustc 和 Node。本轮未执行回归，不能把已有测试视为已通过。
+- 本机已有 Cargo、rustc 和 Node。基线回归已执行：52 tests，0 failures；后续每阶段重新验证。
 
 ## 阶段 0：建立基线与隔离边界
 
@@ -179,4 +179,4 @@ cargo new fx-sim-rust --vcs none
 
 ## 下一步
 
-本计划确认后，从阶段 0 开始，随后只完成阶段 1：建立回退基线、开 `rewrite-rust`、抽离静态资源并验证 Python。该阶段通过再创建和推进 Rust 后端。
+用户已确认完整重写、自主测试与提交目标：继续阶段 1–5 和阶段 6 的隔离验收，不再停在静态资源阶段。最终生产切换、根目录搬迁和旧实现删除仍另行确认。FX provider 不变；biquote 取最新活动 K 线 close（修复 `bars[-1]` 旧价），不宣称逐笔实时。

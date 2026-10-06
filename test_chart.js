@@ -1,4 +1,4 @@
-// Run through test_fx_sim.py: embedded browser script arrives on stdin.
+// Run through test_fx_sim.py, or: node test_chart.js < static/app.js
 const assert = require('node:assert/strict');
 const vm = require('node:vm');
 const script = require('node:fs').readFileSync(0, 'utf8');

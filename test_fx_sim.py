@@ -170,7 +170,7 @@ class CrossSymbolTests(unittest.TestCase):
 class ChartTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('node'), 'Node required for browser-script regressions')
     def test_switch_resets_scale_without_resetting_periodic_zoom(self):
-        script = web.INDEX.split('<script>')[1].split('</script>')[0]
+        script = (web.STATIC_DIR / 'app.js').read_text()
         result = subprocess.run(['node', str(Path(__file__).with_name('test_chart.js'))],
                                 input=script, text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -178,7 +178,7 @@ class ChartTests(unittest.TestCase):
 
 class SimFeedTests(unittest.TestCase):
     def test_selectable_sim_symbol(self):
-        options = next(line for line in web.INDEX.splitlines() if 'symSel.add(new Option' in line)
+        options = next(line for line in (web.STATIC_DIR / 'app.js').read_text().splitlines() if 'symSel.add(new Option' in line)
         self.assertIn('FXSIM', options.split("'")[1].split())
         self.assertIn('模拟币', options)
 

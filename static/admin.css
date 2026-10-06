@@ -1,0 +1,12 @@
+
+@font-face{font-family:'Noto Sans';font-style:normal;font-weight:100 900;font-display:swap;src:url('/assets/noto-sans-latin.woff2') format('woff2')}
+body{margin:0;background:#0e1117;color:#d1d5db;font:14px/1.6 'Noto Sans','Noto Sans SC',system-ui,sans-serif;font-variant-numeric:tabular-nums}
+main{max-width:1100px;margin:auto;padding:24px}h1{font-size:22px}h2{font-size:16px}
+section{background:#161b22;border:1px solid #273040;border-radius:8px;padding:20px;margin-bottom:20px}
+input,select,button{font:inherit;background:#1f2937;color:#eee;border:1px solid #475569;border-radius:5px;padding:8px;max-width:100%;box-sizing:border-box}
+button{cursor:pointer}button:disabled{opacity:.5;cursor:wait}.danger{color:#f87171;border-color:#f87171}
+label{display:inline-block;margin:4px 12px 4px 0}table{border-collapse:collapse;width:100%;white-space:nowrap}
+th,td{text-align:left;padding:8px;border-bottom:1px solid #273040}th{color:#94a3b8;font-weight:normal}
+.scroll{overflow:auto}[hidden]{display:none!important}#message{white-space:pre-wrap;color:#fbbf24;min-height:24px}.muted{color:#94a3b8}
+a{color:#60a5fa}.toolbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.toolbar h1{flex:1}
+@media(max-width:600px){main{padding:12px}section{padding:12px}label{display:block}}

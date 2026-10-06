@@ -1,6 +1,6 @@
 # rewrite-rust 计划
 
-状态：基线 `2c7a210`，分支 `rewrite-rust`。阶段 1 已提交 `decdc46`：app/admin CSS/JS 与基线逐字节一致；Python 53 项测试及 Node 图表回归通过（`.pi/static-tests.log`）。Rust 单 crate 已建立，SQLx 存储与交易核心、基础静态服务完成：12 单元测试 + 1 差分测试（18 固定行情场景）通过，含并发强平、事务失败回滚、充值幂等、重启、Python↔Rust 互读；fmt/clippy 通过（`.pi/rust-core-tests.log`）。正在补齐 HTTP/WS 与行情，尚不可替换生产；真实服务、数据库及密钥保持不动。
+状态：基线 `2c7a210`，分支 `rewrite-rust`。阶段 1 静态抽离 `decdc46`、Rust 核心 `653d710`；阶段 2–5 已实现。最终自动门禁：54 Python、Node 图表回归、25 Rust 测试、37 HTTP + 7 WS 双后端配对、真实进程重启与双向互读、fmt/clippy 均通过；外部行情 smoke 独立通过。浏览器 13 项脚本检查与截图通过，但 macOS 锁屏导致前台物理拖动复核尚未完成，不宣称阶段 6 全部验收。启动与证据见 [Rust README](fx-sim-rust/README.md)、[验收记录](fx-sim-rust/ACCEPTANCE.md)。真实服务、数据库及密钥保持不动，生产切换仍未执行。
 
 ## 目标与范围
 
@@ -15,12 +15,12 @@
 
 - 已在 `main` 保存基线 `2c7a210`，当前开发分支为 `rewrite-rust`，可从基线恢复旧实现。
 - `.gitignore` 已排除数据库及 sidecar、`fx_state.json`、`.pi/`、环境变量文件等。提交前仍需检查 staged diff，不能提交真实账号、token、管理员密钥或备份。
-- `fx_sim_web.py`：HTTP、WS、行情、SQLite、账号、管理员功能，以及 `INDEX` 内嵌的 HTML/CSS/JS。
+- `fx_sim_web.py`：Python 参照后端；原 `INDEX` 已抽离到 `static/index.html`、`app.css`、`app.js`。
 - `fx_sim.py`：交易计算、USD 换算、点差、保证金、强平，以及旧 CLI。
-- `admin.html`：管理员页面，CSS/JS 也内嵌，需一起抽离。
-- `assets/`：Lightweight Charts 5.2.1 本地兜底、字体及许可证；根目录 `charts.js` 为旧 4.2.3 兼容路由，不能当废文件直接删。
+- 管理员页面已抽到 `static/admin.html`、`admin.css`、`admin.js`。
+- `static/assets/`：Lightweight Charts 5.2.1 本地兜底、字体及许可证；`static/charts.js` 保留旧 4.2.3 兼容 URL。
 - 当前回归：`test_fx_sim.py`、`test_currency.py`、`test_stopout.py`、`test_web_panels.py`、`test_chart.js`。
-- 部分测试直接解析 `web.INDEX`，或在首页 HTML 中查 JS；资源抽离时必须改为读取真实外部 JS，不能删除这些断言。
+- 原解析 `web.INDEX` 的测试已改为读取实际外部 JS，原断言保留；新增静态路由安全及 biquote 最新价回归。
 - 本机已有 Cargo、rustc 和 Node。基线回归已执行：52 tests，0 failures；后续每阶段重新验证。
 
 ## 阶段 0：建立基线与隔离边界
@@ -179,4 +179,4 @@ cargo new fx-sim-rust --vcs none
 
 ## 下一步
 
-用户已确认完整重写、自主测试与提交目标：继续阶段 1–5 和阶段 6 的隔离验收，不再停在静态资源阶段。最终生产切换、根目录搬迁和旧实现删除仍另行确认。FX provider 不变；biquote 取最新活动 K 线 close（修复 `bars[-1]` 旧价），不宣称逐笔实时。
+实现及可自动执行的隔离验收已完成，代码/测试/启动说明/验收记录提交在 `rewrite-rust`。剩余非破坏性验收：解锁 macOS 后，仅在独立测试页补前台真实拖动复核；锁屏限制及已有替代证据如实保留于验收记录。最终生产切换、根目录搬迁和旧实现删除仍另行确认。FX provider 不变；biquote 已按最新活动 K 线 close 取价，不宣称逐笔实时。

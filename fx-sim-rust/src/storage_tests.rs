@@ -28,6 +28,15 @@ async fn trade_failure_rolls_back_account_and_history_and_restart_recovers() {
             .await
             .is_err()
     );
+    let next_id = s.next_id.load(Ordering::SeqCst);
+    assert!(
+        s.transaction("player", |a, _, id| {
+            Ok(vec![a.open("long", 0.1, "FXSIM", &quotes(), id, 2)?])
+        })
+        .await
+        .is_err()
+    );
+    assert_eq!(s.next_id.load(Ordering::SeqCst), next_id);
     assert_eq!(s.user("player").await.unwrap().account, before.account);
     assert_eq!(s.history("player").await.unwrap().len(), 1);
     s.close().await;

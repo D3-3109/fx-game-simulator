@@ -1,0 +1,161 @@
+//! Shared upstream tasks, independent of the number of frontend sockets.
+#[cfg(test)]
+#[path = "runtime_tests.rs"]
+mod tests;
+use crate::{app::App, storage::now_ms, symbols};
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{Value, json};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use tokio::{task::JoinSet, time::sleep};
+
+pub fn start(app: Arc<App>) -> JoinSet<()> {
+    let mut tasks = JoinSet::new();
+    let a = app.clone();
+    tasks.spawn(async move {
+        loop {
+            sleep(Duration::from_secs(5)).await;
+            if let Ok(mut value) = a.leaderboard().await {
+                value["type"] = json!("lb");
+                value.as_object_mut().unwrap().remove("ok");
+                a.broadcast(value);
+            }
+        }
+    });
+    let a = app.clone();
+    tasks.spawn(async move {
+        loop {
+            if let Ok(symbols) = a.risk_symbols().await {
+                for symbol in symbols {
+                    let _ = a.market.price(&symbol).await;
+                    if let Some(q) = a.market.snapshot().await.get(&symbol)
+                        && a.market.on_quote(&symbol, q.price, q.at).await.is_err()
+                    {
+                        eprintln!("[risk] quote/settlement failed; will retry");
+                    }
+                }
+            }
+            sleep(Duration::from_secs(2)).await;
+        }
+    });
+    if !app.market.is_offline() {
+        let a = app.clone();
+        tasks.spawn(async move {
+            loop {
+                match a.market.tick_sim().await {
+                    Ok(packet) => a.broadcast(packet),
+                    Err(_) => eprintln!("[sim] tick persistence/settlement failed; will retry"),
+                }
+                sleep(Duration::from_millis(200)).await;
+            }
+        });
+        let a = app.clone();
+        tasks.spawn(async move {
+            yahoo_loop(a).await;
+        });
+        tasks.spawn(async move {
+            binance_loop(app, "wss://data-stream.binance.vision").await;
+        });
+    }
+    tasks
+}
+
+async fn yahoo_loop(app: Arc<App>) {
+    let mut last = std::collections::BTreeMap::new();
+    loop {
+        sleep(Duration::from_secs(2)).await;
+        let mut wanted = BTreeSet::new();
+        for name in app.online() {
+            if let Ok(u) = app.store.user(&name).await {
+                wanted.insert(u.symbol);
+                wanted.extend(u.account.positions.into_iter().map(|p| p.symbol));
+            }
+        }
+        for symbol in wanted
+            .into_iter()
+            .filter(|s| symbols::FX.contains(&s.as_str()))
+        {
+            if let Ok(price) = app.market.yahoo_price(&symbol).await
+                && last.get(&symbol) != Some(&price)
+            {
+                last.insert(symbol.clone(), price);
+                if app
+                    .market
+                    .on_quote(&symbol, price, now_ms())
+                    .await
+                    .unwrap_or(false)
+                {
+                    app.broadcast(json!({"sym":symbol,"price":price}));
+                }
+            }
+        }
+    }
+}
+
+pub fn binance_stream(symbols: impl IntoIterator<Item = String>) -> Option<String> {
+    let wanted: BTreeSet<_> = symbols
+        .into_iter()
+        .filter(|s| crate::symbols::CRYPTO.contains(&s.as_str()))
+        .map(|s| format!("{}@miniTicker", s.to_lowercase()))
+        .collect();
+    if wanted.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "wss://data-stream.binance.vision/stream?streams={}",
+            wanted.into_iter().collect::<Vec<_>>().join("/")
+        ))
+    }
+}
+async fn binance_loop(app: Arc<App>, endpoint: &str) {
+    loop {
+        let Some(url) = binance_stream(app.active_symbols().await.unwrap_or_default()) else {
+            sleep(Duration::from_secs(1)).await;
+            continue;
+        };
+        // Matches the Python upstream's direct TLS connection; REST clients honor FX_PROXY/environment.
+        let connected = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio_tungstenite::connect_async(url.replacen(
+                "wss://data-stream.binance.vision",
+                endpoint,
+                1,
+            )),
+        )
+        .await;
+        let Ok(Ok((mut socket, _))) = connected else {
+            sleep(Duration::from_secs(3)).await;
+            continue;
+        };
+        let mut subscriptions = tokio::time::interval(Duration::from_secs(1));
+        let idle = tokio::time::sleep(Duration::from_secs(30));
+        tokio::pin!(idle);
+        loop {
+            tokio::select! {
+                _=&mut idle=>break,
+                _=subscriptions.tick()=> {
+                    if binance_stream(app.active_symbols().await.unwrap_or_default()).as_ref()!=Some(&url) {break;}
+                },
+                message=socket.next()=> {
+                    idle.as_mut().reset(tokio::time::Instant::now()+Duration::from_secs(30));
+                    match message {
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))=> {
+                            if let Ok(d)=serde_json::from_str::<Value>(&text) {
+                                let d=&d["data"];
+                                if let (Some(symbol),Some(price))=(d["s"].as_str(),d["c"].as_str().and_then(|s|s.parse::<f64>().ok()))
+                                    && symbols::CRYPTO.contains(&symbol) && app.market.on_quote(symbol,price,now_ms()).await.unwrap_or(false) {app.broadcast(json!({"sym":symbol,"price":price}));}
+                            }
+                        },
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(_)))=> {
+                            // tungstenite queues the RFC-required pong with the identical payload.
+                            if socket.flush().await.is_err() {break;}
+                        },
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))|None|Some(Err(_))=>break,
+                        _=>{},
+                    }
+                }
+            }
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(2), socket.close(None)).await;
+        sleep(Duration::from_secs(2)).await;
+    }
+}

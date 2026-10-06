@@ -234,7 +234,9 @@ def biquote_klines(symbol, interval, limit):
 
 def biquote_price(symbol):
     bars = _biquote_get(f"{symbol}/ohlc?interval=1m&limit=1")["bars"]
-    return float(bars[-1]["close"]) if bars else None
+    # limit=1 may include the previous closed bar; ordering is not a freshness contract.
+    latest = max(bars, key=lambda b: _dt.datetime.fromisoformat(b['openTime'].replace('Z', '+00:00')), default=None)
+    return float(latest['close']) if latest else None
 
 
 import os

@@ -197,10 +197,7 @@ impl Store {
         let mut user = load_user(&mut tx, name).await?;
         let id = self.next_id.load(Ordering::SeqCst);
         let trades = operation(&mut user.account, &mut user.symbol, id)?;
-        if trades.iter().any(|t| t.kind == "open") {
-            self.next_id
-                .fetch_max(user.account.next_id, Ordering::SeqCst);
-        }
+        let opened = trades.iter().any(|t| t.kind == "open");
         user.account.validate()?;
         // Re-check enabled status inside the same transaction for all new positions/selection changes.
         for t in &trades {
@@ -219,6 +216,20 @@ impl Store {
         for trade in trades {
             insert_trade(&mut tx, name, &trade).await?;
         }
+        tx.commit().await?;
+        if opened {
+            self.next_id
+                .fetch_max(user.account.next_id, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+    pub async fn select_symbol(&self, name: &str, symbol: &str) -> Result<()> {
+        let _guard = self.gate.lock().await;
+        let mut tx = self.pool.begin().await?;
+        require_tradable(&mut tx, symbol).await?;
+        let mut user = load_user(&mut tx, name).await?;
+        user.symbol = symbol.into();
+        persist(&mut tx, &user).await?;
         tx.commit().await?;
         Ok(())
     }

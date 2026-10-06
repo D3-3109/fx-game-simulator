@@ -1,6 +1,6 @@
 use clap::Parser;
-use fx_sim_rust::{storage::Store, web};
-use std::{net::SocketAddr, path::PathBuf};
+use fx_sim_rust::{api, app::App, market::Market, runtime, storage::Store, web};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 #[derive(Parser)]
 #[command(about = "FX simulator — explicit isolated paths required")]
@@ -20,15 +20,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let static_dir = web::validate_static(&args.static_dir).await?;
     // Validate configuration without logging its contents.
-    let _: serde_json::Value = serde_json::from_slice(&tokio::fs::read(&args.admin_key).await?)?;
-    let store = Store::open(&args.db).await?;
+    let config: serde_json::Value =
+        serde_json::from_slice(&tokio::fs::read(&args.admin_key).await?)?;
+    for (key, length) in [("salt", None), ("hash", Some(32))] {
+        let bytes = hex::decode(
+            config[key]
+                .as_str()
+                .ok_or("invalid administrator configuration")?,
+        )?;
+        if bytes.is_empty() || length.is_some_and(|n| bytes.len() != n) {
+            return Err("invalid administrator configuration".into());
+        }
+    }
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
+    let store = Arc::new(Store::open(&args.db).await?);
+    let market = Arc::new(
+        Market::new(store.clone())
+            .await
+            .map_err(std::io::Error::other)?,
+    );
+    let app = Arc::new(App::new(store.clone(), market, args.admin_key));
+    let mut tasks = runtime::start(app.clone());
     eprintln!("FX Rust listening on http://{}", listener.local_addr()?);
-    axum::serve(listener, web::static_router(static_dir))
-        .with_graceful_shutdown(async {
+    axum::serve(listener, api::router(app.clone(), static_dir))
+        .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
+            app.shutdown();
         })
         .await?;
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
     store.close().await;
     Ok(())
 }

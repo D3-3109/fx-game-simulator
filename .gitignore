@@ -19,6 +19,11 @@ __pycache__/
 .venv/
 .DS_Store
 
+# Generated compatibility bridges for the already-running pre-extraction Python process
+/admin.html
+/assets
+/charts.js
+
 # Rust build output
 /target/
 /fx-sim-rust/target/

@@ -176,6 +176,20 @@ class ChartTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
+class ProviderTests(unittest.TestCase):
+    def test_biquote_uses_latest_live_close_not_last_array_item(self):
+        old = {'openTime': '2026-10-06T19:29:00Z', 'close': 150.02, 'isOpen': False}
+        live = {'openTime': '2026-10-06T19:30:00Z', 'close': 150.24, 'isOpen': True}
+        for bars in ([live, old], [old, live]):
+            with patch.object(web, '_biquote_get', return_value={'bars': bars}):
+                self.assertEqual(web.biquote_price('USDJPY'), 150.24)
+        live['close'] = 150.28
+        with patch.object(web, '_biquote_get', return_value={'bars': [live, old]}):
+            self.assertEqual(web.biquote_price('USDJPY'), 150.28)
+        with patch.object(web, '_biquote_get', return_value={'bars': []}):
+            self.assertIsNone(web.biquote_price('USDJPY'))
+
+
 class SimFeedTests(unittest.TestCase):
     def test_selectable_sim_symbol(self):
         options = next(line for line in (web.STATIC_DIR / 'app.js').read_text().splitlines() if 'symSel.add(new Option' in line)

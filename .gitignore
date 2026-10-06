@@ -18,3 +18,7 @@ __pycache__/
 *.py[cod]
 .venv/
 .DS_Store
+
+# Rust build output
+/target/
+/fx-sim-rust/target/

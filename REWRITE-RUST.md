@@ -1,6 +1,6 @@
 # rewrite-rust 计划
 
-状态：基线 `2c7a210`，分支 `rewrite-rust`。阶段 1 静态抽离已完成：app/admin CSS/JS 与基线逐字节一致；Python 53 项测试及 Node 图表回归通过（`.pi/static-tests.log`）。继续 Rust 实现；真实服务、数据库及密钥保持不动。
+状态：基线 `2c7a210`，分支 `rewrite-rust`。阶段 1 已提交 `decdc46`：app/admin CSS/JS 与基线逐字节一致；Python 53 项测试及 Node 图表回归通过（`.pi/static-tests.log`）。Rust 单 crate 已建立，SQLx 存储与交易核心、基础静态服务完成：12 单元测试 + 1 差分测试（18 固定行情场景）通过，含并发强平、事务失败回滚、充值幂等、重启、Python↔Rust 互读；fmt/clippy 通过（`.pi/rust-core-tests.log`）。正在补齐 HTTP/WS 与行情，尚不可替换生产；真实服务、数据库及密钥保持不动。
 
 ## 目标与范围
 

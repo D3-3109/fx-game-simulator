@@ -1,14 +1,14 @@
 # FX simulator — Rust Web backend
 
-Axum/Tokio + SQLx SQLite. 单 crate，直接使用 `../static/`，无需前端构建。
-Python Web / CLI / Tk GUI 保留作为兼容参照；**未切换原服务，也未搬到仓库根目录**。
+Axum/Tokio + SQLx SQLite。单 crate，使用同目录 `static/`，无需前端构建。
+原 Python Web/CLI/GUI 实现已在切换后删除（见 git 历史与 [ACCEPTANCE.md](ACCEPTANCE.md)）。
 
 ## 独立启动
 
 在仓库根目录运行（已验证 Rust 1.98.1）：
 
 ```sh
-cargo build --locked --manifest-path Cargo.toml
+cargo build --locked
 mkdir -p .pi/rust-dev
 ```
 
@@ -28,8 +28,8 @@ with os.fdopen(fd, 'w') as f:
     json.dump(config, f)
 PY
 
-./target/debug/fx-sim-rust \\
-  --listen 127.0.0.1:8001 \\
+./target/debug/fx-sim-rust \
+  --listen 127.0.0.1:8001 \
   --db "$PWD/.pi/rust-dev/test.db" \\
   --static-dir "$PWD/static" \\
   --admin-key "$PWD/.pi/rust-dev/admin.json"
@@ -37,24 +37,19 @@ PY
 
 打开 `http://127.0.0.1:8001`，注册测试用户；管理员页面 `/admin`。Ctrl+C 关闭连接、后台任务与数据库。静态目录、数据库、管理员文件均为显式参数，支持任意工作目录；默认监听回环 8001。目录须预先存在。
 
-**不要将 Python 和 Rust 指向同一个可写数据库。** Python 有内存账户状态，双写会覆盖交易。切换原 8000 服务、真实数据库或旧文件清理必须单独确认，见 [计划](REWRITE-RUST.md)。账户 token 存在浏览器 origin 下，换端口不会自动继承旧登录。
+生产数据库 `fx_sim.db` 与管理员配置 `.pi/admin-key.json` 已由 Rust 服务直接使用；不要同时再启动旧 Python 进程写同一库。账户 token 存在浏览器 origin 下，换端口不会自动继承旧登录。
 
 ## 验证
 
-需要 Node、Python 3.11+；网络无关的 Python/Rust 黑盒 WS 测试另需 `websockets>=15`（可在独立 venv 安装）。普通 Python 后端无第三方依赖。
-
-从仓库根目录执行：
+需要 Node（前端图表回归）。从仓库根目录执行：
 
 ```sh
-python3 -B -m unittest -v test_fx_sim test_currency test_stopout test_web_panels
 node test_chart.js < static/app.js
-cargo fmt --manifest-path Cargo.toml --check
-cargo clippy --locked --manifest-path Cargo.toml --all-targets -- -D warnings
-cargo test --locked --manifest-path Cargo.toml
-cargo build --locked --manifest-path Cargo.toml
-cargo build --locked --manifest-path Cargo.toml --example fixture_server
-python3 -B tests/blackbox_contract.py
-python3 -B tests/process_restart.py
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo build --locked
+cargo build --locked --example fixture_server
 ```
 
 所有测试使用临时数据库/回环临时端口/测试管理员配置，不读取真实用户数据或 Tiingo key。`fixture_server` 是测试工具，不是生产入口。
@@ -62,7 +57,7 @@ python3 -B tests/process_restart.py
 外部行情 smoke test **单独**执行，不能用网络故障替代确定性回归结论：
 
 ```sh
-cargo run --locked --manifest-path Cargo.toml --example market_smoke
+cargo run --locked --example market_smoke
 ```
 
 最新验收记录见 [ACCEPTANCE.md](ACCEPTANCE.md)。
@@ -70,7 +65,7 @@ cargo run --locked --manifest-path Cargo.toml --example market_smoke
 ## 兼容与边界
 
 - FX 保留 biquote 主源、Yahoo fallback 与后台轮询；Binance 共享上游 WS 广播，不是每个浏览器一条上游。FXSIM 本地真实 tick 聚合。
-- biquote `limit=1` 可能返回两根，按最大 `openTime` 取最新活动根的 `close`，不是 `bars[-1]`；Python 参照同步修复。它是分钟 OHLC 内持续更新的近实时价格，不保证逐笔/毫秒实时。
+- biquote `limit=1` 可能返回两根，按最大 `openTime` 取最新活动根的 `close`，不是 `bars[-1]`。它是分钟 OHLC 内持续更新的近实时价格，不保证逐笔/毫秒实时。
 - 保留 8 秒取价缓存及取价失败时旧缓存回退；自动风险检查拒用超过 30 秒的缓存或缺少 USD 换算价。刷新时间是本机收取时间，不是上游逐笔时间；未新增固定延迟。
 - REST 遵循 `FX_PROXY` / HTTPS/HTTP 代理环境；Binance WS 与原 Python 一样直连 TLS。不要把含凭据的代理 URL 打入日志。
 - `storage.rs` 独占 SQL 和完整业务事务。SQLite 单连接 + 全局写锁保证当前单进程模型的原子性；没有多实例写入或吞吐保证，也没有预建通用数据库框架。

@@ -202,30 +202,35 @@ async fn chat_retention_rate_limit_and_five_minute_deposit_adjustment() {
 }
 
 #[tokio::test]
-async fn python_schema_accounts_tokens_and_legacy_currency_survive_both_directions() {
+async fn python_era_schema_accounts_tokens_and_legacy_currency_survive_restart() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("compat.db");
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let script = r#"
-import sys,sqlite3,json
-import fx_sim_web as w
-w.DB_FILE=sys.argv[1]
-token=w.register_user('旧用户','兼容密码')
-a=w.user_state('旧用户')['account']
-a.open('long',.1,{'USDJPY':150},symbol='USDJPY')
-w.persist_user('旧用户')
-db=sqlite3.connect(w.DB_FILE)
-db.execute('ALTER TABLE trades DROP COLUMN currency');db.commit();db.close()
-"#;
-    assert!(
-        std::process::Command::new("python3")
-            .args(["-B", "-c", script, path.to_str().unwrap()])
-            .current_dir(root)
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
+    let path = dir.path().join("legacy.db");
+    let s = Store::open(&path).await.unwrap();
+    // Python-era rows: space-formatted account JSON and a trade written before
+    // the currency column existed.
+    let account = json!({"balance": 10000.0, "leverage": 100, "next_id": 2,
+        "positions": [{"id": 1, "side": "long", "lots": 0.1, "entry": 150.01, "symbol": "USDJPY"}]});
+    sqlx::query(
+        "INSERT INTO users(name,salt,hash,token,symbol,account,created) VALUES(?,?,?,?,?,?,'2026')",
+    )
+    .bind("旧用户")
+    .bind("unitsalt")
+    .bind(password_hash("unitsalt", "兼容密码"))
+    .bind("legacy-token-0001")
+    .bind("USDJPY")
+    .bind(serde_json::to_string(&account).unwrap())
+    .execute(&mut *s.pool.acquire().await.unwrap())
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO trades(name,time,kind,position_id,symbol,side,lots,entry,price,pnl,balance,margin_level) VALUES('旧用户',1791307402948,'open',1,'USDJPY','long',0.1,150.0,150.0,NULL,10000.0,NULL)")
+        .execute(&mut *s.pool.acquire().await.unwrap())
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE trades DROP COLUMN currency")
+        .execute(&s.pool)
+        .await
+        .unwrap();
+    s.close().await;
     let s = Store::open(&path).await.unwrap();
     let u = s.user("旧用户").await.unwrap();
     assert_eq!(u.account.positions[0].symbol, "USDJPY");
@@ -233,6 +238,7 @@ db.execute('ALTER TABLE trades DROP COLUMN currency');db.commit();db.close()
         .fetch_one(&s.pool)
         .await
         .unwrap();
+    assert_eq!(old, "legacy-token-0001");
     assert_eq!(
         s.authenticate(&old).await.unwrap().as_deref(),
         Some("旧用户")
@@ -248,27 +254,18 @@ db.execute('ALTER TABLE trades DROP COLUMN currency');db.commit();db.close()
     })
     .await
     .unwrap();
-    s.close().await;
-    let check = r#"
-import sys,math
-import fx_sim_web as w
-w.DB_FILE=sys.argv[1];w.load_users()
-a=w.user_state('旧用户')['account']
-assert not a.positions
-assert math.isclose(a.balance,10000+9800/151)
-h=w.trade_history('旧用户');assert len(h)==2 and h[0]['currency']=='USD' and h[1]['currency']=='LEGACY'
-assert w.user_by_token(sys.argv[2])=='旧用户'
-"#;
-    let result = std::process::Command::new("python3")
-        .args(["-B", "-c", check, path.to_str().unwrap(), &new])
-        .current_dir(root)
-        .output()
+    let history = s.history("旧用户").await.unwrap();
+    assert_eq!(history[0]["currency"], "USD");
+    assert!((history[0]["balance"].as_f64().unwrap() - (10000.0 + 9800.0 / 151.0)).abs() < 1e-7);
+    assert_eq!(history[1]["currency"], "LEGACY");
+    let account: String = sqlx::query_scalar("SELECT account FROM users WHERE name='旧用户'")
+        .fetch_one(&s.pool)
+        .await
         .unwrap();
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
+    let account: serde_json::Value = serde_json::from_str(&account).unwrap();
+    assert!(account["positions"].as_array().unwrap().is_empty());
+    assert!((account["balance"].as_f64().unwrap() - (10000.0 + 9800.0 / 151.0)).abs() < 1e-7);
+    s.close().await;
     let s = Store::open(&path).await.unwrap();
     assert!(s.authenticate(&old).await.unwrap().is_none());
     assert!(s.authenticate(&new).await.unwrap().is_some());

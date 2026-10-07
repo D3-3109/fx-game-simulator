@@ -28,7 +28,7 @@ pub fn start(app: Arc<App>) -> JoinSet<()> {
                 for symbol in symbols {
                     let _ = a.market.price(&symbol).await;
                     if let Some(q) = a.market.snapshot().await.get(&symbol)
-                        && a.market.on_quote(&symbol, q.price, q.at).await.is_err()
+                        && a.market.on_market_quote(&symbol, *q).await.is_err()
                     {
                         eprintln!("[risk] quote/settlement failed; will retry");
                     }
@@ -50,7 +50,7 @@ pub fn start(app: Arc<App>) -> JoinSet<()> {
         });
         let a = app.clone();
         tasks.spawn(async move {
-            yahoo_loop(a).await;
+            fx_loop(a).await;
         });
         tasks.spawn(async move {
             binance_loop(app, "wss://data-stream.binance.vision").await;
@@ -59,32 +59,42 @@ pub fn start(app: Arc<App>) -> JoinSet<()> {
     tasks
 }
 
-async fn yahoo_loop(app: Arc<App>) {
-    let mut last = std::collections::BTreeMap::new();
+async fn fx_loop(app: Arc<App>) {
+    let mut clock = tokio::time::interval(Duration::from_millis(500));
+    clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        sleep(Duration::from_secs(2)).await;
-        let mut wanted = BTreeSet::new();
-        for name in app.online() {
-            if let Ok(u) = app.store.user(&name).await {
-                wanted.insert(u.symbol);
-                wanted.extend(u.account.positions.into_iter().map(|p| p.symbol));
-            }
-        }
-        for symbol in wanted
-            .into_iter()
-            .filter(|s| symbols::FX.contains(&s.as_str()))
-        {
-            if let Ok(price) = app.market.yahoo_price(&symbol).await
-                && last.get(&symbol) != Some(&price)
-            {
-                last.insert(symbol.clone(), price);
-                if app
-                    .market
-                    .on_quote(&symbol, price, now_ms())
-                    .await
-                    .unwrap_or(false)
-                {
-                    app.broadcast(json!({"sym":symbol,"price":price}));
+        clock.tick().await;
+        let active = app.active_symbols().await.unwrap_or_default();
+        // Include conversion pairs and offline users' positions; one shared batch per round.
+        if let Ok(needed) = crate::trading::price_symbols(
+            active
+                .iter()
+                .map(String::as_str)
+                .filter(|s| symbols::FX.contains(s)),
+        ) {
+            let wanted: Vec<_> = needed
+                .into_iter()
+                .filter(|s| symbols::FX.contains(&s.as_str()))
+                .collect();
+            if !wanted.is_empty() {
+                match app.market.biquote_quotes(&wanted).await {
+                    Ok(quotes) => {
+                        for (symbol, q) in quotes {
+                            if app
+                                .market
+                                .on_market_quote(&symbol, q)
+                                .await
+                                .unwrap_or(false)
+                            {
+                                // Send sides and original source time even when mid is unchanged.
+                                app.broadcast(q.packet(&symbol, now_ms()));
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        eprintln!("[fx] source quote unavailable; will retry");
+                        sleep(Duration::from_secs(2)).await;
+                    }
                 }
             }
         }
@@ -142,7 +152,8 @@ async fn binance_loop(app: Arc<App>, endpoint: &str) {
                             if let Ok(d)=serde_json::from_str::<Value>(&text) {
                                 let d=&d["data"];
                                 if let (Some(symbol),Some(price))=(d["s"].as_str(),d["c"].as_str().and_then(|s|s.parse::<f64>().ok()))
-                                    && symbols::CRYPTO.contains(&symbol) && app.market.on_quote(symbol,price,now_ms()).await.unwrap_or(false) {app.broadcast(json!({"sym":symbol,"price":price}));}
+                                    && symbols::CRYPTO.contains(&symbol) && app.market.on_quote(symbol,price,now_ms()).await.unwrap_or(false)
+                                    && let Some(q)=app.market.snapshot().await.get(symbol) {app.broadcast(q.packet(symbol,now_ms()));}
                             }
                         },
                         Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(_)))=> {

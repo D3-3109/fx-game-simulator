@@ -123,6 +123,67 @@ impl Harness {
         pool.close().await;
     }
 }
+#[tokio::test]
+async fn fx_source_sides_match_state_fills_marks_closes_and_closed_market_rejection() {
+    let h = Harness::new().await;
+    let token = h.register("quotes").await;
+    let q = fx_sim_rust::market::Quote {
+        price: 150.015,
+        at: now_ms(),
+        received_at: now_ms(),
+        bid_ask: Some((150.009, 150.021)),
+        open: true,
+    };
+    h.app.market.on_market_quote("USDJPY", q).await.unwrap();
+    let state = h.request("/api/state", None, &token).await.1;
+    near(&state["price"], 150.015);
+    near(&state["bid"], 150.009);
+    near(&state["ask"], 150.021);
+    assert_eq!(state["quote_valid"], true);
+    for (side, entry, exit) in [("buy", 150.021, 150.009), ("sell", 150.009, 150.021)] {
+        let (status, reply) = h
+            .request("/api/trade", Some(json!({"side":side,"lots":0.01})), &token)
+            .await;
+        assert_eq!(status, 200, "{reply}");
+        let state = h.request("/api/state", None, &token).await.1;
+        near(&state["positions"][0]["entry"], entry);
+        near(&state["positions"][0]["now"], exit);
+        let pnl = state["positions"][0]["pnl"].as_f64().unwrap();
+        near(&state["positions"][0]["margin"], 10.0);
+        let (status, reply) = h.request("/api/close", Some(json!({})), &token).await;
+        assert_eq!(status, 200, "{reply}");
+        let history = h.request("/api/history", None, &token).await.1;
+        near(&history["rows"][0]["price"], exit);
+        near(&history["rows"][0]["pnl"], pnl);
+    }
+    let mut closed = q;
+    closed.open = false;
+    h.app
+        .market
+        .on_market_quote("USDJPY", closed)
+        .await
+        .unwrap();
+    let before = h.request("/api/state", None, &token).await.1;
+    assert_eq!(before["quote_valid"], false);
+    let (status, reply) = h
+        .request(
+            "/api/trade",
+            Some(json!({"side":"buy","lots":0.01})),
+            &token,
+        )
+        .await;
+    assert_eq!(status, 400);
+    assert!(
+        reply["err"]
+            .as_str()
+            .unwrap()
+            .contains("报价已过期或市场已关闭")
+    );
+    let after = h.request("/api/state", None, &token).await.1;
+    assert_eq!(after["balance"], before["balance"]);
+    assert_eq!(after["positions"], before["positions"]);
+}
+
 fn near(a: &Value, b: f64) {
     assert!((a.as_f64().unwrap() - b).abs() < 1e-7, "{a} != {b}");
 }

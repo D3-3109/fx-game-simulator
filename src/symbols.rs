@@ -25,15 +25,14 @@ pub fn provider(symbol: &str) -> Option<&'static str> {
     } else if CRYPTO.contains(&symbol) {
         Some("Binance")
     } else if FX.contains(&symbol) {
-        Some("biquote.io → Yahoo Finance（备用）")
+        Some("biquote.io")
     } else {
         None
     }
 }
 pub fn yahoo(symbol: &str) -> Option<&'static str> {
     Some(match symbol {
-        "USDCNH" | "USDCNY" => "CNY=X",
-        "EURCNH" => "EURCNY=X",
+        "USDCNY" => "CNY=X",
         "EURUSD" => "EURUSD=X",
         "GBPUSD" => "GBPUSD=X",
         "USDJPY" => "JPY=X",

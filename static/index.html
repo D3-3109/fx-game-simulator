@@ -1,48 +1,58 @@
 <!doctype html>
-<html lang="zh"><head><meta charset="utf-8">
-<title>FX 对战模拟器</title>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#10141c">
+<title>— | USDJPY</title>
 <link rel="stylesheet" href="/app.css"></head><body>
 <div id="auth"><div id="authbox">
- <h2>FX 对战模拟</h2>
- <input id="f-name" placeholder="用户名" maxlength="16">
- <input id="f-pwd" type="password" placeholder="密码">
- <div id="autherr"></div>
- <button onclick="doAuth('login')">登录</button>
- <button onclick="doAuth('register')">注册 (送 $10,000)</button>
+ <div class="brand"><span class="brand-mark" aria-hidden="true">FX</span><span>FX SIM<small>外汇对战模拟器</small></span></div>
+ <h1>进入你的交易台</h1><p class="muted">真实行情，模拟资金。与其他交易者一起对战。</p>
+ <form id="auth-form" onsubmit="event.preventDefault();doAuth('login')">
+  <label for="f-name">用户名</label><input id="f-name" placeholder="输入用户名" maxlength="16" autocomplete="username" required>
+  <label for="f-pwd">密码</label><input id="f-pwd" type="password" placeholder="输入密码" autocomplete="current-password" required>
+  <div id="autherr" role="alert"></div>
+  <button id="auth-login" class="primary" type="submit">登录交易台</button>
+  <button id="auth-register" type="button" onclick="doAuth('register')">注册 · 领取 $10,000.00 模拟资金</button>
+ </form>
+ <p class="auth-note">仅供模拟练习，不涉及真实资金交易。</p>
 </div></div>
 
 <div id="wrap" style="display:none">
 <aside id="tradebar" aria-label="下单">
- <h2>交易下单</h2>
+ <div class="section-heading"><h2>交易下单</h2><span class="tag">市价单</span></div>
  <div class="order-form">
-  <label for="lots">手数<input id="lots" type="number" min="0.01" step="0.01" value="0.10" required></label>
-  <div class="order-buttons"><button id="trade-buy" type="button" class="buy" onclick="trade('buy')">买入 / 多</button>
-   <button id="trade-sell" type="button" class="sell" onclick="trade('sell')">卖出 / 空</button></div>
+  <div class="order-symbol"><b id="order-symbol">USDJPY</b><span>美元结算</span></div>
+  <label for="lots">交易手数<input id="lots" type="number" min="0.01" step="0.01" value="0.10" inputmode="decimal" required></label>
+  <div class="lot-presets" role="group" aria-label="快捷手数">
+   <button type="button" data-lots="0.01" onclick="setLots(0.01)">0.01</button><button type="button" data-lots="0.1" onclick="setLots(0.1)">0.10</button>
+   <button type="button" data-lots="0.5" onclick="setLots(0.5)">0.50</button><button type="button" data-lots="1" onclick="setLots(1)">1.00</button>
+  </div>
+  <div class="order-buttons"><button id="trade-buy" type="button" class="buy" onclick="trade('buy')">BUY<small id="buy-price">—</small></button>
+   <button id="trade-sell" type="button" class="sell" onclick="trade('sell')">SELL<small id="sell-price">—</small></button></div>
  </div>
  <p id="symbol-status" class="muted" role="status"></p>
- <form onsubmit="event.preventDefault();setLev()">
-  <label for="lev">杠杆（倍）<input id="lev" type="number" min="1" max="9007199254740991" step="1" list="lev-presets" required oninput="levDirty=true"></label>
+ <form class="leverage-form" onsubmit="event.preventDefault();setLev()">
+  <label for="lev">杠杆倍数<input id="lev" type="number" min="1" max="9007199254740991" step="1" list="lev-presets" required oninput="levDirty=true"></label>
   <datalist id="lev-presets"><option value="1"><option value="10"><option value="20"><option value="50">
    <option value="100"><option value="200"><option value="500"><option value="1000"></datalist>
   <button id="lev-apply" type="submit">应用杠杆</button>
   <p id="lev-hint">持仓时不可修改杠杆</p>
  </form>
- <button id="close-all" onclick="closeAll()">全部平仓</button>
+ <div class="close-section"><button id="close-all" type="button" onclick="closeAll()">全部平仓</button></div>
+ <div id="acct" aria-label="账户概览"><span class="muted">正在加载账户…</span></div>
 </aside>
 <div id="left-splitter" class="splitter vertical" role="separator" aria-label="调整下单栏宽度"
  aria-orientation="vertical" tabindex="0" aria-valuemin="160" aria-valuemax="520" aria-valuenow="240" title="左右拖动；方向键微调，双击恢复"></div>
 <div id="app">
 <header>
- <span id="who" style="color:#fbbf24"></span>
- <select id="sym"></select>
- <select id="itv"></select>
- <span id="price">--</span>
- <span style="flex:1"></span>
- <button onclick="logout()">退出</button>
+ <div class="market-controls"><label class="sr-only" for="sym">交易币对</label><select id="sym"></select>
+ <label class="sr-only" for="itv">K线周期</label><select id="itv"></select></div>
+ <div class="quote"><div class="quote-price"><span id="price" aria-label="最新报价">—</span><span id="quote-unit"></span></div><span id="quote-change" class="quote-change" title="较前日收盘"></span></div>
+ <div class="user-controls"><span id="connection" class="connection" data-state="connecting" role="status">连接中</span><span id="who"></span><button class="quiet" type="button" onclick="logout()">退出</button></div>
 </header>
-<div id="acct">加载中...</div>
 <div id="workspace">
 <div id="chartpane" aria-busy="true"><div id="cv"></div><div id="px"></div>
+ <div id="msg" role="status" aria-live="polite"></div>
  <div id="chartpane-status" class="panel-status" role="status" aria-live="polite" data-state="loading">
   <span class="spinner" aria-hidden="true"></span><span class="status-text">Loading...</span>
   <button onclick="loadK()">重试</button></div>
@@ -50,51 +60,53 @@
 <div id="splitter" class="splitter" role="separator" aria-label="调整K线和持仓高度" aria-orientation="horizontal"
  tabindex="0" aria-valuemin="15" aria-valuemax="90" aria-valuenow="68" title="上下拖动调整高度；方向键微调，双击恢复"></div>
 <div id="lowerpanels">
-<div id="positions" aria-busy="true"><div id="msg"></div>
-<div id="positions-status" class="panel-status" role="status" aria-live="polite" data-state="loading">
- <span class="spinner" aria-hidden="true"></span><span class="status-text">Loading...</span>
- <button onclick="refresh()">重试</button></div>
-<table id="pos"><thead><tr>
- <th>ID</th><th>方向</th><th class="ctr">手数</th><th>币对</th><th>开仓价</th><th>现价</th><th>浮动盈亏</th><th>保证金</th><th></th>
-</tr></thead><tbody></tbody></table>
-</div><!-- /positions -->
+<section id="positions" aria-label="当前持仓" aria-busy="true">
+ <div class="panel-heading"><h3>当前持仓 <span id="position-count" class="count">0</span></h3><span>盈亏 / USD</span></div>
+ <div id="positions-status" class="panel-status" role="status" aria-live="polite" data-state="loading">
+  <span class="spinner" aria-hidden="true"></span><span class="status-text">Loading...</span>
+  <button onclick="refresh()">重试</button></div>
+ <table id="pos"><thead><tr>
+  <th>ID</th><th>方向</th><th class="ctr">手数</th><th>币对</th><th>开仓价</th><th>现价</th><th>浮动盈亏</th><th>保证金</th><th>操作</th>
+ </tr></thead><tbody></tbody></table>
+</section>
 <div id="history-splitter" class="splitter" role="separator" aria-label="调整持仓和成交记录高度"
  aria-orientation="horizontal" tabindex="0" aria-valuemin="15" aria-valuemax="85" aria-valuenow="60" title="上下拖动；方向键微调，双击恢复"></div>
 <section id="history" aria-label="成交记录" aria-busy="true">
- <h3>成交记录 · 最近100笔</h3>
+ <div class="panel-heading"><h3>成交记录</h3><span>最近 100 笔</span></div>
  <div id="history-status" class="history-status" hidden role="status" aria-live="polite">
   <span class="spinner" aria-hidden="true"></span><span class="status-text">Loading...</span>
   <button onclick="loadHistory()">重试</button></div>
  <table id="historyT"><thead><tr><th>时间</th><th>操作</th><th>ID</th><th>币对</th><th>方向</th>
   <th>手数</th><th>开仓价</th><th>成交价</th><th>已实现盈亏</th><th>成交后余额</th></tr></thead><tbody></tbody></table>
-</section><!-- /history -->
-</div><!-- /lowerpanels -->
-</div><!-- /workspace -->
-</div><!-- /app -->
+</section>
+</div>
+</div>
+</div>
 
 <div id="right-splitter" class="splitter vertical" role="separator" aria-label="调整排行栏宽度"
  aria-orientation="vertical" tabindex="0" aria-valuemin="160" aria-valuemax="520" aria-valuenow="264" title="左右拖动；方向键微调，双击恢复"></div>
 <div id="rightbar">
-<div id="lbbar" aria-busy="true"><b>🏆 对战排行</b><span style="color:#9ca3af;font-size:11px"> 实时</span>
+<section id="lbbar" aria-label="对战排行" aria-busy="true">
+ <div class="panel-heading"><h3>对战排行</h3><span class="tag">实时</span></div>
  <div id="lbbar-status" class="panel-status" role="status" aria-live="polite" data-state="loading">
   <span class="spinner" aria-hidden="true"></span><span class="status-text">Loading...</span>
   <button onclick="loadLeaderboard()">重试</button></div>
- <table id="rankT"><thead><tr><th>#</th><th>玩家</th><th>净值</th><th>总收益</th><th>近5min</th></tr></thead><tbody></tbody></table>
-</div>
+ <table id="rankT"><thead><tr><th>#</th><th>玩家</th><th>净值</th><th>总收益</th><th>近 5 分钟</th></tr></thead><tbody></tbody></table>
+</section>
 <div id="chat-splitter" class="splitter" role="separator" aria-label="调整排行和聊天高度"
  aria-orientation="horizontal" tabindex="0" aria-valuemin="15" aria-valuemax="85" aria-valuenow="50" title="上下拖动；方向键微调，双击恢复"></div>
 <section id="chatpane" aria-label="聊天" aria-busy="true">
- <h3>聊天室</h3>
+ <div class="panel-heading"><h3>聊天室</h3><span>一起聊聊行情</span></div>
  <div id="chat-messages" role="log" aria-live="polite" aria-relevant="additions"></div>
  <div id="chatpane-status" class="panel-status" role="status" aria-live="polite" data-state="loading">
   <span class="spinner" aria-hidden="true"></span><span class="status-text">Loading...</span>
   <button onclick="loadChat()">重试</button></div>
  <form id="chat-form" onsubmit="event.preventDefault();sendChat()">
-  <textarea id="chat-text" rows="2" maxlength="300" required aria-label="聊天内容" placeholder="说点什么…（最多300字）"></textarea>
-  <div id="chat-error" role="status"></div><button id="chat-send" type="submit">发送</button>
+  <textarea id="chat-text" rows="2" maxlength="300" required aria-label="聊天内容" placeholder="说点什么…"></textarea>
+  <div class="chat-actions"><span class="muted">最多 300 字</span><button id="chat-send" type="submit">发送</button></div><div id="chat-error" role="status"></div>
  </form>
 </section>
-</div><!-- /rightbar -->
-</div><!-- /wrap -->
+</div>
+</div>
 
 <script src="/app.js"></script></body></html>

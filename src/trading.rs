@@ -5,7 +5,43 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const CONTRACT: f64 = 100_000.0;
 pub const STOPOUT: f64 = 0.5;
 pub const MAX_LEVERAGE: u64 = 9_007_199_254_740_991;
-pub type Prices = BTreeMap<String, f64>;
+#[derive(Debug, Clone, Default)]
+pub struct Prices {
+    pub mid: BTreeMap<String, f64>,
+    pub bid_ask: BTreeMap<String, (f64, f64)>,
+}
+impl Prices {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn remove(&mut self, symbol: &str) -> Option<f64> {
+        self.bid_ask.remove(symbol);
+        self.mid.remove(symbol)
+    }
+    pub fn insert(&mut self, symbol: String, price: f64) -> Option<f64> {
+        self.bid_ask.remove(&symbol);
+        self.mid.insert(symbol, price)
+    }
+}
+impl std::ops::Deref for Prices {
+    type Target = BTreeMap<String, f64>;
+    fn deref(&self) -> &Self::Target {
+        &self.mid
+    }
+}
+impl FromIterator<(String, f64)> for Prices {
+    fn from_iter<T: IntoIterator<Item = (String, f64)>>(iter: T) -> Self {
+        Self {
+            mid: iter.into_iter().collect(),
+            bid_ask: BTreeMap::new(),
+        }
+    }
+}
+impl<const N: usize> From<[(String, f64); N]> for Prices {
+    fn from(pairs: [(String, f64); N]) -> Self {
+        pairs.into_iter().collect()
+    }
+}
 pub type Result<T> = std::result::Result<T, String>;
 
 pub fn market_price(prices: &Prices, symbol: &str) -> Result<f64> {
@@ -67,6 +103,27 @@ pub fn spread(symbol: &str) -> f64 {
     }
 }
 
+/// Source bid/ask when present; keep the original simulated spread for offline/non-FX feeds.
+pub fn execution_price(prices: &Prices, symbol: &str, buy: bool) -> Result<f64> {
+    let mid = market_price(prices, symbol)?;
+    let px = if let Some(&(bid, ask)) = prices.bid_ask.get(symbol) {
+        if !bid.is_finite() || !ask.is_finite() || bid <= 0.0 || ask < bid {
+            return Err("买卖报价无效".into());
+        }
+        if buy { ask } else { bid }
+    } else {
+        mid + if buy {
+            spread(symbol) / 2.0
+        } else {
+            -spread(symbol) / 2.0
+        }
+    };
+    if !px.is_finite() || px <= 0.0 {
+        return Err("成交价无效".into());
+    }
+    Ok(px)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Position {
     pub id: u64,
@@ -87,7 +144,12 @@ impl Position {
         finite(diff * self.lots * CONTRACT * usd_rate(prices, &self.symbol)?)
     }
     pub fn pnl(&self, prices: &Prices) -> Result<f64> {
-        self.pnl_at(market_price(prices, &self.symbol)?, prices)
+        let quote = if prices.bid_ask.contains_key(&self.symbol) {
+            execution_price(prices, &self.symbol, self.side == "short")?
+        } else {
+            market_price(prices, &self.symbol)?
+        };
+        self.pnl_at(quote, prices)
     }
     pub fn margin(&self, prices: &Prices, leverage: u64) -> Result<f64> {
         finite(
@@ -211,16 +273,7 @@ impl Account {
             return Err("手数必须为有限数且不少于0.01".into());
         }
         self.validate()?;
-        let quote = market_price(prices, symbol)?;
-        let px = quote
-            + if side == "long" {
-                spread(symbol) / 2.0
-            } else {
-                -spread(symbol) / 2.0
-            };
-        if px <= 0.0 {
-            return Err("成交价无效".into());
-        }
+        let px = execution_price(prices, symbol, side == "long")?;
         let need = finite(lots * CONTRACT * px * usd_rate(prices, symbol)? / self.leverage as f64)?;
         let free = self.equity(prices)? - self.used_margin(prices)?;
         if need > free {
@@ -271,13 +324,7 @@ impl Account {
         now: i64,
     ) -> Result<Trade> {
         let p = &self.positions[index];
-        let quote = market_price(prices, &p.symbol)?;
-        let px = quote
-            + if p.side == "long" {
-                -spread(&p.symbol) / 2.0
-            } else {
-                spread(&p.symbol) / 2.0
-            };
+        let px = execution_price(prices, &p.symbol, p.side == "short")?;
         let pnl = p.pnl_at(px, prices)?;
         self.balance = finite(self.balance + pnl)?;
         let p = self.positions.remove(index);
@@ -414,6 +461,35 @@ mod tests {
         let t = a.check_stopout(&quotes(&[("FXSIM", 1.0)]), 2).unwrap();
         assert_eq!(t[0].position_id, 2);
         assert_eq!(a.positions.len(), 1);
+    }
+    #[test]
+    fn source_bid_ask_controls_fills_pnl_close_and_stopout() {
+        let mut q = quotes(&[("USDCNH", 6.706195)]);
+        q.bid_ask.insert("USDCNH".into(), (6.70493, 6.70746));
+        for (side, entry, exit) in [("long", 6.70746, 6.70493), ("short", 6.70493, 6.70746)] {
+            let mut a = Account::default();
+            let open = a.open(side, 0.1, "USDCNH", &q, 1, 1).unwrap();
+            near(open.price, entry);
+            let pnl = a.positions[0].pnl(&q).unwrap();
+            let close = a.close(None, &q, 2).unwrap();
+            near(close[0].price, exit);
+            near(close[0].pnl.unwrap(), pnl);
+            near(pnl, -0.00253 * 10000.0 / 6.706195);
+        }
+        let mut a = Account::default();
+        a.open("long", 0.1, "USDCNH", &q, 1, 1).unwrap();
+        a.balance = 1.0;
+        let stop = a.check_stopout(&q, 2).unwrap();
+        near(stop[0].price, 6.70493);
+        let mut invalid = q.clone();
+        invalid.bid_ask.insert("USDCNH".into(), (6.8, 6.7));
+        assert!(
+            Account::default()
+                .open("long", 0.1, "USDCNH", &invalid, 1, 0)
+                .is_err()
+        );
+        q.insert("USDCNH".into(), 6.7);
+        assert!(!q.bid_ask.contains_key("USDCNH"));
     }
     #[test]
     fn invalid_numbers_and_directions_do_not_mutate() {

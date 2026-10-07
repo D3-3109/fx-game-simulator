@@ -1,6 +1,7 @@
 
 const $=id=>document.getElementById(id);
-const money=n=>`${n<0?'-':''}$${Math.abs(n).toFixed(2)}`;
+const amountFormat=new Intl.NumberFormat('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+const money=n=>`${n<0?'-':''}$${amountFormat.format(Math.abs(n))}`;
 let token=sessionStorage.fx_admin_token||'',busy=false,pendingFunding=null;
 function notice(text){$('message').textContent=text}
 function view(){const logged=Boolean(token);$('login').hidden=logged;$('panel').hidden=!logged;$('logout').hidden=!logged}

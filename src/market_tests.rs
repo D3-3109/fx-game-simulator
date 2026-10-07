@@ -20,6 +20,160 @@ fn biquote_latest_is_order_independent_and_active_close_changes_intraminute() {
 }
 
 #[test]
+fn source_quote_preserves_sides_and_rejects_invalid_or_stale_trading_data() {
+    let mut tick = json!({"symbol":"USDCNH","bid":6.70493,"ask":6.70746,"mid":6.706195,"last":0,
+        "timestamp":"2026-10-07T09:21:32Z","marketState":"open","stale":false});
+    let now = stamp(&tick["timestamp"]).unwrap();
+    let q = biquote_quote(&tick, "USDCNH", now).unwrap();
+    assert_eq!(q.bid_ask, Some((6.70493, 6.70746)));
+    assert!((q.price - 6.706195).abs() < 1e-10);
+    assert!(q.fresh(now));
+    assert!(!q.fresh(now + 30001));
+    assert!(biquote_quote(&tick, "USDCNY", now).is_err());
+    tick["ask"] = json!(6.6);
+    assert!(biquote_quote(&tick, "USDCNH", now).is_err());
+    tick["ask"] = json!(6.70746);
+    tick["bid"] = json!(0);
+    assert!(biquote_quote(&tick, "USDCNH", now).is_err());
+    tick["bid"] = json!(6.70493);
+    tick["stale"] = json!(true);
+    assert!(!biquote_quote(&tick, "USDCNH", now).unwrap().fresh(now));
+    tick["stale"] = json!(false);
+    tick["marketState"] = json!("closed");
+    assert!(!biquote_quote(&tick, "USDCNH", now).unwrap().fresh(now));
+    assert!(biquote_quote(&tick, "USDCNH", now - 6000).is_err());
+}
+
+#[test]
+fn retry_after_seconds_dates_and_missing_headers_are_respected() {
+    use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+    let mut headers = HeaderMap::new();
+    let now = stamp(&json!("2026-10-07T09:21:32Z")).unwrap();
+    assert_eq!(retry_delay(&headers, now), 60000);
+    for (value, delay) in [
+        ("3", 3000),
+        ("0", 1000),
+        ("-1", 60000),
+        ("bad", 60000),
+        ("Wed, 07 Oct 2026 09:22:32 GMT", 60000),
+    ] {
+        headers.insert(RETRY_AFTER, HeaderValue::from_str(value).unwrap());
+        assert_eq!(retry_delay(&headers, now), delay);
+    }
+}
+
+#[tokio::test]
+async fn receipt_cache_reuses_frozen_quotes_without_making_stale_quotes_tradable() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(&dir.path().join("receipt.db")).await.unwrap());
+    let mut market = Market::offline(store.clone(), Prices::new()).await.unwrap();
+    market.offline = false;
+    // Local unresponsive proxy makes any unintended HTTP fetch fail this bounded check.
+    let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    market.client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(format!("http://{}", proxy.local_addr().unwrap())).unwrap())
+        .timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
+    let now = now_ms();
+    let tick = json!({"symbol":"USDCNH","bid":6.70493,"ask":6.70746,"mid":6.706195,
+        "timestamp":chrono::DateTime::from_timestamp_millis(now-10000).unwrap().to_rfc3339(),
+        "marketState":"open","stale":false});
+    let mut q = biquote_quote(&tick, "USDCNH", now).unwrap();
+    market.on_market_quote("USDCNH", q).await.unwrap();
+    for _ in 0..5 {
+        let hit = tokio::time::timeout(Duration::from_millis(100), market.quote("USDCNH"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.at, now - 10000);
+        assert_eq!(hit.received_at, now);
+    }
+    q.at = now - 31000;
+    market.cache.write().await.insert("USDCNH".into(), q);
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            market.trading_prices(["USDCNH"])
+        )
+        .await
+        .unwrap()
+        .is_err()
+    );
+    assert_eq!(
+        market.snapshot().await["USDCNH"].packet("USDCNH", now)["quote_valid"],
+        false
+    );
+    market
+        .biquote_retry_at
+        .store(now + 60000, Ordering::Relaxed);
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            market.get("https://biquote.io/api/USDJPY")
+        )
+        .await
+        .unwrap()
+        .unwrap_err(),
+        "行情源退避中"
+    );
+    store.close().await;
+}
+
+#[test]
+fn weekly_bars_use_monday_and_keep_partial_current_week() {
+    let day = 86_400_000.0;
+    let rows = vec![
+        [4.0 * day, 6.7, 6.8, 6.6, 6.75],
+        [10.0 * day, 6.75, 6.9, 6.5, 6.76],
+        [11.0 * day, 6.76, 6.85, 6.7, 6.8],
+    ];
+    assert_eq!(
+        weekly_bars(rows.clone(), 2),
+        vec![[4.0 * day, 6.7, 6.9, 6.5, 6.76], rows[2]]
+    );
+    assert_eq!(
+        weekly_bars(rows, 1),
+        vec![[11.0 * day, 6.76, 6.85, 6.7, 6.8]]
+    );
+    assert!(weekly_bars(vec![], 2).is_empty());
+}
+
+#[tokio::test]
+async fn live_fx_cache_cannot_be_overwritten_by_cny_or_single_price_feed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(&dir.path().join("quotes.db")).await.unwrap());
+    let mut market = Market::offline(store.clone(), Prices::new()).await.unwrap();
+    market.offline = false;
+    let at = now_ms();
+    let tick = json!({"symbol":"USDCNH","bid":6.70493,"ask":6.70746,"mid":6.706195,
+        "timestamp":chrono::DateTime::from_timestamp_millis(at).unwrap().to_rfc3339(),
+        "marketState":"open","stale":false});
+    let q = biquote_quote(&tick, "USDCNH", at).unwrap();
+    market.on_market_quote("USDCNH", q).await.unwrap();
+    assert!(market.on_quote("USDCNH", 6.693300, at + 1).await.is_err());
+    assert_eq!(market.snapshot().await["USDCNH"].price, 6.706195);
+    let prices = market.trading_prices(["USDCNH"]).await.unwrap();
+    assert_eq!(prices.bid_ask["USDCNH"], (6.70493, 6.70746));
+    let packet = q.packet("USDCNH", at);
+    assert_eq!(packet["price"], 6.706195);
+    assert_eq!(packet["bid"], 6.70493);
+    assert_eq!(packet["ask"], 6.70746);
+    assert_eq!(packet["quote_at"], at);
+    assert_eq!(packet["quote_valid"], true);
+    assert_eq!(q.packet("USDCNH", at + 30001)["quote_valid"], false);
+    let mut closed = q;
+    closed.open = false;
+    market.on_market_quote("USDCNH", closed).await.unwrap();
+    assert!(market.trading_prices(["USDCNH"]).await.is_err());
+    assert_eq!(market.prices(["USDCNH"]).await.unwrap()["USDCNH"], 6.706195);
+    assert_eq!(symbols::yahoo("USDCNH"), None);
+    assert_eq!(symbols::yahoo("EURCNH"), None);
+    assert_eq!(symbols::provider("USDCNH"), Some("biquote.io"));
+    store.close().await;
+}
+
+#[test]
 fn recorded_ticks_preserve_wicks_freeze_closed_candles_and_bound_retention() {
     for (_, sec) in symbols::INTERVALS {
         let t = 1800000000 / sec * sec;

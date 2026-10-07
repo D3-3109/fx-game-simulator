@@ -6,6 +6,7 @@ const elements = {};
 let autoScale = false, sets = 0, updates = [], removed = [], ranges = [];
 let response = [], displayed = [], now = Date.now(), requests = [], responseStamp = 0;
 const series = {
+  applyOptions(options) { this.options=options; },
   setData(data) { sets++; displayed = data.map(bar => ({...bar})); },
   update(bar) {
     const latest = displayed.at(-1);
@@ -23,9 +24,10 @@ const chart = {
   timeScale() { return {setVisibleLogicalRange(range) { ranges.push(range); }}; },
 };
 const context = vm.createContext({
-  document: {getElementById(id) {
+  document: {querySelectorAll() { return []; },getElementById(id) {
     return elements[id] ||= {style: {setProperty(key,value){this[key]=value;}}, dataset: {}, hidden:false, value: '', textContent: '', innerHTML: '',
       clientHeight:id==='workspace'?600:400,clientWidth:1000,offsetHeight:10,scrollHeight:0,scrollTop:0,attributes:{},
+      addEventListener() {}, reportValidity() { return true; },
       setAttribute(key,value) { this.attributes[key]=String(value); },
       removeAttribute(key) { delete this.attributes[key]; },
       setPointerCapture(id) { this.capture=id; },
@@ -39,7 +41,7 @@ const context = vm.createContext({
   Date: class extends Date {static now(){return now;} },
   Option: class {constructor(text,value){this.text=text;this.value=value??text;} },
   fetch: async url => { requests.push(url); return {json: async () => ({ok: true, klines: response, updated_at: responseStamp})}; },
-  setTimeout() {},
+  setTimeout() {}, clearTimeout() {}, confirm() { return false; },
   console,
 });
 vm.runInContext(script, context);
@@ -57,7 +59,7 @@ const candle = price => {
   const makeLoader=()=>{
     const scripts=[],timers=new Map(),loaderElements={};let clock=0;
     const sandbox=vm.createContext({...context,LightweightCharts:undefined,localStorage:{},
-      document:{getElementById(id){return loaderElements[id]||={...context.document.getElementById(id),
+      document:{querySelectorAll() { return []; },getElementById(id){return loaderElements[id]||={...context.document.getElementById(id),
           style:{setProperty(key,value){this[key]=value;}},attributes:{},dataset:{},options:[],value:''};},
         head:{append(node){scripts.push(node);}},
         createElement(tag){assert.equal(tag,'script');return {remove(){this.removed=true;}};}},
@@ -114,6 +116,8 @@ const candle = price => {
   assert.equal(elements['trade-buy'].disabled,true,'trade enabled before whitelist loaded');
   context.symbolSettings={version:10,rows:[{symbol:'USDJPY',enabled:true},{symbol:'FXSIM',enabled:true}]};
   run('applySymbols(symbolSettings)');
+  assert.equal(elements['trade-buy'].disabled,true,'trade enabled before any quote');
+  run("renderQuote(150,'USDJPY',149.99,150.01,true)");
   assert.equal(elements['trade-buy'].disabled,false);
   context.symbolSettings={version:11,rows:[{symbol:'USDJPY',enabled:false},{symbol:'FXSIM',enabled:true}]};
   context.symbolPacket=JSON.stringify({type:'symbols',...context.symbolSettings});
@@ -288,7 +292,7 @@ const candle = price => {
   run("panelStatus('positions','loading','LOADING');panelStatus('lbbar','loading','LOADING');wsConnect();ws.onopen();");
   assert.equal(elements['positions-status'].hidden,false,'WS open hid unloaded positions');
   assert.equal(elements['lbbar-status'].hidden,false,'WS open hid unloaded leaderboard');
-  context.statePacket=JSON.stringify({ok:true,type:'state',symbol:'FXSIM',price:1.1,balance:10000,equity:10000,used:0,leverage:100,margin_level:null,positions:[]});
+  context.statePacket=JSON.stringify({ok:true,type:'state',symbol:'FXSIM',price:1.1,bid:1.0999,ask:1.1001,quote_valid:true,balance:10000,equity:10000,used:0,leverage:100,margin_level:null,positions:[]});
   run('ws.onmessage({data:statePacket});');
   assert.equal(elements['positions-status'].hidden,true,'first WS state did not finish positions loading');
   assert.match(elements.pos.innerHTML,/暂无持仓，去下单吧/,'empty positions mistaken for not loaded');
@@ -346,6 +350,26 @@ const candle = price => {
   await run('setLev()');assert.equal(blocked.length,0,'in-position leverage changed');
   context.levState.positions=[];run('render(levState)');context.fetch=normalFetch;
 
+  // Order UX: validate lots, block duplicates and symbol switches, always unlock on errors.
+  run('applySymbols({version:100,rows:[{symbol:"FXSIM",enabled:true}]});cur.sym="FXSIM";render(levState);setLots(.01);syncOrderControls()');
+  assert.equal(elements.lots.value,'0.01');assert.equal(elements['close-all'].disabled,true);
+  let finishOrder,orderCalls=0;
+  context.fetch=()=>{orderCalls++;return new Promise(resolve=>{finishOrder=resolve;});};
+  const ordering=run('trade("buy")');
+  assert.equal(elements['trade-buy'].disabled,true);assert.equal(elements.sym.disabled,true);
+  await run('trade("buy")');assert.equal(orderCalls,1,'double click submitted duplicate order');
+  run('render(levState)');assert.equal(elements['trade-buy'].disabled,true,'live state unlocked pending order');
+  finishOrder({status:400,json:async()=>({ok:false,err:'余额不足'})});await ordering;
+  assert.equal(run('orderBusy'),false);assert.equal(elements['trade-buy'].disabled,false);
+  assert.match(elements.msg.textContent,/余额不足/);
+  context.fetch=async()=>{throw Error('offline')};await run('trade("sell")');
+  assert.equal(run('orderBusy'),false);assert.equal(elements['trade-sell'].disabled,false);
+  elements.lots.reportValidity=()=>false;context.fetch=()=>{throw Error('invalid lots requested');};
+  await run('trade("buy")');elements.lots.reportValidity=()=>true;
+  run('curPos=[{id:99}];syncOrderControls()');assert.equal(elements['close-all'].disabled,false);
+  context.confirm=()=>false;await run('closeAll()');assert.equal(run('orderBusy'),false);
+  context.fetch=normalFetch;run('curPos=[];syncOrderControls()');
+
   // Chat history merges WS with late HTTP, escapes HTML, bounds rows and sends once.
   const chat={id:1,name:'<img>',time:1800000000000,text:'<script>alert(1)</script>'};
   context.chatPacket=JSON.stringify({type:'chat',row:chat});run('ws.onmessage({data:chatPacket})');
@@ -389,8 +413,13 @@ const candle = price => {
   run("$('msg').textContent='ack';observeTrade(JSON.parse(latestTrade));");
   assert.equal(elements.msg.textContent,'ack','same WS state repeated stopout notification');
   run('render({...JSON.parse(statePacket),margin_level:0,stopout_level:.5})');
-  assert.match(elements.acct.innerHTML,/保证金比例.*0%/);assert.match(elements.acct.innerHTML,/强平线 50%/);
-  assert.match(elements.acct.innerHTML,/\$10000\.00/);
+  assert.match(elements.acct.innerHTML,/保证金比例.*0%/);assert.match(elements.acct.innerHTML,/强平线.*50%/);
+  assert.match(elements.acct.innerHTML,/\$10,000\.00/);
+  assert.equal(run('money(1234567.89)'), '$1,234,567.89');
+  run('observePrices("TESTJPY",[158.121,158.2])');
+  assert.equal(run('priceText(158.2,"TESTJPY")'),'158.200');
+  assert.equal(run('priceFormat("TESTJPY").minMove'),.001);
+  assert.equal(run('decimalPlaces(1e-7)'),7);
   assert.equal(run('money(100)'), '$100.00');assert.equal(run('money(-2)'), '-$2.00');
   run("renderLb([{name:'<script>',equity:100,ret:.02,online:false,pnl_5m:-2,ret_5m:-.02}])");
   assert.match(elements.rankT.innerHTML,/class="offline" title="离线"/);
@@ -481,7 +510,7 @@ const candle = price => {
   const saved=context.localStorage;
   const otherElements={};
   const fresh=vm.createContext({...context,localStorage:{...saved,fx_sidebar_widths:'{"left":300,"right":260}',fx_history_ratio:.7},
-    document:{getElementById(id){return otherElements[id]||=( {...elements.splitter,style:{setProperty(key,value){this[key]=value;}},attributes:{},clientWidth:1000,clientHeight:600});}}});
+    document:{querySelectorAll() { return []; },getElementById(id){return otherElements[id]||=( {...elements.splitter,style:{setProperty(key,value){this[key]=value;}},attributes:{},clientWidth:1000,clientHeight:600});}}});
   vm.runInContext(script,fresh);
   assert.equal(vm.runInContext('sideWidths.left',fresh),300);
   assert.equal(vm.runInContext('sideWidths.right',fresh),260);
@@ -509,5 +538,68 @@ const candle = price => {
   await run('symSel.onchange()');
   assert.equal(removed.length, 1, 'old position line survives symbol switch');
   assert.equal(run('priceLines.length'), 0);
-  console.log('PASS: switch scales, stale-state guards, periodic zoom, OHLC/wicks, authoritative simulated spikes, closed candles, Ctrl+R, panel splitter, chart sizing and independent loading states, realized history, stopout notices, margin labels, leverage drafts, resizable sidebars/history and v5 CDN/SRI/fallback/timeout/retry');
+  // Quote styling uses native precision; tick direction and daily change are independent.
+  context.fetch=async url=>{assert.match(url,/interval=1d&limit=2$/);return {json:async()=>({ok:true,klines:[[0,158,159,157,158.091],[86400000,158.091,159,157,158.290]]})};};
+  run("cur.sym='USDJPY';pricePrecisions.set(cur.sym,3);quoteReferences.clear();renderQuote(158.290,cur.sym)");
+  assert.equal(elements['quote-change'].textContent,'','missing baseline must not fabricate change');
+  await tick();
+  assert.equal(elements.price.innerHTML,'158<span class="quote-decimal">.290</span>');
+  assert.equal(elements['quote-unit'].textContent,'JPY');
+  assert.equal(context.document.title,'158.290 | USDJPY');
+  assert.equal(elements['quote-change'].textContent,'+0.199  +0.13%');
+  run("renderQuote(158.300,'USDJPY')");assert.equal(elements.price.dataset.direction,'up');
+  run("renderQuote(158.290,'USDJPY')");assert.equal(elements.price.dataset.direction,'down');
+  assert.match(elements['quote-change'].className,/green/,'falling tick must not change positive daily gain to red');
+  run("renderQuote(158.290,'USDJPY')");assert.equal(elements.price.dataset.direction,'down','duplicate state erased direction');
+  run("renderQuote(158.000,'USDJPY')");assert.match(elements['quote-change'].className,/red/);
+  assert.equal(elements['quote-change'].textContent,'-0.091  -0.06%');
+
+  let dailyReply;
+  context.fetch=()=>new Promise(resolve=>{dailyReply=resolve;});
+  run("quoteReferences.clear();renderQuote(158.290,'USDJPY');cur.sym='BTCUSDT';renderQuote(NaN,cur.sym)");
+  dailyReply({json:async()=>({ok:true,klines:[[0,158,159,157,158.091],[86400000,158.091,159,157,158.290]]})});
+  await tick();
+  assert.equal(elements['quote-change'].textContent,'','stale daily response leaked across symbols');
+  context.fetch=async()=>({json:async()=>({ok:false})});
+  run("wsConnect();ws.onmessage({data:JSON.stringify({sym:'BTCUSDT',price:60000.75})})");
+  await tick();
+  assert.equal(elements.price.innerHTML,'60,000<span class="quote-decimal">.75</span>');
+  assert.equal(elements['quote-unit'].textContent,'USDT');
+  assert.equal(elements['quote-change'].textContent,'','unavailable daily baseline must stay blank');
+  run("ws.onmessage({data:JSON.stringify({sym:'USDJPY',price:158.290})})");
+  assert.equal(elements['quote-unit'].textContent,'USDT','stale tick changed active quote');
+  assert.equal(context.document.title,'60000.75 | BTCUSDT','title must follow WS quote and ignore stale symbols');
+
+  // Weekly FX history and live bars share UTC Monday, not Unix epoch Thursday.
+  const savedNow=now;now=Date.parse('2026-10-07T12:00:00Z');
+  run("cur={sym:'USDCNH',itv:'1w'};lastSym=cur.sym;lastItv=cur.itv;kLoaded=true;lastBar={time:Date.parse('2026-10-05T00:00:00Z')/1000,open:6.7,high:6.71,low:6.69,close:6.7}");
+  displayed=[{...run('lastBar')}];run('updateLast(6.706195)');
+  assert.equal(updates.at(-1).time,Date.parse('2026-10-05T00:00:00Z')/1000);
+  assert.equal(displayed.length,1,'live tick created Thursday candle beside Monday week');now=savedNow;
+
+  const fs=require('node:fs');
+  assert.match(fs.readFileSync('static/index.html','utf8'),/id="chartpane"[^]*?id="msg"[^]*?id="chartpane-status"/);
+  assert.match(fs.readFileSync('static/app.css','utf8'),/#msg\{position:absolute;/,'toast must not occupy chart layout space');
+  assert.match(fs.readFileSync('static/index.html','utf8'),/id="trade-buy"[^>]*>BUY<small id="buy-price">—<\/small><\/button>/);
+  assert.match(fs.readFileSync('static/index.html','utf8'),/id="trade-sell"[^>]*>SELL<small id="sell-price">—<\/small><\/button>/);
+  // Button prices use source sides, never mid; stale/old-symbol data cannot enable trading.
+  context.fetch=async()=>({json:async()=>({ok:false})});
+  run("cur.sym='USDCNH';applySymbols({version:200,rows:[{symbol:'USDCNH',enabled:true}]});renderQuote(6.706195,cur.sym,6.70493,6.70746,true)");
+  assert.equal(elements['buy-price'].textContent,'6.707460');
+  assert.equal(elements['sell-price'].textContent,'6.704930');
+  assert.equal(elements['trade-buy'].disabled,false);
+  run("renderQuote(158,'USDJPY',157.99,158.01,true)");
+  assert.equal(elements['buy-price'].textContent,'6.707460','old symbol changed active ask');
+  run("renderQuote(6.706195,'USDCNH',6.70493,6.70746,false)");
+  assert.equal(elements['buy-price'].textContent,'—');assert.equal(elements['trade-buy'].disabled,true);
+  run("renderQuote(NaN,'USDCNH')");assert.equal(elements['sell-price'].textContent,'—');
+  const savedTimers={set:context.setTimeout,clear:context.clearTimeout};let expire;
+  context.setTimeout=(callback,ms)=>{assert.equal(ms,30000);expire=callback;return 1;};
+  run("renderQuote(6.706195,'USDCNH',6.70493,6.70746,true,Date.now())");
+  expire();assert.equal(elements['buy-price'].textContent,'—');assert.equal(elements['trade-sell'].disabled,true);
+  context.setTimeout=savedTimers.set;context.clearTimeout=savedTimers.clear;
+  run("cur.sym='BTCUSDT';pricePrecisions.set(cur.sym,2);renderQuote(60000.25,cur.sym,60000.249900000004,60000.2501,true)");
+  assert.equal(elements['buy-price'].textContent,'60000.2501');assert.equal(elements['sell-price'].textContent,'60000.2499');
+  assert.equal(run("pricePrecisions.get('BTCUSDT')"),2,'synthetic spread polluted native chart precision');
+  console.log('PASS: chart scales/OHLC, stale-state guards, layout/loading, trading controls, v5 loading, split quotes/daily changes and out-of-flow toasts');
 })().catch(error => { console.error(error); process.exitCode = 1; });

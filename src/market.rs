@@ -12,7 +12,10 @@ use rand_distr::{Distribution, StandardNormal};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
     time::Duration,
 };
 use tokio::sync::{Mutex, RwLock};
@@ -22,6 +25,32 @@ pub type Result<T> = std::result::Result<T, String>;
 pub struct Quote {
     pub price: f64,
     pub at: i64,
+    // Receipt time controls HTTP caching, never whether a quote is safe to trade.
+    pub received_at: i64,
+    pub bid_ask: Option<(f64, f64)>,
+    pub open: bool,
+}
+impl Quote {
+    fn single(price: f64, at: i64) -> Self {
+        Self {
+            price,
+            at,
+            received_at: now_ms(),
+            bid_ask: None,
+            open: true,
+        }
+    }
+    pub fn fresh(self, now: i64) -> bool {
+        self.open && (-5000..=30000).contains(&(now - self.at))
+    }
+    pub fn packet(self, symbol: &str, now: i64) -> Value {
+        let (bid, ask) = self.bid_ask.unwrap_or_else(|| {
+            let half = trading::spread(symbol) / 2.0;
+            (self.price - half, self.price + half)
+        });
+        json!({"sym":symbol,"price":self.price,"bid":bid,"ask":ask,
+            "quote_at":self.at,"quote_valid":self.fresh(now)})
+    }
 }
 
 pub struct Market {
@@ -31,6 +60,7 @@ pub struct Market {
     sim: Mutex<SimFeed>,
     offline: bool,
     quote_gate: Mutex<()>,
+    biquote_retry_at: AtomicI64,
 }
 
 impl Market {
@@ -67,13 +97,19 @@ impl Market {
             client,
             cache: RwLock::new(
                 prices
+                    .mid
                     .into_iter()
-                    .map(|(s, price)| (s, Quote { price, at: now }))
+                    .map(|(s, price)| {
+                        let mut q = Quote::single(price, now);
+                        q.bid_ask = prices.bid_ask.get(&s).copied();
+                        (s, q)
+                    })
                     .collect(),
             ),
             sim: Mutex::new(sim),
             offline,
             quote_gate: Mutex::new(()),
+            biquote_retry_at: AtomicI64::new(0),
         })
     }
     pub fn is_offline(&self) -> bool {
@@ -83,48 +119,95 @@ impl Market {
         self.cache.read().await.clone()
     }
     pub async fn price(&self, symbol: &str) -> Result<f64> {
+        Ok(self.quote(symbol).await?.price)
+    }
+    pub async fn quote(&self, symbol: &str) -> Result<Quote> {
         let start = now_ms();
         let hit = self.cache.read().await.get(symbol).copied();
         if let Some(q) = hit
-            && (self.offline || start - q.at < 8000)
+            && (self.offline || (0..8000).contains(&(start - q.received_at)))
         {
-            return Ok(q.price);
+            return Ok(q);
         }
         if self.offline {
             return Err(format!("行情不可用: {symbol}"));
         }
-        if symbol == symbols::SIM {
-            return Ok(self.sim.lock().await.price);
-        }
-        let result = self.fetch_price(symbol).await;
+        let result = if symbol == symbols::SIM {
+            Ok(Quote::single(self.sim.lock().await.price, start))
+        } else if symbols::FX.contains(&symbol) {
+            self.biquote_quote(symbol).await
+        } else {
+            self.fetch_price(symbol)
+                .await
+                .map(|price| Quote::single(price, start))
+        };
         match result {
-            Ok(price) => {
-                valid(price)?;
+            Ok(q) => {
                 let mut cache = self.cache.write().await;
                 if let Some(latest) = cache.get(symbol)
-                    && latest.at > start
+                    && latest.at > q.at
                 {
-                    return Ok(latest.price);
+                    return Ok(*latest);
                 }
-                cache.insert(symbol.into(), Quote { price, at: start });
-                Ok(price)
+                cache.insert(symbol.into(), q);
+                Ok(q)
             }
-            Err(e) => hit.map(|q| q.price).ok_or(e),
+            // Retain the last price for display; trading_prices refuses stale/closed quotes.
+            Err(e) => hit.ok_or(e),
         }
     }
     pub async fn prices<'a>(&self, symbols: impl IntoIterator<Item = &'a str>) -> Result<Prices> {
         let mut out = Prices::new();
         for symbol in trading::price_symbols(symbols)? {
-            out.insert(symbol.clone(), valid(self.price(&symbol).await?)?);
+            let q = self.quote(&symbol).await?;
+            out.insert(symbol.clone(), valid(q.price)?);
+            if let Some(book) = q.bid_ask {
+                out.bid_ask.insert(symbol, book);
+            }
         }
         Ok(out)
     }
+    pub async fn trading_prices<'a>(
+        &self,
+        symbols: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Prices> {
+        let needed = trading::price_symbols(symbols)?;
+        let prices = self.prices(needed.iter().map(String::as_str)).await?;
+        let quotes = self.cache.read().await;
+        for symbol in needed {
+            if quotes.get(&symbol).is_none_or(|q| {
+                !q.open
+                    || (!self.offline
+                        && (!q.fresh(now_ms())
+                            || (symbols::FX.contains(&symbol.as_str()) && q.bid_ask.is_none())))
+            }) {
+                return Err(format!("报价已过期或市场已关闭: {symbol}"));
+            }
+        }
+        Ok(prices)
+    }
     async fn get(&self, url: &str) -> Result<Value> {
-        self.client
-            .get(url)
-            .send()
-            .await
-            .map_err(|_| "行情请求失败")?
+        let biquote = url.starts_with("https://biquote.io/");
+        if biquote && now_ms() < self.biquote_retry_at.load(Ordering::Relaxed) {
+            return Err("行情源退避中".into());
+        }
+        let response = match self.client.get(url).send().await {
+            Ok(response) => response,
+            Err(_) => {
+                if biquote {
+                    self.biquote_retry_at
+                        .fetch_max(now_ms() + 2000, Ordering::Relaxed);
+                }
+                return Err("行情请求失败".into());
+            }
+        };
+        if biquote && matches!(response.status().as_u16(), 429 | 503) {
+            self.biquote_retry_at.fetch_max(
+                now_ms().saturating_add(retry_delay(response.headers(), now_ms())),
+                Ordering::Relaxed,
+            );
+        }
+        response
             .error_for_status()
             .map_err(|_| "行情源返回错误")?
             .json()
@@ -132,12 +215,29 @@ impl Market {
             .map_err(|_| "行情数据格式无效".into())
     }
     pub async fn biquote_price(&self, symbol: &str) -> Result<f64> {
+        Ok(self.biquote_quote(symbol).await?.price)
+    }
+    pub async fn biquote_quote(&self, symbol: &str) -> Result<Quote> {
         let data = self
-            .get(&format!(
-                "https://biquote.io/api/{symbol}/ohlc?interval=1m&limit=1"
-            ))
+            .get(&format!("https://biquote.io/api/{symbol}"))
             .await?;
-        latest_biquote(&data)
+        biquote_quote(&data, symbol, now_ms())
+    }
+    pub async fn biquote_quotes(&self, symbols: &[String]) -> Result<BTreeMap<String, Quote>> {
+        let query = symbols
+            .iter()
+            .map(|s| format!("symbols={s}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let data = self
+            .get(&format!("https://biquote.io/api/latest?{query}"))
+            .await?;
+        data.as_object().ok_or("批量报价无效")?;
+        let now = now_ms();
+        Ok(symbols
+            .iter()
+            .filter_map(|s| biquote_quote(&data[s], s, now).ok().map(|q| (s.clone(), q)))
+            .collect())
     }
     async fn yahoo_chart(&self, symbol: &str, interval: &str) -> Result<Value> {
         let ticker = symbols::yahoo(symbol).ok_or("不支持的币种对")?;
@@ -162,14 +262,6 @@ impl Market {
         )
     }
     async fn fetch_price(&self, symbol: &str) -> Result<f64> {
-        if symbols::FX.contains(&symbol) {
-            if let Ok(px) = self.biquote_price(symbol).await {
-                return Ok(px);
-            }
-            if let Ok(px) = self.yahoo_price(symbol).await {
-                return Ok(px);
-            }
-        }
         for host in [
             "data-api.binance.vision",
             "api.binance.com",
@@ -209,15 +301,25 @@ impl Market {
             return Err("离线行情无历史".into());
         }
         let bars = if symbols::FX.contains(&symbol) {
-            let bi = self
+            // The provider has no 1w endpoint: aggregate its daily bars, not another feed.
+            let (iv, count) = if interval == "1w" {
+                ("1d", (limit * 7 + 7).min(1000))
+            } else {
+                (interval, limit)
+            };
+            let data = self
                 .get(&format!(
-                    "https://biquote.io/api/{symbol}/ohlc?interval={interval}&limit={limit}"
+                    "https://biquote.io/api/{symbol}/ohlc?interval={iv}&limit={count}"
                 ))
-                .await
-                .and_then(|d| biquote_bars(&d));
-            match bi {
-                Ok(b) => b,
-                Err(_) => yahoo_bars(&self.yahoo_chart(symbol, interval).await?, interval, limit)?,
+                .await?;
+            if data["symbol"].as_str() != Some(symbol) {
+                return Err("K线币对不匹配".into());
+            }
+            let bars = biquote_bars(&data)?;
+            if interval == "1w" {
+                weekly_bars(bars, limit)
+            } else {
+                bars
             }
         } else {
             let raw=self.get(&format!("https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}")).await?;
@@ -239,15 +341,28 @@ impl Market {
     }
     /// Update the shared cache then settle every affected account, even with no browsers.
     pub async fn on_quote(&self, symbol: &str, price: f64, at: i64) -> Result<bool> {
-        valid(price)?;
+        self.on_market_quote(symbol, Quote::single(price, at)).await
+    }
+    pub async fn on_market_quote(&self, symbol: &str, quote: Quote) -> Result<bool> {
+        valid(quote.price)?;
+        if !self.offline && symbols::FX.contains(&symbol) && quote.bid_ask.is_none() {
+            return Err("FX缺少源买卖报价".into());
+        }
+        if let Some((bid, ask)) = quote.bid_ask {
+            valid(bid)?;
+            valid(ask)?;
+            if ask < bid {
+                return Err("买卖报价无效".into());
+            }
+        }
         // Keep accepted quote order and risk settlement order identical across upstream tasks.
         let _guard = self.quote_gate.lock().await;
         let quotes = {
             let mut cache = self.cache.write().await;
-            if cache.get(symbol).is_some_and(|q| q.at > at) {
+            if cache.get(symbol).is_some_and(|q| q.at > quote.at) {
                 return Ok(false);
             }
-            cache.insert(symbol.into(), Quote { price, at });
+            cache.insert(symbol.into(), quote);
             cache.clone()
         };
         self.check_risk(symbol, &quotes, now_ms()).await?;
@@ -270,11 +385,16 @@ impl Market {
             if !needed.contains(symbol) {
                 continue;
             }
-            let prices: Prices = quotes
-                .iter()
-                .filter(|(_, q)| now - q.at <= 30000)
-                .map(|(s, q)| (s.clone(), q.price))
-                .collect();
+            let mut prices = Prices::new();
+            for (s, q) in quotes.iter().filter(|(_, q)| q.fresh(now)) {
+                if !self.offline && symbols::FX.contains(&s.as_str()) && q.bid_ask.is_none() {
+                    continue;
+                }
+                prices.insert(s.clone(), q.price);
+                if let Some(book) = q.bid_ask {
+                    prices.bid_ask.insert(s.clone(), book);
+                }
+            }
             if needed.iter().any(|s| !prices.contains_key(s)) {
                 continue;
             }
@@ -343,6 +463,46 @@ fn stamp(v: &Value) -> Result<i64> {
         .map_err(|_| "行情时间无效".into())
 }
 
+fn retry_delay(headers: &reqwest::header::HeaderMap, now: i64) -> i64 {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.parse::<i64>()
+                .ok()
+                .filter(|s| *s >= 0)
+                .map(|s| s.max(1).saturating_mul(1000))
+                .or_else(|| {
+                    chrono::DateTime::parse_from_rfc2822(v)
+                        .ok()
+                        .map(|date| date.timestamp_millis().saturating_sub(now).max(1000))
+                })
+        })
+        .unwrap_or(60000)
+}
+
+pub fn biquote_quote(data: &Value, symbol: &str, now: i64) -> Result<Quote> {
+    if data["symbol"].as_str() != Some(symbol) {
+        return Err("行情币对不匹配".into());
+    }
+    let bid = valid(number(&data["bid"])?)?;
+    let ask = valid(number(&data["ask"])?)?;
+    let mid = valid(number(&data["mid"])?)?;
+    let at = stamp(&data["timestamp"])?;
+    if ask < bid || at > now + 5000 || (mid - (bid + ask) / 2.0).abs() > mid * 1e-10 {
+        return Err("买卖报价无效".into());
+    }
+    let state = data["marketState"].as_str().ok_or("行情市场状态缺失")?;
+    let stale = data["stale"].as_bool().ok_or("行情时效状态缺失")?;
+    Ok(Quote {
+        price: mid,
+        at,
+        received_at: now,
+        bid_ask: Some((bid, ask)),
+        open: state == "open" && !stale,
+    })
+}
+
 pub fn latest_biquote(data: &Value) -> Result<f64> {
     let bars = data["bars"].as_array().ok_or("行情不可用")?;
     // Do not rely on limit=1 or undocumented array ordering: the newest active candle updates intra-minute.
@@ -374,49 +534,21 @@ fn biquote_bars(data: &Value) -> Result<Vec<[f64; 5]>> {
     out.dedup_by(|a, b| a[0] == b[0]);
     Ok(out)
 }
-fn yahoo_bars(data: &Value, interval: &str, limit: usize) -> Result<Vec<[f64; 5]>> {
-    let r = &data["chart"]["result"][0];
-    let ts = r["timestamp"].as_array().ok_or("K线无效")?;
-    let q = &r["indicators"]["quote"][0];
-    let mut out = Vec::new();
-    for (i, t) in ts.iter().enumerate() {
-        let fields = [&q["open"][i], &q["high"][i], &q["low"][i], &q["close"][i]];
-        if fields.iter().any(|v| v.is_null()) {
-            continue;
-        }
-        let rounded = |v: &Value| number(v).map(|x| (x * 1e6).round() / 1e6);
-        out.push([
-            number(t)? * 1000.0,
-            rounded(fields[0])?,
-            rounded(fields[1])?,
-            rounded(fields[2])?,
-            rounded(fields[3])?,
-        ]);
+fn weekly_bars(bars: Vec<[f64; 5]>, limit: usize) -> Vec<[f64; 5]> {
+    const DAY: i64 = 86_400_000;
+    let mut weeks = BTreeMap::<i64, [f64; 5]>::new();
+    for bar in bars {
+        // UTC Monday boundary; retain the current incomplete week.
+        let start = ((bar[0] as i64 + 3 * DAY).div_euclid(7 * DAY)) * 7 * DAY - 3 * DAY;
+        let week = weeks
+            .entry(start)
+            .or_insert([start as f64, bar[1], bar[2], bar[3], bar[4]]);
+        week[2] = week[2].max(bar[2]);
+        week[3] = week[3].min(bar[3]);
+        week[4] = bar[4];
     }
-    if interval == "4h" {
-        out = out
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| {
-                [
-                    c[0][0],
-                    c[0][1],
-                    c.iter().map(|b| b[2]).fold(f64::NEG_INFINITY, f64::max),
-                    c.iter().map(|b| b[3]).fold(f64::INFINITY, f64::min),
-                    c[3][4],
-                ]
-            })
-            .collect();
-    }
-    Ok(out
-        .into_iter()
-        .rev()
-        .take(limit)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect())
+    let skip = weeks.len().saturating_sub(limit);
+    weeks.into_values().skip(skip).collect()
 }
 
 #[derive(Clone)]
@@ -509,7 +641,16 @@ impl SimFeed {
             .collect()
     }
     fn packet(&self) -> Value {
-        json!({"sym":symbols::SIM,"price":self.price,"time":self.updated_at,"klines":symbols::INTERVALS.iter().map(|(itv,sec)|(*itv,json!(self.klines(*sec,2)))).collect::<BTreeMap<_,_>>()})
+        let mut packet =
+            Quote::single(self.price, self.updated_at).packet(symbols::SIM, self.updated_at);
+        packet["time"] = json!(self.updated_at);
+        packet["klines"] = json!(
+            symbols::INTERVALS
+                .iter()
+                .map(|(itv, sec)| (*itv, json!(self.klines(*sec, 2))))
+                .collect::<BTreeMap<_, _>>()
+        );
+        packet
     }
     fn next_price(&mut self) -> f64 {
         let mut rng = rand::rng();

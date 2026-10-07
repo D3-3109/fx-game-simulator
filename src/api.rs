@@ -256,7 +256,7 @@ async fn post_inner(app: &App, path: &str, headers: &HeaderMap, body: &Value) ->
             app.store.require_tradable(&u.symbol).await?;
             let prices = app
                 .market
-                .prices(
+                .trading_prices(
                     std::iter::once(u.symbol.as_str())
                         .chain(u.account.positions.iter().map(|p| p.symbol.as_str())),
                 )
@@ -279,7 +279,7 @@ async fn post_inner(app: &App, path: &str, headers: &HeaderMap, body: &Value) ->
             let u = app.store.user(&name).await?;
             let prices = app
                 .market
-                .prices(
+                .trading_prices(
                     u.account
                         .positions
                         .iter()

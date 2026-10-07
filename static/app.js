@@ -1,9 +1,72 @@
 
 const $=id=>document.getElementById(id);
-const money=value=>`${value<0?'-':''}$${Math.abs(value).toFixed(2)}`;
+const amountFormat=new Intl.NumberFormat('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+const money=value=>`${value<0?'-':''}$${amountFormat.format(Math.abs(value))}`;
+const pricePrecisions=new Map();
+function decimalPlaces(value){
+ const [base,exponent='0']=String(value).toLowerCase().split('e');
+ return Math.max(0,(base.split('.')[1]||'').length-Number(exponent));
+}
+function priceFormat(symbol){
+ const precision=pricePrecisions.get(symbol)??0;
+ return {type:'price',precision,minMove:10**-precision};
+}
+function observePrices(symbol,values){
+ const precision=Math.max(pricePrecisions.get(symbol)??0,...values.filter(Number.isFinite).map(decimalPlaces));
+ if(pricePrecisions.get(symbol)===precision)return;
+ pricePrecisions.set(symbol,precision);
+ if(series&&symbol===cur.sym)series.applyOptions({priceFormat:priceFormat(symbol)});
+}
+const priceText=(value,symbol=cur.sym)=>Number.isFinite(value)?value.toFixed(pricePrecisions.get(symbol)??decimalPlaces(value)):'—';
 let TOKEN=localStorage.fx_token||'',ME='',cur={sym:'USDJPY',itv:'15m'};
 let chart=null,series=null,lastBar=null,priceLines=[],curPos=[],symSynced=false,lastSym=null,lastItv=null;
-let levDirty=false,levSaving=false,accountLeverage=100;
+let levDirty=false,levSaving=false,accountLeverage=100,orderBusy=false,authBusy=false;
+let quoteSymbol='',quoteLast=null,quoteReady=false,quoteTimer=null;
+const quoteReferences=new Map();
+function renderQuote(price,symbol,bid,ask,valid=true,at){
+ if(symbol!==cur.sym)return;
+ const fx=symbol!=='FXSIM'&&!symbol.endsWith('USDT');
+ observePrices(symbol,fx?[price,bid,ask]:[price]);
+ const sideText=value=>fx?priceText(value,symbol):value.toFixed(Math.max(pricePrecisions.get(symbol)??0,4));
+ clearTimeout(quoteTimer);
+ quoteReady=valid&&Number.isFinite(bid)&&Number.isFinite(ask)&&bid>0&&ask>=bid&&(!Number.isFinite(at)||Date.now()-at<=30000);
+ $('buy-price').textContent=quoteReady?sideText(ask):'—';
+ $('sell-price').textContent=quoteReady?sideText(bid):'—';
+ if(quoteReady&&Number.isFinite(at))quoteTimer=setTimeout(()=>{
+  quoteReady=false;$('buy-price').textContent=$('sell-price').textContent='—';syncOrderControls();
+ },Math.max(0,at+30000-Date.now()));
+ syncOrderControls();
+ const node=$('price');
+ if(quoteSymbol!==symbol){quoteSymbol=symbol;quoteLast=null;delete node.dataset.direction}
+ if(Number.isFinite(price)&&quoteLast!==null&&price!==quoteLast)node.dataset.direction=price>quoteLast?'up':'down';
+ const formatted=priceText(price,symbol);
+ document.title=`${formatted} | ${symbol}`;
+ const [whole,decimal]=formatted.split('.');
+ node.innerHTML=Number.isFinite(price)?Number(whole).toLocaleString('en-US')+(decimal?`<span class="quote-decimal">.${decimal}</span>`:''):'—';
+ $('quote-unit').textContent=symbol==='FXSIM'?'USD':symbol.endsWith('USDT')?'USDT':symbol.slice(-3);
+ quoteLast=Number.isFinite(price)?price:null;
+ renderQuoteChange();
+ if(quoteLast!==null)loadQuoteReference(symbol);
+}
+function renderQuoteChange(){
+ const reference=quoteReferences.get(quoteSymbol)?.close,node=$('quote-change');
+ node.textContent='';node.className='quote-change';
+ if(quoteSymbol!==cur.sym||quoteLast===null||!Number.isFinite(reference)||reference<=0)return;
+ const delta=Number((quoteLast-reference).toFixed(pricePrecisions.get(quoteSymbol)??decimalPlaces(quoteLast))),sign=delta>0?'+':'';
+ node.textContent=`${sign}${priceText(delta,quoteSymbol)}  ${sign}${(delta/reference*100).toFixed(2)}%`;
+ node.className+=' '+(delta===0?'muted':delta>0?'green':'red');
+}
+async function loadQuoteReference(symbol){
+ const previous=quoteReferences.get(symbol);
+ if(previous&&(previous.pending||Date.now()-previous.at<60000))return;
+ const reference={at:Date.now(),pending:true};quoteReferences.set(symbol,reference);
+ try{
+  const r=await fetch(`/api/klines?symbol=${symbol}&interval=1d&limit=2`,{signal:AbortSignal.timeout(20000)}),j=await r.json();
+  if(!j.ok||!Array.isArray(j.klines)||j.klines.length<2)return;
+  const close=j.klines.at(-2)[4];if(Number.isFinite(close)&&close>0)reference.close=close;
+ }catch(_){}  // 没有前日收盘数据时留空，不用当前价或开盘价冒充。
+ finally{reference.pending=false;if(symbol===cur.sym)renderQuoteChange()}
+}
 function panelStatus(id,state='ready',text=''){
  const status=$(id+'-status');status.hidden=state==='ready';
  status.dataset.state=state;status.querySelector('.status-text').textContent=text;
@@ -12,12 +75,16 @@ function panelStatus(id,state='ready',text=''){
 
 /* ---------- auth ---------- */
 async function doAuth(action){
+ if(authBusy||!$('auth-form').reportValidity())return;
+ authBusy=true;$('auth-login').disabled=$('auth-register').disabled=true;
  $('autherr').textContent='';
  try{const r=await fetch('/api/auth',{method:'POST',headers:{'Content-Type':'application/json'},
   body:JSON.stringify({action,name:$('f-name').value.trim(),pwd:$('f-pwd').value})});
   const j=await r.json();if(!j.ok)throw j.err||'失败';
   TOKEN=j.token;localStorage.fx_token=TOKEN;boot();
- }catch(e){$('autherr').textContent=String(e)}}
+ }catch(e){$('autherr').textContent=String(e)}
+ finally{authBusy=false;$('auth-login').disabled=$('auth-register').disabled=false}}
+
 function logout(){localStorage.removeItem('fx_token');location.reload()}
 async function me(){
  try{const r=await fetch('/api/me',{headers:authH()});const j=await r.json();
@@ -144,16 +211,16 @@ function initChart(){
  if(chart||typeof LightweightCharts==='undefined')return;
  const cw=$('cv').clientWidth||innerWidth-24;
  chart=LightweightCharts.createChart($('cv'),{width:cw,height:$('cv').clientHeight||160,
-  layout:{background:{type:'solid',color:'#0e1117'},textColor:'#9598a1',fontSize:12,fontFamily:'Noto Sans, Noto Sans SC, sans-serif'},
-  grid:{vertLines:{color:'#1c2330'},horzLines:{color:'#1c2330'}},crosshair:{mode:0},
-  timeScale:{borderColor:'#2a2e39',timeVisible:true,secondsVisible:false},
-  rightPriceScale:{borderColor:'#2a2e39'}});
+  layout:{background:{type:'solid',color:'#10141c'},textColor:'#9aa8ba',fontSize:11,fontFamily:'Noto Sans, Noto Sans SC, sans-serif'},
+  grid:{vertLines:{color:'#1e2735'},horzLines:{color:'#1e2735'}},crosshair:{mode:0},
+  timeScale:{borderColor:'#283242',timeVisible:true,secondsVisible:false},
+  rightPriceScale:{borderColor:'#283242'}});
  chart.subscribeCrosshairMove(param=>{
   const p=param.seriesData&&param.seriesData.get(series);
-  $('px').textContent=p?`开 ${p.open.toFixed(5)} 高 ${p.high.toFixed(5)} 低 ${p.low.toFixed(5)} 收 ${p.close.toFixed(5)}`:'';});
+  $('px').textContent=p?`开 ${priceText(p.open)} 高 ${priceText(p.high)} 低 ${priceText(p.low)} 收 ${priceText(p.close)}`:'';});
  series=chart.addSeries(LightweightCharts.CandlestickSeries,{upColor:'#26a69a',downColor:'#ef5350',borderVisible:false,
   wickUpColor:'#26a69a',wickDownColor:'#ef5350',
-  priceFormat:{type:'price',precision:5,minMove:0.00001}});
+  priceFormat:priceFormat(cur.sym)});
  new ResizeObserver(()=>{
   const cv=$('cv');if(cv.clientWidth&&cv.clientHeight)chart.applyOptions({width:cv.clientWidth,height:cv.clientHeight});
  }).observe($('cv'));
@@ -177,10 +244,17 @@ function syncSymbolChoices(){
   }
   symSel.value=cur.sym;
  }
+ syncOrderControls();
+}
+function syncOrderControls(){
  const allowed=tradableSymbols!==null&&tradableSymbols.includes(cur.sym);
- symSel.disabled=symbolSaving||tradableSymbols?.length===0;
- $('trade-buy').disabled=$('trade-sell').disabled=symbolSaving||!allowed;
- $('symbol-status').textContent=tradableSymbols===null?'正在获取币种配置…':allowed?'':
+ symSel.disabled=orderBusy||symbolSaving||tradableSymbols?.length===0;
+ $('order-symbol').textContent=cur.sym;
+ $('trade-buy').disabled=$('trade-sell').disabled=orderBusy||symbolSaving||!allowed||!quoteReady;
+ $('close-all').disabled=orderBusy||curPos.length===0;
+ $('close-all').textContent=orderBusy?'正在处理…':'全部平仓';
+ document.querySelectorAll('.close-position').forEach(button=>button.disabled=orderBusy);
+ $('symbol-status').textContent=orderBusy?'订单提交中，请稍候…':tradableSymbols===null?'正在获取币种配置…':allowed?'':
   tradableSymbols.length?'该币对已禁用，已有持仓仍可平仓':'暂无启用的币对，已有持仓仍可平仓';
 }
 function applySymbols(settings){
@@ -197,7 +271,7 @@ symSel.onchange=async()=>{
  const previous=cur.sym,next=symSel.value;if(symbolSaving||next===previous)return;
  symbolSaving=true;syncSymbolChoices();
  try{const j=await api('symbol',{symbol:next});
-  if(j.ok){cur.sym=next;lastBar=null;kLoaded=false;drawPosLines();loadK();await refresh()}
+  if(j.ok){cur.sym=next;renderQuote(NaN,next);if(series)series.applyOptions({priceFormat:priceFormat(next)});lastBar=null;kLoaded=false;drawPosLines();loadK();await refresh()}
  }catch(e){msg('币对切换失败：'+e)}
  finally{symbolSaving=false;syncSymbolChoices()}
 };
@@ -205,26 +279,53 @@ itvSel.onchange=()=>{cur.itv=itvSel.value;lastBar=null;kLoaded=false;drawPosLine
 syncSymbolChoices();
 
 async function api(path,body){const r=await fetch('/api/'+path,{method:'POST',headers:authH({'Content-Type':'application/json'}),body:JSON.stringify(body||{})});
- if(r.status==401){logout();throw'auth'}const j=await r.json();if(!j.ok)msg('err: '+j.err);return j}
-function msg(t){$('msg').textContent=t;setTimeout(()=>$('msg').textContent='',4000)}
-async function trade(side){
- if(symbolSaving||tradableSymbols===null||!tradableSymbols.includes(cur.sym)){msg('该币对暂不可新开仓');return}
- const j=await api('trade',{side,lots:+$('lots').value});if(j.ok)refresh()
+ if(r.status==401){logout();throw'auth'}const j=await r.json();if(!j.ok)msg('操作失败：'+j.err);return j}
+let messageTimer=null;
+function msg(t){clearTimeout(messageTimer);$('msg').textContent=t;messageTimer=setTimeout(()=>$('msg').textContent='',6000)}
+function syncLotPresets(){
+ document.querySelectorAll('[data-lots]').forEach(button=>button.setAttribute('aria-pressed',Number(button.dataset.lots)===Number($('lots').value)));
 }
-async function closePos(id){await api('close',id?{id}:{});refresh()}
-async function closeAll(){await api('close',{});refresh()}
+function setLots(value){$('lots').value=value.toFixed(2);syncLotPresets()}
+$('lots').addEventListener('input',syncLotPresets);syncLotPresets();
+async function trade(side){
+ if(orderBusy)return;
+ if(symbolSaving||tradableSymbols===null||!tradableSymbols.includes(cur.sym)){msg('该币对暂不可新开仓');return}
+ if(!quoteReady){msg('报价不可用，请等待更新');return}
+ if(!$('lots').reportValidity())return;
+ orderBusy=true;syncOrderControls();
+ try{const j=await api('trade',{side,lots:Number($('lots').value)});
+  if(j.ok){msg(`${cur.sym} ${side==='buy'?'买入':'卖出'}已成交`);await refresh()}
+ }catch(e){msg('下单失败：'+e)}
+ finally{orderBusy=false;syncOrderControls()}
+}
+async function closePos(id){
+ if(orderBusy||!id)return;
+ await submitClose({id});
+}
+async function closeAll(){
+ if(orderBusy||!curPos.length)return;
+ if(!confirm(`确认平掉全部 ${curPos.length} 笔持仓？\n将按各币对当前报价结算，无法撤销。`))return;
+ await submitClose({});
+}
+async function submitClose(body){
+ orderBusy=true;syncOrderControls();
+ try{const j=await api('close',body);if(j.ok){msg('平仓已完成');await refresh()}}
+ catch(e){msg('平仓失败：'+e)}
+ finally{orderBusy=false;syncOrderControls()}
+}
 async function setLev(){
  if(levSaving)return;
  const input=$('lev'),value=Number(input.value);
  if(curPos.length){msg('先平仓再修改杠杆');input.value=accountLeverage;levDirty=false;return}
  if(!Number.isSafeInteger(value)||value<1){msg('杠杆必须为正整数');return}
  levSaving=true;input.disabled=$('lev-apply').disabled=true;
+ $('lev-apply').textContent='保存中…';
  try{
   const j=await api('leverage',{leverage:value});
   if(j.ok){accountLeverage=value;levDirty=false;input.value=value;await refresh()}
   else{input.value=accountLeverage;levDirty=false}
  }catch(e){msg('杠杆保存失败，请重试：'+e)}
- finally{levSaving=false;input.disabled=$('lev-apply').disabled=curPos.length>0}
+ finally{levSaving=false;input.disabled=$('lev-apply').disabled=curPos.length>0;$('lev-apply').textContent='应用杠杆'}
 }
 
 const SEC={'1m':60,'5m':300,'15m':900,'30m':1800,'1h':3600,'4h':14400,'1d':86400,'1w':604800};
@@ -254,6 +355,8 @@ async function loadK(){
   const data=j.klines.map(k=>({time:k[0]/1000,open:k[1],high:k[2],low:k[3],close:k[4]}));
   const reset=!kLoaded||cur.sym!==lastSym||cur.itv!==lastItv,latest=data[data.length-1];
   if(!latest)throw '无K线数据';
+  observePrices(sym,j.klines.flatMap(k=>k.slice(1,5)));
+  series.applyOptions({priceFormat:priceFormat(sym)});
   if(sym==='FXSIM'){
    if(reset){simBars=[];simStamp=0}
    if(!mergeSimBars(data,j.updated_at||0))return;
@@ -284,7 +387,8 @@ async function loadK(){
 }
 function updateLast(price){
  if(cur.sym==='FXSIM'||!series||!kLoaded||lastSym!==cur.sym||lastItv!==cur.itv||!price)return;
- const t=Math.floor(Date.now()/1000/SEC[cur.itv])*SEC[cur.itv];
+ const offset=cur.itv==='1w'?3*86400:0;
+ const t=Math.floor((Date.now()/1000+offset)/SEC[cur.itv])*SEC[cur.itv]-offset;
  const base=(lastBar&&lastBar.time===t)?lastBar:{time:t,open:price,high:price,low:price,close:price};
  lastBar={time:t,open:base.open,high:Math.max(base.high,price),low:Math.min(base.low,price),close:price};
  lastBarLive=true;series.update(lastBar);
@@ -292,21 +396,27 @@ function updateLast(price){
 function render(s){
  const ml=s.margin_level,stopout=s.stopout_level??.5;
  const mls=ml==null?'-':Math.round(ml*100)+'%',mlc=ml==null?'':(ml>=1?'green':(ml>=stopout?'':'red'));
- $('acct').innerHTML=`${s.symbol} | 余额 <b>${money(s.balance)}</b> | 净值 <b>${money(s.equity)}</b>`+
-  ` | 已用保证金 ${money(s.used)} | 可用 ${money(s.equity-s.used)}`+
-  ` | 保证金比例 <span class="${mlc}">${mls}</span> | 强平线 ${Math.round(stopout*100)}% | 杠杆 1:${s.leverage}`;
+ $('acct').innerHTML=`<div class="account-stats">`+
+  `<div class="account-stat"><span>账户余额 / USD</span><b>${money(s.balance)}</b></div>`+
+  `<div class="account-stat"><span>账户净值 / USD</span><b class="${s.equity>=s.balance?'green':'red'}">${money(s.equity)}</b></div>`+
+  `<div class="account-stat"><span>已用保证金 / USD</span><b>${money(s.used)}</b></div>`+
+  `<div class="account-stat"><span>可用保证金 / USD</span><b>${money(s.equity-s.used)}</b></div></div>`+
+  `<div class="account-meta"><span>保证金比例 <strong class="${mlc}">${mls}</strong></span>`+
+  `<span>强平线 <strong>${Math.round(stopout*100)}%</strong></span><span>杠杆 <strong>1:${s.leverage}</strong></span></div>`;
  accountLeverage=s.leverage;
  if(!levSaving&&(!levDirty||s.positions.length)){$('lev').value=s.leverage;levDirty=false}
  $('lev').disabled=$('lev-apply').disabled=levSaving||s.positions.length>0;
  $('lev-hint').textContent=s.positions.length?'先平仓再修改杠杆':`当前 ${s.leverage} 倍 · 高杠杆更易强平`;
- curPos=s.positions;drawPosLines();
+ observePrices(s.symbol,[s.price]);
+ for(const p of s.positions)observePrices(p.sym||s.symbol,[p.now]);
+ curPos=s.positions;drawPosLines();$('position-count').textContent=curPos.length;
  $('pos').querySelector('tbody').innerHTML=s.positions.map(p=>
   `<tr><td>${p.id}</td><td class="${p.side=='long'?'green':'red'}">${p.side=='long'?'多':'空'}</td>`+
-  `<td class="ctr">${p.lots}</td><td>${p.sym||s.symbol}</td><td>${p.entry}</td><td>${p.now}</td>`+
+  `<td class="ctr">${p.lots}</td><td>${p.sym||s.symbol}</td><td>${priceText(p.entry,p.sym||s.symbol)}</td><td>${priceText(p.now,p.sym||s.symbol)}</td>`+
   `<td class="${p.pnl>=0?'green':'red'}">${money(p.pnl)}</td><td>${money(p.margin)}</td>`+
-  `<td><button onclick="closePos(${p.id})">平仓</button></td></tr>`).join('')||'<tr><td colspan="9" class="empty">暂无持仓，去下单吧</td></tr>';
- panelStatus('positions');observeTrade(s.last_trade);
- if(s.symbol===cur.sym){$('price').textContent=s.price.toFixed(5);updateLast(s.price)}
+  `<td><button class="close-position" aria-label="平仓 ${escapeHtml(p.sym||s.symbol)} 持仓 #${p.id}" onclick="closePos(${p.id})">平仓</button></td></tr>`).join('')||'<tr><td colspan="9" class="empty">暂无持仓，去下单吧</td></tr>';
+ syncOrderControls();panelStatus('positions');observeTrade(s.last_trade);
+ if(s.symbol===cur.sym){renderQuote(s.price,s.symbol,s.bid,s.ask,s.quote_valid,s.quote_at);updateLast(s.price)}
 }
 let seenTrade=0,historySeq=0;
 function observeTrade(trade){
@@ -326,13 +436,13 @@ async function loadHistory(){
   $('historyT').querySelector('tbody').innerHTML=j.rows.map(t=>
    `<tr><td>${escapeHtml(new Date(t.time).toLocaleString())}</td><td class="${t.kind==='stopout'?'red':''}">${({open:'开仓',close:'平仓',stopout:'强平'})[t.kind]}${t.currency==='LEGACY'?' · 旧口径':''}</td>`+
    `<td>${t.position_id}</td><td>${escapeHtml(t.symbol)}</td><td>${t.side==='long'?'多':'空'}</td>`+
-   `<td>${t.lots}</td><td>${t.entry}</td><td>${t.price}</td><td class="${t.pnl==null?'':t.pnl>=0?'green':'red'}">${t.pnl==null?'-':t.currency==='LEGACY'&&!/USD(T)?$/.test(t.symbol)&&t.symbol!=='FXSIM'?'旧口径 '+t.pnl.toFixed(2):money(t.pnl)}</td><td>${money(t.balance)}</td></tr>`).join('')||'<tr><td colspan="10" class="empty">暂无成交记录</td></tr>';
+   `<td>${t.lots}</td><td>${priceText(t.entry,t.symbol)}</td><td>${priceText(t.price,t.symbol)}</td><td class="${t.pnl==null?'':t.pnl>=0?'green':'red'}">${t.pnl==null?'-':t.currency==='LEGACY'&&!/USD(T)?$/.test(t.symbol)&&t.symbol!=='FXSIM'?'旧口径 '+amountFormat.format(t.pnl):money(t.pnl)}</td><td>${money(t.balance)}</td></tr>`).join('')||'<tr><td colspan="10" class="empty">暂无成交记录</td></tr>';
   panelStatus('history');
  }catch(e){if(my===historySeq)panelStatus('history','error','成交记录加载失败，请重试')}
 }
 let connWasDown=false;
-function connDown(){connWasDown=true;$('msg').textContent='与服务器的连接暂时中断，重试中…'}
-function connOk(){if(connWasDown){connWasDown=false;$('msg').textContent=''}}
+function connDown(){connWasDown=true;$('connection').dataset.state='down';$('connection').textContent='重连中';$('connection').title='与服务器的连接暂时中断，正在重试'}
+function connOk(){connWasDown=false;$('connection').dataset.state='ready';$('connection').textContent='已连接';$('connection').title='服务器连接正常'}
 async function refresh(){
  if(!$('positions-status').hidden)panelStatus('positions','loading','Loading...');
  try{const r=await fetch('/api/state',{headers:authH(),signal:AbortSignal.timeout(20000)});
@@ -356,7 +466,7 @@ function wsConnect(){
   if(d.type==='lb'){renderLb(d.rows);return}
   if(d.type==='state'){connOk();render(d);return}
   if(d.sym!==cur.sym)return;
-  $('price').textContent=d.price.toFixed(5);
+  renderQuote(d.price,d.sym,d.bid,d.ask,d.quote_valid,d.quote_at);
   if(d.sym==='FXSIM'){updateSim(d.klines&&d.klines[cur.itv],d.time);return}
   updateLast(d.price)};
  ws.onopen=()=>{connOk();loadChat();loadSymbols()};
@@ -366,8 +476,8 @@ function wsConnect(){
 function renderLb(rows){
  $('rankT').querySelector('tbody').innerHTML=rows.map((p,i)=>
   `<tr class="${p.name==ME?'me':''}"><td>${i+1}</td><td class="${p.online?'online':'offline'}" title="${p.online?'在线':'离线'}">${escapeHtml(p.name)}</td>`+
-  `<td>${money(p.equity)}</td><td class="${p.ret>=0?'green':'red'}">${(p.ret*100).toFixed(2)}%</td>`+
-  `<td class="${p.pnl_5m==null?'':p.pnl_5m>=0?'green':'red'}">${p.pnl_5m==null?'—':money(p.pnl_5m)+(p.ret_5m==null?'':`<br>${(p.ret_5m*100).toFixed(2)}%`)}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">暂无排名</td></tr>';
+  `<td>${money(p.equity)}</td><td class="${p.ret>=0?'green':'red'}">${amountFormat.format(p.ret*100)}%</td>`+
+  `<td class="${p.pnl_5m==null?'':p.pnl_5m>=0?'green':'red'}">${p.pnl_5m==null?'—':money(p.pnl_5m)+(p.ret_5m==null?'':`<br>${amountFormat.format(p.ret_5m*100)}%`)}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">暂无排名</td></tr>';
  panelStatus('lbbar');
 }
 async function loadLeaderboard(){

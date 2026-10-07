@@ -141,12 +141,19 @@ impl App {
                     .chain(user.account.positions.iter().map(|p| p.symbol.as_str())),
             )
             .await?;
+        let quote = self.market.snapshot().await[&user.symbol];
+        let bid = trading::execution_price(&prices, &user.symbol, false)?;
+        let ask = trading::execution_price(&prices, &user.symbol, true)?;
+        let quote_valid = quote.open
+            && (self.market.is_offline()
+                || (quote.fresh(storage::now_ms())
+                    && (!symbols::FX.contains(&user.symbol.as_str()) || quote.bid_ask.is_some())));
         let acc = &user.account;
         let used = acc.used_margin(&prices)?;
         let equity = acc.equity(&prices)?;
-        let positions=acc.positions.iter().map(|p|Ok(json!({"id":p.id,"side":p.side,"lots":p.lots,"sym":p.symbol,"entry":p.entry,"now":trading::market_price(&prices,&p.symbol)?,"pnl":p.pnl(&prices)?,"margin":p.margin(&prices,acc.leverage)?}))).collect::<Result<Vec<_>,String>>()?;
+        let positions=acc.positions.iter().map(|p|Ok(json!({"id":p.id,"side":p.side,"lots":p.lots,"sym":p.symbol,"entry":p.entry,"now":if prices.bid_ask.contains_key(&p.symbol) {trading::execution_price(&prices,&p.symbol,p.side=="short")?} else {trading::market_price(&prices,&p.symbol)?},"pnl":p.pnl(&prices)?,"margin":p.margin(&prices,acc.leverage)?}))).collect::<Result<Vec<_>,String>>()?;
         Ok(
-            json!({"ok":true,"type":"state","name":name,"symbol":user.symbol,"price":prices[&user.symbol],"balance":acc.balance,"equity":equity,"used":used,"free":equity-used,"margin_level":if used==0.0 {None} else {Some(equity/used)},"leverage":acc.leverage,"positions":positions,"stopout_level":trading::STOPOUT,"currency":"USD","last_trade":user.last_trade}),
+            json!({"ok":true,"type":"state","name":name,"symbol":user.symbol,"price":prices[&user.symbol],"bid":bid,"ask":ask,"quote_valid":quote_valid,"quote_at":if self.market.is_offline(){None}else{Some(quote.at)},"balance":acc.balance,"equity":equity,"used":used,"free":equity-used,"margin_level":if used==0.0 {None} else {Some(equity/used)},"leverage":acc.leverage,"positions":positions,"stopout_level":trading::STOPOUT,"currency":"USD","last_trade":user.last_trade}),
         )
     }
     pub async fn leaderboard(&self) -> Result<Value, String> {

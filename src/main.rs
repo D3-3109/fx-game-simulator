@@ -5,7 +5,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 #[derive(Parser)]
 #[command(about = "FX simulator — explicit isolated paths required")]
 struct Args {
-    #[arg(long, default_value = "127.0.0.1:8001")]
+    #[arg(long, default_value = "127.0.0.1:8000")]
     listen: SocketAddr,
     #[arg(long)]
     db: PathBuf,

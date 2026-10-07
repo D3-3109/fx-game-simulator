@@ -29,13 +29,13 @@ with os.fdopen(fd, 'w') as f:
 PY
 
 ./target/debug/fx-sim-rust \
-  --listen 127.0.0.1:8001 \
+  --listen 127.0.0.1:8000 \
   --db "$PWD/.pi/rust-dev/test.db" \\
   --static-dir "$PWD/static" \\
   --admin-key "$PWD/.pi/rust-dev/admin.json"
 ```
 
-打开 `http://127.0.0.1:8001`，注册测试用户；管理员页面 `/admin`。Ctrl+C 关闭连接、后台任务与数据库。静态目录、数据库、管理员文件均为显式参数，支持任意工作目录；默认监听回环 8001。目录须预先存在。
+打开 `http://127.0.0.1:8000`，注册测试用户；管理员页面 `/admin`。Ctrl+C 关闭连接、后台任务与数据库。静态目录、数据库、管理员文件均为显式参数，支持任意工作目录；默认监听回环 8000。目录须预先存在。
 
 生产数据库 `fx_sim.db` 与管理员配置 `.pi/admin-key.json` 已由 Rust 服务直接使用；不要同时再启动旧 Python 进程写同一库。账户 token 存在浏览器 origin 下，换端口不会自动继承旧登录。
 

@@ -48,9 +48,9 @@ Kimi WebBridge 独立标签页，`127.0.0.1:8001`，测试用户 `rust-browser`�
 - `rust-final-tests.log`、`python-final-tests.log`、`node-final-tests.log`
 - `blackbox-contract-final.log`、`process-restart-final.log`、`market-smoke-final.log`
 
-### 尚未完成：前台物理拖动复核
+### 前台物理拖动复核：已通过（2026-10-07）
 
-验收时 macOS 屏幕已锁定（`CGSSessionScreenIsLocked=Yes`），测试标签 active 但 `document.visibilityState='hidden'`。前台激活尝试无效；没有尝试绕过系统锁屏。因此**不能把这些截图/脚本结果宣称为解锁后的前台拖动已验收**。Node 拖拽回归、实际浏览器键盘 resize 与截图已通过；计划要求的前台交互复核仍需解锁后补做，此项未标记完成。
+验收时 macOS 屏幕锁定曾导致脚本标签 `visibilityState='hidden'`，前台拖动当时无法自动执行；Node 拖拽回归、键盘 resize 与截图先行通过。随后由用户在解锁桌面手动复核：`127.0.0.1:8001` 页面内鼠标拖动图表/面板分隔条，高度实时跟随、布局无破损、价格轴缩放与持仓线保持正常。此项按用户实测结论标记完成。
 
 ## 保留项、差异与回滚
 

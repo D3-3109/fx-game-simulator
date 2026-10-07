@@ -15,7 +15,7 @@ import sys
 import tempfile
 import time
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import fx_sim_web as web
 spec = importlib.util.spec_from_file_location('contract', Path(__file__).with_name('blackbox_contract.py'))
@@ -60,7 +60,7 @@ async def stop_with_socket_open(process, base, token):
 
 
 def main():
-    binary = ROOT/'fx-sim-rust/target/debug/fx-sim-rust'
+    binary = ROOT/'target/debug/fx-sim-rust'
     with tempfile.TemporaryDirectory(prefix='fx-process-') as tmp:
         folder = Path(tmp)
         salt = bytes.fromhex('cd'*16)

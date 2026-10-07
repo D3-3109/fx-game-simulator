@@ -23,10 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _tasks = runtime::start(app.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     println!("http://{}", listener.local_addr()?);
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("static");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("static");
     axum::serve(listener, api::router(app, root)).await?;
     Ok(())
 }

@@ -1,5 +1,5 @@
 """Run one HTTP contract against both servers, with independent temporary data.
-Usage: python3 -B fx-sim-rust/tests/blackbox_contract.py
+Usage: python3 -B tests/blackbox_contract.py
 Builds/starts the Rust offline example; never contacts the service on port 8000.
 """
 import asyncio
@@ -14,7 +14,7 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import fx_sim_web as web
 
@@ -144,7 +144,7 @@ async def exercise_ws(base):
 
 
 def main():
-    subprocess.run(['cargo', 'build', '--manifest-path', str(ROOT/'fx-sim-rust/Cargo.toml'),
+    subprocess.run(['cargo', 'build', '--manifest-path', str(ROOT/'Cargo.toml'),
                     '--example', 'fixture_server'], check=True)
     with tempfile.TemporaryDirectory() as folder:
         folder = Path(folder)
@@ -158,7 +158,7 @@ def main():
         worker.start()
         threading.Thread(target=web._state_push_loop, daemon=True).start()
         threading.Thread(target=web._lb_push_loop, daemon=True).start()
-        process = subprocess.Popen([str(ROOT/'fx-sim-rust/target/debug/examples/fixture_server'), str(folder)],
+        process = subprocess.Popen([str(ROOT/'target/debug/examples/fixture_server'), str(folder)],
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             rust_url = process.stdout.readline().strip()

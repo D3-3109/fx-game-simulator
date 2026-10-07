@@ -205,7 +205,7 @@ async fn chat_retention_rate_limit_and_five_minute_deposit_adjustment() {
 async fn python_schema_accounts_tokens_and_legacy_currency_survive_both_directions() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("compat.db");
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let script = r#"
 import sys,sqlite3,json
 import fx_sim_web as w

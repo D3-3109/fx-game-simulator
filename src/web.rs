@@ -112,10 +112,7 @@ mod tests {
     use tower::ServiceExt;
     #[tokio::test]
     async fn static_assets_headers_and_traversal() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("static");
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("static");
         let app = static_router(validate_static(&dir).await.unwrap());
         for path in [
             "/",

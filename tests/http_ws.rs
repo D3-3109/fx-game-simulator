@@ -55,10 +55,7 @@ impl Harness {
         let app = Arc::new(App::new(store, market, key));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let static_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("static");
+        let static_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("static");
         let router = api::router(app.clone(), static_dir);
         let server = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();

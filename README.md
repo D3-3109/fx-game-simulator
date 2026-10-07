@@ -8,7 +8,7 @@ Python Web / CLI / Tk GUI 保留作为兼容参照；**未切换原服务，也�
 在仓库根目录运行（已验证 Rust 1.98.1）：
 
 ```sh
-cargo build --locked --manifest-path fx-sim-rust/Cargo.toml
+cargo build --locked --manifest-path Cargo.toml
 mkdir -p .pi/rust-dev
 ```
 
@@ -28,16 +28,16 @@ with os.fdopen(fd, 'w') as f:
     json.dump(config, f)
 PY
 
-./fx-sim-rust/target/debug/fx-sim-rust \
-  --listen 127.0.0.1:8001 \
-  --db "$PWD/.pi/rust-dev/test.db" \
-  --static-dir "$PWD/static" \
+./target/debug/fx-sim-rust \\
+  --listen 127.0.0.1:8001 \\
+  --db "$PWD/.pi/rust-dev/test.db" \\
+  --static-dir "$PWD/static" \\
   --admin-key "$PWD/.pi/rust-dev/admin.json"
 ```
 
 打开 `http://127.0.0.1:8001`，注册测试用户；管理员页面 `/admin`。Ctrl+C 关闭连接、后台任务与数据库。静态目录、数据库、管理员文件均为显式参数，支持任意工作目录；默认监听回环 8001。目录须预先存在。
 
-**不要将 Python 和 Rust 指向同一个可写数据库。** Python 有内存账户状态，双写会覆盖交易。切换原 8000 服务、真实数据库或旧文件清理必须单独确认，见 [计划](../REWRITE-RUST.md)。账户 token 存在浏览器 origin 下，换端口不会自动继承旧登录。
+**不要将 Python 和 Rust 指向同一个可写数据库。** Python 有内存账户状态，双写会覆盖交易。切换原 8000 服务、真实数据库或旧文件清理必须单独确认，见 [计划](REWRITE-RUST.md)。账户 token 存在浏览器 origin 下，换端口不会自动继承旧登录。
 
 ## 验证
 
@@ -48,13 +48,13 @@ PY
 ```sh
 python3 -B -m unittest -v test_fx_sim test_currency test_stopout test_web_panels
 node test_chart.js < static/app.js
-cargo fmt --manifest-path fx-sim-rust/Cargo.toml --check
-cargo clippy --locked --manifest-path fx-sim-rust/Cargo.toml --all-targets -- -D warnings
-cargo test --locked --manifest-path fx-sim-rust/Cargo.toml
-cargo build --locked --manifest-path fx-sim-rust/Cargo.toml
-cargo build --locked --manifest-path fx-sim-rust/Cargo.toml --example fixture_server
-python3 -B fx-sim-rust/tests/blackbox_contract.py
-python3 -B fx-sim-rust/tests/process_restart.py
+cargo fmt --manifest-path Cargo.toml --check
+cargo clippy --locked --manifest-path Cargo.toml --all-targets -- -D warnings
+cargo test --locked --manifest-path Cargo.toml
+cargo build --locked --manifest-path Cargo.toml
+cargo build --locked --manifest-path Cargo.toml --example fixture_server
+python3 -B tests/blackbox_contract.py
+python3 -B tests/process_restart.py
 ```
 
 所有测试使用临时数据库/回环临时端口/测试管理员配置，不读取真实用户数据或 Tiingo key。`fixture_server` 是测试工具，不是生产入口。
@@ -62,7 +62,7 @@ python3 -B fx-sim-rust/tests/process_restart.py
 外部行情 smoke test **单独**执行，不能用网络故障替代确定性回归结论：
 
 ```sh
-cargo run --locked --manifest-path fx-sim-rust/Cargo.toml --example market_smoke
+cargo run --locked --manifest-path Cargo.toml --example market_smoke
 ```
 
 最新验收记录见 [ACCEPTANCE.md](ACCEPTANCE.md)。

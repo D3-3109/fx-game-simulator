@@ -26,7 +26,7 @@ __pycache__/
 
 # Rust build output
 /target/
-/fx-sim-rust/target/
+
 
 # realmem: share project memories (.pi/realmem) through git
 !/.pi/

@@ -249,7 +249,7 @@ impl Market {
             "1m" => ("1m", "3d"),
             "5m" => ("5m", "1mo"),
             "15m" => ("15m", "1mo"),
-            "30m" => ("30m", "2mo"),
+            "30m" => ("30m", "1mo"),
             "1h" | "4h" => ("60m", "3mo"),
             "1d" => ("1d", "1y"),
             "1w" => ("1wk", "2y"),
@@ -325,6 +325,26 @@ impl Market {
             } else {
                 bars
             }
+        } else if symbols::STOCK.contains(&symbol) {
+            let data = self.yahoo_chart(symbol, interval).await?;
+            let result = &data["chart"]["result"][0];
+            let quote = &result["indicators"]["quote"][0];
+            let times = result["timestamp"].as_array().ok_or("K线无效")?;
+            let mut bars = Vec::new();
+            for (i, t) in times.iter().enumerate() {
+                let (Some(time), Some(o), Some(h), Some(l), Some(c)) = (
+                    t.as_i64(),
+                    quote["open"][i].as_f64(),
+                    quote["high"][i].as_f64(),
+                    quote["low"][i].as_f64(),
+                    quote["close"][i].as_f64(),
+                ) else {
+                    continue;
+                };
+                bars.push([(time * 1000) as f64, o, h, l, c]);
+            }
+            let skip = bars.len().saturating_sub(limit);
+            bars.into_iter().skip(skip).collect()
         } else {
             let raw=self.get(&format!("https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}")).await?;
             raw.as_array()

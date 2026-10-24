@@ -24,8 +24,8 @@
   <div class="order-symbol"><b id="order-symbol">USDJPY</b><span>美元结算</span></div>
   <label for="lots">交易手数<input id="lots" type="number" min="0.01" step="0.01" value="0.10" inputmode="decimal" required></label>
   <div class="lot-presets" role="group" aria-label="快捷手数">
-   <button type="button" data-lots="0.01" onclick="setLots(0.01)">0.01</button><button type="button" data-lots="0.1" onclick="setLots(0.1)">0.10</button>
-   <button type="button" data-lots="0.5" onclick="setLots(0.5)">0.50</button><button type="button" data-lots="1" onclick="setLots(1)">1.00</button>
+   <button type="button" data-lots="0.01" onclick="setLots(this.dataset.lots)">0.01</button><button type="button" data-lots="0.1" onclick="setLots(this.dataset.lots)">0.10</button>
+   <button type="button" data-lots="0.5" onclick="setLots(this.dataset.lots)">0.50</button><button type="button" data-lots="1" onclick="setLots(this.dataset.lots)">1.00</button>
   </div>
   <div class="order-buttons"><button id="trade-buy" type="button" class="buy" onclick="trade('buy')">BUY<small id="buy-price">—</small></button>
    <button id="trade-sell" type="button" class="sell" onclick="trade('sell')">SELL<small id="sell-price">—</small></button></div>

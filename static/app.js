@@ -289,7 +289,7 @@ function msg(t){clearTimeout(messageTimer);$('msg').textContent=t;messageTimer=s
 function syncLotPresets(){
  document.querySelectorAll('[data-lots]').forEach(button=>button.setAttribute('aria-pressed',Number(button.dataset.lots)===Number($('lots').value)));
 }
-function setLots(value){$('lots').value=STOCKS.includes(cur.sym)?value:value.toFixed(2);syncLotPresets()}
+function setLots(value){const n=Number(value);$('lots').value=STOCKS.includes(cur.sym)?String(n):n.toFixed(2);syncLotPresets()}
 $('lots').addEventListener('input',syncLotPresets);syncLotPresets();
 async function trade(side){
  if(orderBusy)return;
@@ -486,7 +486,7 @@ async function refresh(){
 /* ws */
 let ws=null,wsTimer=null;
 function wsConnect(){
- try{ws=new WebSocket(`ws://${location.host}/ws?token=${TOKEN}`)}catch(e){return}
+ try{ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws?token=${TOKEN}`)}catch(e){return}
  ws.onmessage=e=>{const d=JSON.parse(e.data);
   if(d.type==='symbols'){applySymbols(d);return}
   if(d.type==='chat'){renderChat([d.row]);return}

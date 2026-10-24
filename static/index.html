@@ -1,72 +1,104 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="theme-color" content="#10141c">
+<meta name="theme-color" content="#000000">
 <title>— | USDJPY</title>
 <link rel="stylesheet" href="/app.css"></head><body>
 <div id="auth"><div id="authbox">
- <div class="brand"><span class="brand-mark" aria-hidden="true">FX</span><span>FX SIM<small>外汇对战模拟器</small></span></div>
- <h1>进入你的交易台</h1><p class="muted">真实行情，模拟资金。与其他交易者一起对战。</p>
+ <div class="brand"><span class="brand-mark" aria-hidden="true">NS</span><span>NorthStar<small>北极星模拟交易所</small></span></div>
+ <h1>登录交易所</h1><p class="muted">真实行情 + 北极星币 NSTAR/USDT。现货、永续合约，与其他交易者同场竞技。</p>
  <form id="auth-form" onsubmit="event.preventDefault();doAuth('login')">
   <label for="f-name">用户名</label><input id="f-name" placeholder="输入用户名" maxlength="16" autocomplete="username" required>
   <label for="f-pwd">密码</label><input id="f-pwd" type="password" placeholder="输入密码" autocomplete="current-password" required aria-describedby="pwd-rule">
   <p id="pwd-rule" class="auth-rule">注册：用户名2-16字（文字、数字、_或-）；密码8位以上，含字母和数字</p>
   <div id="autherr" role="alert"></div>
-  <button id="auth-login" class="primary" type="submit">登录交易台</button>
-  <button id="auth-register" type="button" onclick="doAuth('register')">注册 · 领取 $10,000.00 模拟资金</button>
+  <button id="auth-login" class="primary" type="submit">登录</button>
+  <button id="auth-register" type="button" onclick="doAuth('register')">注册 · 领取 10,000 USDT 体验金</button>
  </form>
  <p class="auth-note">仅供模拟练习，不涉及真实资金交易。</p>
 </div></div>
 
-<div id="wrap" style="display:none">
+<div id="shell" hidden>
+<nav id="topnav" aria-label="主导航">
+ <div class="brand"><span class="brand-mark" aria-hidden="true">NS</span><span>NorthStar</span></div>
+ <div class="nav-links"><b>交易</b><span>现货</span><span>永续合约</span><span>排行榜</span></div>
+ <div class="user-controls"><span id="connection" class="connection" data-state="connecting" role="status">连接中</span><span id="who"></span><button class="quiet" type="button" onclick="logout()">退出</button></div>
+</nav>
+<header id="pairbar">
+ <div class="market-controls"><label class="sr-only" for="sym">交易币对</label><select id="sym"></select></div>
+ <div class="quote"><div class="quote-price"><span id="price" aria-label="最新报价">—</span><span id="quote-unit"></span></div><span id="quote-change" class="quote-change" title="较前日收盘"></span></div>
+ <div class="stat" data-nstar hidden><span>标记价格</span><b id="stat-mark">—</b></div>
+ <div class="stat" data-nstar hidden><span>公允价值</span><b id="stat-fair">—</b></div>
+ <div class="stat" data-nstar hidden><span>24h 最高</span><b id="stat-high">—</b></div>
+ <div class="stat" data-nstar hidden><span>24h 最低</span><b id="stat-low">—</b></div>
+ <div class="stat" data-nstar hidden><span>24h 成交量 (NSTAR)</span><b id="stat-vol">—</b></div>
+ <div class="stat" data-nstar hidden><span>24h 成交额 (USDT)</span><b id="stat-turnover">—</b></div>
+ <div class="stat" data-nstar hidden><span>资金费率 / 倒计时</span><b><span id="stat-funding">—</span> / <span id="stat-countdown" class="countdown">—</span></b></div>
+</header>
+
+<div id="wrap">
 <aside id="tradebar" aria-label="下单">
- <div class="section-heading"><h2>交易下单</h2><span class="tag">市价单</span></div>
- <div class="order-form">
-  <div class="order-symbol"><b id="order-symbol">USDJPY</b><span>美元结算</span></div>
-  <label for="lots">交易手数<input id="lots" type="number" min="0.01" step="0.01" value="0.10" inputmode="decimal" required></label>
-  <div class="lot-presets" role="group" aria-label="快捷手数">
+ <div class="mode-tabs" role="tablist" aria-label="交易模式">
+  <button type="button" role="tab" id="mode-perp" aria-selected="true" onclick="setMode('perp')">永续合约</button>
+  <button type="button" role="tab" id="mode-spot" aria-selected="false" onclick="setMode('spot')">现货</button>
+ </div>
+ <div id="perp-form" class="order-form">
+  <div class="order-symbol"><b id="order-symbol">USDJPY</b><span>市价 · USDT 结算</span></div>
+  <label class="field" for="lots"><span>数量</span><input id="lots" type="number" min="0.01" step="0.01" value="0.10" inputmode="decimal" required><span id="lots-unit" class="unit">手</span></label>
+  <div class="lot-presets" role="group" aria-label="快捷数量">
    <button type="button" data-lots="0.01" onclick="setLots(this.dataset.lots)">0.01</button><button type="button" data-lots="0.1" onclick="setLots(this.dataset.lots)">0.10</button>
    <button type="button" data-lots="0.5" onclick="setLots(this.dataset.lots)">0.50</button><button type="button" data-lots="1" onclick="setLots(this.dataset.lots)">1.00</button>
   </div>
+  <div class="order-meta"><span>名义价值</span><b id="order-notional">—</b></div>
+  <div class="order-meta"><span>所需保证金</span><b id="order-margin">—</b></div>
   <div class="order-buttons"><button id="trade-buy" type="button" class="buy" onclick="trade('buy')">BUY<small id="buy-price">—</small></button>
    <button id="trade-sell" type="button" class="sell" onclick="trade('sell')">SELL<small id="sell-price">—</small></button></div>
+  <p id="symbol-status" class="muted" role="status"></p>
  </div>
- <p id="symbol-status" class="muted" role="status"></p>
- <form class="leverage-form" onsubmit="event.preventDefault();setLev()">
+ <form id="lev-form" class="leverage-form" onsubmit="event.preventDefault();setLev()">
   <label for="lev">杠杆倍数<input id="lev" type="number" min="1" max="9007199254740991" step="1" list="lev-presets" required oninput="levDirty=true"></label>
   <datalist id="lev-presets"><option value="1"><option value="10"><option value="20"><option value="50">
    <option value="100"><option value="200"><option value="500"><option value="1000"></datalist>
   <button id="lev-apply" type="submit">应用杠杆</button>
   <p id="lev-hint">持仓时不可修改杠杆</p>
  </form>
- <div class="close-section"><button id="close-all" type="button" onclick="closeAll()">全部平仓</button></div>
+ <div id="close-box" class="close-section"><button id="close-all" type="button" onclick="closeAll()">全部平仓</button></div>
+ <div id="spot-form" class="order-form" hidden>
+  <div class="order-symbol"><b>NSTAR/USDT</b><span>现货 · 手续费 0.1%</span></div>
+  <div class="side-tabs" role="tablist" aria-label="买卖方向">
+   <button type="button" role="tab" id="spot-side-buy" class="buy" aria-selected="true" onclick="setSpotSide('buy')">买入</button>
+   <button type="button" role="tab" id="spot-side-sell" class="sell" aria-selected="false" onclick="setSpotSide('sell')">卖出</button>
+  </div>
+  <label class="field" for="spot-units"><span>数量</span><input id="spot-units" type="number" min="0.0001" step="0.0001" value="1" inputmode="decimal" required><span class="unit">NSTAR</span></label>
+  <div class="lot-presets" role="group" aria-label="按比例">
+   <button type="button" onclick="spotPercent(.25)">25%</button><button type="button" onclick="spotPercent(.5)">50%</button>
+   <button type="button" onclick="spotPercent(.75)">75%</button><button type="button" onclick="spotPercent(1)">100%</button>
+  </div>
+  <div class="order-meta"><span>预估金额</span><b id="spot-total">—</b></div>
+  <div class="order-meta"><span>可用</span><b id="spot-avail">—</b></div>
+  <button id="spot-submit" type="button" class="spot-submit buy" onclick="spotTrade()">买入 NSTAR</button>
+ </div>
  <div id="acct" aria-label="账户概览"><span class="muted">正在加载账户…</span></div>
-<div id="loan-panel" class="loan-panel">
- <div id="debt-status" class="debt-status" role="status" aria-live="polite"></div>
- <div class="loan-row">
-  <label>借款金额 / USD<input id="borrow-amount" type="number" min="1" step="1" value="1000"></label>
-  <button id="borrow-btn" type="button" onclick="borrowMoney()">借款</button>
- </div>
- <div class="loan-row">
-  <label>还款金额 / USD<input id="repay-amount" type="number" min="1" step="1" value="1000"></label>
-  <button id="repay-btn" type="button" onclick="repayMoney()">还款</button>
- </div>
- <div class="loan-row">
-  <button id="reset-btn" type="button" class="danger" onclick="resetAccount()">重置账号（清空余额、持仓和贷款）</button>
- </div>
-</div>
+ <details id="loan-panel" class="loan-panel">
+  <summary>借贷与账户</summary>
+  <div id="debt-status" class="debt-status" role="status" aria-live="polite"></div>
+  <div class="loan-row"><label>借款 / USDT<input id="borrow-amount" type="number" min="1" step="1" value="1000"></label>
+   <button id="borrow-btn" type="button" onclick="borrowMoney()">借款</button></div>
+  <div class="loan-row"><label>还款 / USDT<input id="repay-amount" type="number" min="1" step="1" value="1000"></label>
+   <button id="repay-btn" type="button" onclick="repayMoney()">还款</button></div>
+  <button id="reset-btn" type="button" class="danger" onclick="resetAccount()">重置账号（清空余额、持仓、现货和贷款）</button>
+ </details>
 </aside>
 <div id="left-splitter" class="splitter vertical" role="separator" aria-label="调整下单栏宽度"
- aria-orientation="vertical" tabindex="0" aria-valuemin="160" aria-valuemax="520" aria-valuenow="240" title="左右拖动；方向键微调，双击恢复"></div>
+ aria-orientation="vertical" tabindex="0" aria-valuemin="160" aria-valuemax="520" aria-valuenow="280" title="左右拖动；方向键微调，双击恢复"></div>
 <div id="app">
-<header>
- <div class="market-controls"><label class="sr-only" for="sym">交易币对</label><select id="sym"></select>
- <label class="sr-only" for="itv">K线周期</label><select id="itv"></select></div>
- <div class="quote"><div class="quote-price"><span id="price" aria-label="最新报价">—</span><span id="quote-unit"></span></div><span id="quote-change" class="quote-change" title="较前日收盘"></span></div>
- <div class="user-controls"><span id="connection" class="connection" data-state="connecting" role="status">连接中</span><span id="who"></span><button class="quiet" type="button" onclick="logout()">退出</button></div>
-</header>
 <div id="workspace">
-<div id="chartpane" aria-busy="true"><div id="cv"></div><div id="px"></div>
+<div id="chartpane" aria-busy="true">
+ <div class="chart-toolbar" role="toolbar" aria-label="K线周期">
+  <span id="itv-quick"></span>
+  <label>更多<select id="itv"></select></label>
+ </div>
+ <div id="cv"></div><div id="px"></div>
  <div id="msg" role="status" aria-live="polite"></div>
  <ol id="nstar-feed" aria-label="NSTAR 市场快讯" aria-live="polite"></ol>
  <div id="chartpane-status" class="panel-status" role="status" aria-live="polite" data-state="loading">
@@ -77,52 +109,85 @@
  tabindex="0" aria-valuemin="15" aria-valuemax="90" aria-valuenow="68" title="上下拖动调整高度；方向键微调，双击恢复"></div>
 <div id="lowerpanels">
 <section id="positions" aria-label="当前持仓" aria-busy="true">
- <div class="panel-heading"><h3>当前持仓 <span id="position-count" class="count">0</span></h3><span>盈亏 / USD</span></div>
+ <div class="panel-heading"><div class="tabs" role="tablist">
+  <button type="button" role="tab" aria-selected="true" data-lower="pos">持仓 <span id="position-count" class="count">0</span></button>
+  <button type="button" role="tab" aria-selected="false" data-lower="spot">资产 <span id="spot-count" class="count">0</span></button>
+ </div><span>盈亏 / USDT</span></div>
  <div id="positions-status" class="panel-status" role="status" aria-live="polite" data-state="loading">
   <span class="spinner" aria-hidden="true"></span><span class="status-text">Loading...</span>
   <button onclick="refresh()">重试</button></div>
- <table id="pos"><thead><tr>
-  <th>ID</th><th>方向</th><th class="ctr">手数</th><th>币对</th><th>开仓价</th><th>现价</th><th>浮动盈亏</th><th>保证金</th><th>操作</th>
- </tr></thead><tbody></tbody></table>
+ <div class="table-scroll" data-lower-pane="pos"><table id="pos"><thead><tr>
+  <th>合约</th><th>方向</th><th class="ctr">数量</th><th>开仓价</th><th>标记价</th><th>预估强平价</th><th>未实现盈亏 (收益率)</th><th>保证金</th><th>止盈 / 止损</th><th>操作</th>
+ </tr></thead><tbody></tbody></table></div>
+ <div class="table-scroll" data-lower-pane="spot" hidden><table id="spotT"><thead><tr>
+  <th>币种</th><th>可用</th><th>持仓均价</th><th>现价</th><th>估值 (USDT)</th><th>盈亏</th>
+ </tr></thead><tbody></tbody></table></div>
 </section>
 <div id="history-splitter" class="splitter" role="separator" aria-label="调整持仓和成交记录高度"
  aria-orientation="horizontal" tabindex="0" aria-valuemin="15" aria-valuemax="85" aria-valuenow="60" title="上下拖动；方向键微调，双击恢复"></div>
 <section id="history" aria-label="成交记录" aria-busy="true">
- <div class="panel-heading"><h3>成交记录</h3><span>最近 100 笔</span></div>
+ <div class="panel-heading"><h3>历史成交</h3><span>最近 100 笔</span></div>
  <div id="history-status" class="history-status" hidden role="status" aria-live="polite">
   <span class="spinner" aria-hidden="true"></span><span class="status-text">Loading...</span>
   <button onclick="loadHistory()">重试</button></div>
- <table id="historyT"><thead><tr><th>时间</th><th>操作</th><th>ID</th><th>币对</th><th>方向</th>
-  <th>手数</th><th>开仓价</th><th>成交价</th><th>已实现盈亏</th><th>成交后余额</th></tr></thead><tbody></tbody></table>
+ <div class="table-scroll"><table id="historyT"><thead><tr><th>时间</th><th>类型</th><th>ID</th><th>币对</th><th>方向</th>
+  <th>数量</th><th>开仓价</th><th>成交价</th><th>已实现盈亏</th><th>成交后余额</th></tr></thead><tbody></tbody></table></div>
+</section>
+</div>
+</div>
+</div>
+<div id="right-splitter" class="splitter vertical" role="separator" aria-label="调整盘口栏宽度"
+ aria-orientation="vertical" tabindex="0" aria-valuemin="160" aria-valuemax="520" aria-valuenow="300" title="左右拖动；方向键微调，双击恢复"></div>
+<div id="rightbar">
+<section id="lbbar" aria-label="订单簿与排行" aria-busy="true">
+ <div class="panel-heading"><div class="tabs" role="tablist">
+  <button type="button" role="tab" aria-selected="true" data-upper="book">订单表</button>
+  <button type="button" role="tab" aria-selected="false" data-upper="rank">对战排行</button>
+ </div><span class="tag">实时</span></div>
+ <div id="lbbar-status" class="panel-status" role="status" aria-live="polite" data-state="loading">
+  <span class="spinner" aria-hidden="true"></span><span class="status-text">Loading...</span>
+  <button onclick="loadLeaderboard()">重试</button></div>
+ <div id="book" data-upper-pane="book">
+  <div class="book-head"><span>价格 (USDT)</span><span>数量</span><span>累计</span></div>
+  <div id="book-asks" class="book-side"></div>
+  <div class="book-mid"><b id="book-last">—</b><span id="book-spread"></span></div>
+  <div id="book-bids" class="book-side"></div>
+ </div>
+ <div class="side-pane" data-upper-pane="rank" hidden>
+  <table id="rankT"><thead><tr><th>#</th><th>玩家</th><th>净值</th><th>总收益</th><th>近 5 分钟</th></tr></thead><tbody></tbody></table>
+ </div>
+</section>
+<div id="chat-splitter" class="splitter" role="separator" aria-label="调整盘口和聊天高度"
+ aria-orientation="horizontal" tabindex="0" aria-valuemin="15" aria-valuemax="85" aria-valuenow="50" title="上下拖动；方向键微调，双击恢复"></div>
+<section id="chatpane" aria-label="最新成交与聊天" aria-busy="true">
+ <div class="panel-heading"><div class="tabs" role="tablist">
+  <button type="button" role="tab" aria-selected="true" data-chat="tape">最新成交</button>
+  <button type="button" role="tab" aria-selected="false" data-chat="chat">聊天室</button>
+ </div></div>
+ <div id="tape" data-chat-pane="tape"><div class="book-head"><span>价格 (USDT)</span><span>数量</span><span>时间</span></div><div id="tape-rows"></div></div>
+ <div class="side-pane chat-pane" data-chat-pane="chat" hidden>
+  <div id="chat-messages" role="log" aria-live="polite" aria-relevant="additions"></div>
+  <form id="chat-form" onsubmit="event.preventDefault();sendChat()">
+   <textarea id="chat-text" rows="2" maxlength="300" required aria-label="聊天内容" placeholder="说点什么…"></textarea>
+   <div class="chat-actions"><span class="muted">最多 300 字</span><button id="chat-send" type="submit">发送</button></div><div id="chat-error" role="status"></div>
+  </form>
+ </div>
+ <div id="chatpane-status" class="panel-status" role="status" aria-live="polite" data-state="loading" hidden>
+  <span class="spinner" aria-hidden="true"></span><span class="status-text">Loading...</span>
+  <button onclick="loadChat()">重试</button></div>
 </section>
 </div>
 </div>
 </div>
 
-<div id="right-splitter" class="splitter vertical" role="separator" aria-label="调整排行栏宽度"
- aria-orientation="vertical" tabindex="0" aria-valuemin="160" aria-valuemax="520" aria-valuenow="264" title="左右拖动；方向键微调，双击恢复"></div>
-<div id="rightbar">
-<section id="lbbar" aria-label="对战排行" aria-busy="true">
- <div class="panel-heading"><h3>对战排行</h3><span class="tag">实时</span></div>
- <div id="lbbar-status" class="panel-status" role="status" aria-live="polite" data-state="loading">
-  <span class="spinner" aria-hidden="true"></span><span class="status-text">Loading...</span>
-  <button onclick="loadLeaderboard()">重试</button></div>
- <table id="rankT"><thead><tr><th>#</th><th>玩家</th><th>净值</th><th>总收益</th><th>近 5 分钟</th></tr></thead><tbody></tbody></table>
-</section>
-<div id="chat-splitter" class="splitter" role="separator" aria-label="调整排行和聊天高度"
- aria-orientation="horizontal" tabindex="0" aria-valuemin="15" aria-valuemax="85" aria-valuenow="50" title="上下拖动；方向键微调，双击恢复"></div>
-<section id="chatpane" aria-label="聊天" aria-busy="true">
- <div class="panel-heading"><h3>聊天室</h3><span>一起聊聊行情</span></div>
- <div id="chat-messages" role="log" aria-live="polite" aria-relevant="additions"></div>
- <div id="chatpane-status" class="panel-status" role="status" aria-live="polite" data-state="loading">
-  <span class="spinner" aria-hidden="true"></span><span class="status-text">Loading...</span>
-  <button onclick="loadChat()">重试</button></div>
- <form id="chat-form" onsubmit="event.preventDefault();sendChat()">
-  <textarea id="chat-text" rows="2" maxlength="300" required aria-label="聊天内容" placeholder="说点什么…"></textarea>
-  <div class="chat-actions"><span class="muted">最多 300 字</span><button id="chat-send" type="submit">发送</button></div><div id="chat-error" role="status"></div>
+<dialog id="tpsl-dialog" aria-labelledby="tpsl-title">
+ <h3 id="tpsl-title">设置止盈止损</h3>
+ <form method="dialog" onsubmit="event.preventDefault();saveTpsl()">
+  <p id="tpsl-info" class="muted"></p>
+  <label class="field" for="tpsl-tp"><span>止盈价</span><input id="tpsl-tp" type="number" min="0" step="any" placeholder="不设置"><span class="unit">USDT</span></label>
+  <label class="field" for="tpsl-sl"><span>止损价</span><input id="tpsl-sl" type="number" min="0" step="any" placeholder="不设置"><span class="unit">USDT</span></label>
+  <div class="dialog-actions"><button type="button" onclick="closeTpsl()">取消</button><button type="submit" class="primary">确认</button></div>
  </form>
-</section>
-</div>
-</div>
+</dialog>
 
 <script src="/app.js"></script></body></html>

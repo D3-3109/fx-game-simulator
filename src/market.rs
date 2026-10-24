@@ -413,9 +413,10 @@ impl Market {
     ) -> Result<()> {
         let users = self.store.users().await.map_err(|_| "风险账户读取失败")?;
         for user in users {
-            let needed = match trading::price_symbols(
-                user.account.positions.iter().map(|p| p.symbol.as_str()),
-            ) {
+            if user.account.positions.is_empty() {
+                continue;
+            }
+            let needed = match trading::price_symbols(user.account.symbols()) {
                 Ok(s) => s,
                 Err(_) => continue,
             };
@@ -438,7 +439,15 @@ impl Market {
             // Re-load current holdings under Store's mutation lock; stale account snapshots cannot double-settle.
             if let Err(e) = self
                 .store
-                .transaction(&user.name, |a, _, _| a.check_stopout(&prices, now))
+                .transaction(&user.name, |a, _, _| {
+                    let mut trades = a.check_triggers(&prices, now)?;
+                    let mut after = prices.clone();
+                    for t in &trades {
+                        trading::apply_fill(&mut after, t)?;
+                    }
+                    trades.extend(a.check_stopout(&after, now)?);
+                    Ok(trades)
+                })
                 .await
             {
                 match e {
@@ -493,6 +502,17 @@ impl Market {
         drop(sim);
         self.on_market_quote(symbol, quote).await?;
         Ok((packet, events))
+    }
+    /// Current hourly funding rate per book symbol.
+    pub async fn funding_rates(&self) -> BTreeMap<String, f64> {
+        BTreeMap::from([(
+            symbols::NSTAR.to_string(),
+            self.nstar.lock().await.book.funding_rate(),
+        )])
+    }
+    /// Public NSTAR market panel (24 h stats, fair value, funding, trades tape).
+    pub async fn nstar_stats(&self) -> Value {
+        self.nstar.lock().await.stats()
     }
     /// Lock the NSTAR book for one account operation. Orders are priced and applied one at a
     /// time, so splitting an order across requests cannot reuse a mid it already moved.
@@ -753,6 +773,9 @@ impl SimFeed {
     fn packet(&self) -> Value {
         let mut packet = self.quote().packet(self.symbol, self.updated_at);
         packet["time"] = json!(self.updated_at);
+        if trading::depth(self.symbol) > 0.0 {
+            packet["market"] = self.stats();
+        }
         packet["klines"] = json!(
             symbols::INTERVALS
                 .iter()
@@ -760,6 +783,22 @@ impl SimFeed {
                 .collect::<BTreeMap<_, _>>()
         );
         packet
+    }
+    /// Public market panel: 24 h range and volume, fair value, funding, recent prints.
+    fn stats(&self) -> Value {
+        let hours: Vec<&[f64; 5]> = self.bars[&3600].iter().rev().take(24).collect();
+        let open = hours.last().map_or(self.price, |b| b[1]);
+        let high = hours.iter().map(|b| b[2]).fold(self.price, f64::max);
+        let low = hours.iter().map(|b| b[3]).fold(self.price, f64::min);
+        let volume: f64 = self.book.volume.iter().map(|(_, v)| v).sum();
+        let tape: Vec<_> = self.book.tape.iter().rev().take(30).collect();
+        json!({
+            "open_24h": open, "high_24h": high, "low_24h": low,
+            "volume_24h": volume, "turnover_24h": volume * self.price,
+            "fair": self.book.fair.exp(), "funding_rate": self.book.funding_rate(),
+            "halted": self.book.halt > 0, "depth": trading::depth(self.symbol),
+            "tape": tape,
+        })
     }
     fn regime(&mut self, rng: &mut impl Rng) {
         if self.left == 0 {
@@ -866,6 +905,11 @@ const HALT_TICKS: std::ops::RangeInclusive<u32> = 10..=15;
 const RUMOR_LEAD: u32 = 25;
 const RUMOR_ACCURACY: f64 = 0.65;
 const NEWS_MIN_GAP: u32 = 1500;
+/// Recent prints kept for the trades tape.
+const TAPE_LEN: usize = 60;
+/// Funding charges this share of the hourly price-over-fair premium, capped per hour.
+const FUNDING_SHARE: f64 = 0.1;
+const FUNDING_CAP: f64 = 0.0075;
 /// Flow that moves price by 3% or more (~1,500 NSTAR) is announced.
 const BIG_FLOW: f64 = 0.03;
 
@@ -880,6 +924,10 @@ struct Book {
     news_in: u32,
     pending: Option<f64>,
     events: Vec<Value>,
+    /// Recent prints, newest last: [time ms, price, signed units].
+    tape: VecDeque<[f64; 3]>,
+    /// Per-second units traded over the last 24 h, oldest first: (second, units).
+    volume: VecDeque<(i64, f64)>,
 }
 impl Book {
     fn new(base: f64, price: f64) -> Self {
@@ -894,6 +942,8 @@ impl Book {
             news_in: NEWS_MIN_GAP,
             pending: None,
             events: Vec::new(),
+            tape: VecDeque::new(),
+            volume: VecDeque::new(),
         };
         book.clamp();
         book
@@ -990,15 +1040,36 @@ impl Book {
         );
         true
     }
+    fn print(&mut self, price: f64, units: f64) {
+        let now = now_ms();
+        self.tape.push_back([now as f64, price, units]);
+        while self.tape.len() > TAPE_LEN {
+            self.tape.pop_front();
+        }
+        let sec = now / 1000;
+        match self.volume.back_mut() {
+            Some((s, v)) if *s == sec => *v += units.abs(),
+            _ => self.volume.push_back((sec, units.abs())),
+        }
+        while self.volume.front().is_some_and(|(s, _)| *s <= sec - 86_400) {
+            self.volume.pop_front();
+        }
+    }
+    /// Hourly funding rate: the premium of price over fair value, clamped to ±0.75%.
+    fn funding_rate(&self) -> f64 {
+        ((self.log - self.fair) * FUNDING_SHARE).clamp(-FUNDING_CAP, FUNDING_CAP)
+    }
     /// Signed units bought (+) or sold (-) move the book immediately.
     fn flow(&mut self, units: f64, depth: f64, forced: bool) {
         if units == 0.0 {
             return;
         }
         let d = units / depth;
+        let avg = self.log.exp() * d.exp_m1() / d;
         self.log += d;
         self.fair += CONVICTION * d;
         self.clamp();
+        self.print(avg, units);
         if d.abs() >= BIG_FLOW {
             let side = if units > 0.0 { "买入" } else { "卖出" };
             let pct = d.exp_m1() * 100.0;

@@ -175,10 +175,7 @@ impl App {
         let user = self.store.user(name).await.map_err(|_| "账户读取失败")?;
         let prices = self
             .market
-            .prices(
-                std::iter::once(user.symbol.as_str())
-                    .chain(user.account.positions.iter().map(|p| p.symbol.as_str())),
-            )
+            .prices(std::iter::once(user.symbol.as_str()).chain(user.account.symbols()))
             .await?;
         let quote = self.market.snapshot().await[&user.symbol];
         let bid = trading::execution_price(&prices, &user.symbol, false)?;
@@ -191,9 +188,35 @@ impl App {
         let used = acc.used_margin(&prices)?;
         let equity = acc.equity(&prices)?;
         let marks = acc.marks(&prices)?;
-        let positions=acc.positions.iter().zip(marks).map(|(p,(now,pnl))|Ok(json!({"id":p.id,"side":p.side,"lots":p.lots,"sym":p.symbol,"entry":p.entry,"now":now,"pnl":pnl,"margin":p.margin(&prices,acc.leverage)?}))).collect::<Result<Vec<_>,String>>()?;
+        let mut positions = Vec::new();
+        for (p, (now, pnl)) in acc.positions.iter().zip(marks) {
+            let margin = p.margin(&prices, acc.leverage)?;
+            positions.push(json!({"id":p.id,"side":p.side,"lots":p.lots,"sym":p.symbol,
+                "entry":p.entry,"now":now,"pnl":pnl,"margin":margin,
+                "units":p.lots*trading::contract(&p.symbol),
+                "leverage":trading::leverage_for(&p.symbol,acc.leverage),
+                "roe":if margin>0.0 {pnl/margin} else {0.0},
+                "tp":p.tp,"sl":p.sl,
+                "liq":acc.liquidation_price(&p.symbol,&prices)?}));
+        }
+        let mut spot = Vec::new();
+        for (symbol, h) in &acc.spot {
+            let mid = trading::market_price(&prices, symbol)?;
+            let value = trading::sweep(mid, -h.units, trading::depth(symbol))
+                * h.units
+                * (1.0 - trading::SPOT_FEE);
+            spot.push(
+                json!({"sym":symbol,"units":h.units,"cost":h.cost,"price":mid,
+                "value":value,"pnl":value-h.cost*h.units}),
+            );
+        }
+        // Shown in the asset panel even with no NSTAR held; absent offline.
+        let nstar = match prices.get(symbols::NSTAR) {
+            Some(p) => Some(*p),
+            None => self.market.price(symbols::NSTAR).await.ok(),
+        };
         Ok(
-            json!({"ok":true,"type":"state","name":name,"symbol":user.symbol,"price":prices[&user.symbol],"bid":bid,"ask":ask,"quote_valid":quote_valid,"quote_at":if self.market.is_offline(){None}else{Some(quote.at)},"balance":acc.balance,"loan":acc.loan,"debt":acc.debt(),"debt_since":acc.debt_since,"debt_limit":trading::DEBT_LIMIT,"equity":equity,"used":used,"free":equity-used,"margin_level":if used==0.0 {None} else {Some(equity/used)},"leverage":acc.leverage,"positions":positions,"stopout_level":trading::STOPOUT,"currency":"USD","last_trade":user.last_trade}),
+            json!({"ok":true,"type":"state","name":name,"symbol":user.symbol,"price":prices[&user.symbol],"bid":bid,"ask":ask,"quote_valid":quote_valid,"quote_at":if self.market.is_offline(){None}else{Some(quote.at)},"balance":acc.balance,"loan":acc.loan,"debt":acc.debt(),"debt_since":acc.debt_since,"debt_limit":trading::DEBT_LIMIT,"equity":equity,"used":used,"free":equity-used,"margin_level":if used==0.0 {None} else {Some(equity/used)},"leverage":acc.leverage,"positions":positions,"spot":spot,"nstar_price":nstar,"spot_fee":trading::SPOT_FEE,"contract":trading::contract(&user.symbol),"symbol_leverage":trading::leverage_for(&user.symbol,acc.leverage),"funding_at":acc.funding_at,"stopout_level":trading::STOPOUT,"currency":"USD","last_trade":user.last_trade}),
         )
     }
     pub async fn leaderboard(&self) -> Result<Value, String> {
@@ -205,11 +228,7 @@ impl App {
         let online = self.online();
         let mut rows = Vec::new();
         for user in self.store.users().await.map_err(|_| "账户读取失败")? {
-            let Ok(prices) = self
-                .market
-                .prices(user.account.positions.iter().map(|p| p.symbol.as_str()))
-                .await
-            else {
+            let Ok(prices) = self.market.prices(user.account.symbols()).await else {
                 continue;
             };
             let Ok(eq) = user.account.equity(&prices) else {
@@ -229,6 +248,35 @@ impl App {
                 .total_cmp(&a["ret"].as_f64().unwrap())
         });
         Ok(json!({"ok":true,"rows":rows}))
+    }
+    /// Settle due hourly funding on every account holding a perpetual book position. Each
+    /// account is re-read under the store lock, so a settlement is never applied twice.
+    pub async fn settle_funding(&self) -> Result<(), String> {
+        let rates = self.market.funding_rates().await;
+        let now = storage::now_ms();
+        for user in self.store.users().await.map_err(|_| "账户读取失败")? {
+            let acc = &user.account;
+            if !acc.positions.iter().any(|p| rates.contains_key(&p.symbol)) {
+                continue;
+            }
+            let Ok(prices) = self.market.prices(acc.symbols()).await else {
+                continue;
+            };
+            let result = self
+                .store
+                .transaction(&user.name, |a, _, _| {
+                    let mut trades = a.settle_funding(&rates, &prices, now)?;
+                    if !trades.is_empty() {
+                        trades.extend(a.check_stopout(&prices, now)?);
+                    }
+                    Ok(trades)
+                })
+                .await;
+            if let Err(storage::Error::Database(_)) = result {
+                return Err("资金费保存失败".into());
+            }
+        }
+        Ok(())
     }
     pub async fn active_symbols(&self) -> Result<Vec<String>, String> {
         let mut out = std::collections::BTreeSet::new();

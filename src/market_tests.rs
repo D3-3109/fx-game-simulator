@@ -240,6 +240,8 @@ async fn stale_missing_and_out_of_order_quotes_never_misliquidate() {
                 lots: 0.1,
                 entry: 165.0,
                 symbol: "EURJPY".into(),
+                tp: 0.0,
+                sl: 0.0,
             }];
             Ok(vec![])
         })

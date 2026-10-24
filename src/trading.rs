@@ -8,6 +8,10 @@ pub const STOPOUT: f64 = 0.5;
 pub const MAX_LEVERAGE: u64 = 50_000;
 pub const MAX_LOTS: f64 = 100_000.0;
 pub const LOAN_RATE: f64 = 0.10;
+/// Spot taker fee (0.1%, OKX's base tier) and order size bounds in units.
+pub const SPOT_FEE: f64 = 0.001;
+pub const SPOT_MIN: f64 = 0.0001;
+pub const SPOT_MAX: f64 = 10_000.0;
 fn cents(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
 }
@@ -144,8 +148,11 @@ pub fn apply_fill(prices: &mut Prices, trade: &Trade) -> Result<()> {
     }
     let buy = matches!(
         (trade.kind.as_str(), trade.side.as_str()),
-        ("open", "long") | ("close" | "stopout", "short")
+        ("open", "long") | ("close" | "stopout" | "tp" | "sl", "short") | ("spot", "buy")
     );
+    if trade.kind == "funding" {
+        return Ok(());
+    }
     let units = trade.lots * contract(&trade.symbol) * if buy { 1.0 } else { -1.0 };
     let mid = market_price(prices, &trade.symbol)?;
     prices
@@ -209,6 +216,19 @@ pub struct Position {
     pub entry: f64,
     #[serde(default)]
     pub symbol: String,
+    /// Take-profit and stop-loss trigger prices (mid); 0 means unset.
+    #[serde(default)]
+    pub tp: f64,
+    #[serde(default)]
+    pub sl: f64,
+}
+
+/// Spot holding of a book symbol, owned outright: no leverage, no liquidation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Holding {
+    pub units: f64,
+    /// Average cost per unit in USD, fees included.
+    pub cost: f64,
 }
 
 impl Position {
@@ -263,6 +283,11 @@ pub struct Account {
     pub interest_at: i64,
     #[serde(default)]
     pub debt_since: i64,
+    #[serde(default)]
+    pub spot: BTreeMap<String, Holding>,
+    /// Last funding settlement time; 0 until the first perpetual position.
+    #[serde(default)]
+    pub funding_at: i64,
 }
 
 pub const DEBT_LIMIT: f64 = 100_000.0;
@@ -278,6 +303,8 @@ impl Default for Account {
             loan: 0.0,
             interest_at: 0,
             debt_since: 0,
+            spot: BTreeMap::new(),
+            funding_at: 0,
         }
     }
 }
@@ -320,6 +347,12 @@ impl Account {
                 || p.entry <= 0.0
             {
                 return Err("持仓记录无效".into());
+            }
+        }
+        for (symbol, h) in &self.spot {
+            if depth(symbol) <= 0.0 || !h.units.is_finite() || h.units < 0.0 || !h.cost.is_finite()
+            {
+                return Err("现货记录无效".into());
             }
         }
         Ok(())
@@ -443,7 +476,9 @@ impl Account {
     }
     pub fn equity(&self, prices: &Prices) -> Result<f64> {
         finite(
-            self.balance - self.loan + self.marks(prices)?.iter().map(|(_, pnl)| pnl).sum::<f64>(),
+            self.balance - self.loan
+                + self.spot_value(prices)?
+                + self.marks(prices)?.iter().map(|(_, pnl)| pnl).sum::<f64>(),
         )
     }
     pub fn used_margin(&self, prices: &Prices) -> Result<f64> {
@@ -517,6 +552,8 @@ impl Account {
             lots,
             entry: px,
             symbol: symbol.into(),
+            tp: 0.0,
+            sl: 0.0,
         };
         let trade = self.trade("open", &p, px, None, None, now);
         if depth(symbol) > 0.0 {
@@ -601,6 +638,218 @@ impl Account {
             trades.push(next.settle(index, &mut prices, "close", None, now)?);
         }
         *self = next;
+        Ok(trades)
+    }
+    /// Every symbol whose price this account's equity depends on.
+    pub fn symbols(&self) -> impl Iterator<Item = &str> {
+        self.positions
+            .iter()
+            .map(|p| p.symbol.as_str())
+            .chain(self.spot.keys().map(String::as_str))
+    }
+    /// Liquidation value of spot holdings at the live book.
+    pub fn spot_value(&self, prices: &Prices) -> Result<f64> {
+        let mut total = 0.0;
+        for (symbol, h) in self.spot.iter().filter(|(_, h)| h.units > 0.0) {
+            let mid = market_price(prices, symbol)?;
+            let px = sweep(mid, -h.units, depth(symbol)) * (1.0 - SPOT_FEE);
+            total += px * h.units;
+        }
+        finite(total)
+    }
+    /// Buy (`units > 0`) or sell spot units of a book symbol at its swept price, paying
+    /// the spot fee. Spot is fully paid: cash must cover the buy, units must cover the sale.
+    pub fn spot(&mut self, symbol: &str, units: f64, prices: &Prices, now: i64) -> Result<Trade> {
+        let depth = depth(symbol);
+        if depth <= 0.0 {
+            return Err("该币种不支持现货".into());
+        }
+        if !units.is_finite() || units.abs() < SPOT_MIN || units.abs() > SPOT_MAX {
+            return Err(format!("现货数量需在 {SPOT_MIN} 至 {SPOT_MAX} 之间"));
+        }
+        self.validate()?;
+        let mid = market_price(prices, symbol)?;
+        let avg = sweep(mid, units, depth);
+        let holding = self.spot.entry(symbol.into()).or_default();
+        let (side, pnl) = if units > 0.0 {
+            let cost = finite(avg * units * (1.0 + SPOT_FEE))?;
+            // Cash only: borrowed balance can fund spot, open-position margin cannot.
+            if cost > self.balance {
+                return Err(format!(
+                    "可用 USDT 不足: 需 {cost:.2}，余额 {:.2}",
+                    self.balance
+                ));
+            }
+            self.balance -= cost;
+            holding.cost = (holding.cost * holding.units + cost) / (holding.units + units);
+            holding.units += units;
+            ("buy", None)
+        } else {
+            let sell = -units;
+            if sell > holding.units + 1e-9 {
+                return Err(format!("{symbol} 可用余额不足: 持有 {:.4}", holding.units));
+            }
+            let proceeds = finite(avg * sell * (1.0 - SPOT_FEE))?;
+            let pnl = proceeds - holding.cost * sell;
+            self.balance += proceeds;
+            holding.units -= sell;
+            if holding.units < 1e-9 {
+                self.spot.remove(symbol);
+            }
+            ("sell", Some(pnl))
+        };
+        Ok(Trade {
+            time: now,
+            kind: "spot".into(),
+            position_id: 0,
+            symbol: symbol.into(),
+            side: side.into(),
+            lots: units.abs() / contract(symbol),
+            entry: 0.0,
+            price: avg,
+            pnl,
+            balance: self.balance,
+            margin_level: None,
+            currency: "USD".into(),
+        })
+    }
+    /// Set or clear (0) take-profit and stop-loss trigger prices on one position.
+    pub fn set_triggers(&mut self, id: u64, tp: f64, sl: f64, prices: &Prices) -> Result<()> {
+        let p = self
+            .positions
+            .iter_mut()
+            .find(|p| p.id == id)
+            .ok_or_else(|| format!("无 # {id} 持仓"))?;
+        for v in [tp, sl] {
+            if !v.is_finite() || v < 0.0 {
+                return Err("止盈止损价格无效".into());
+            }
+        }
+        let mid = market_price(prices, &p.symbol)?;
+        let long = p.side == "long";
+        if tp > 0.0 && (tp > mid) != long {
+            return Err(format!(
+                "{}止盈价需{}当前价",
+                if long { "多单" } else { "空单" },
+                if long { "高于" } else { "低于" }
+            ));
+        }
+        if sl > 0.0 && (sl < mid) != long {
+            return Err(format!(
+                "{}止损价需{}当前价",
+                if long { "多单" } else { "空单" },
+                if long { "低于" } else { "高于" }
+            ));
+        }
+        p.tp = tp;
+        p.sl = sl;
+        Ok(())
+    }
+    /// Close every position whose take-profit or stop-loss the mid has crossed.
+    pub fn check_triggers(&mut self, prices: &Prices, now: i64) -> Result<Vec<Trade>> {
+        let hit: Vec<(u64, &'static str)> = self
+            .positions
+            .iter()
+            .filter_map(|p| {
+                let mid = prices.get(&p.symbol).copied()?;
+                let long = p.side == "long";
+                if p.tp > 0.0 && (if long { mid >= p.tp } else { mid <= p.tp }) {
+                    Some((p.id, "tp"))
+                } else if p.sl > 0.0 && (if long { mid <= p.sl } else { mid >= p.sl }) {
+                    Some((p.id, "sl"))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut next = self.clone();
+        let mut prices = prices.clone();
+        let mut trades = Vec::new();
+        for (id, kind) in hit {
+            let index = next.positions.iter().position(|p| p.id == id).unwrap();
+            trades.push(next.settle(index, &mut prices, kind, None, now)?);
+        }
+        *self = next;
+        Ok(trades)
+    }
+    /// Mid at which the account would hit stop-out if only this symbol moved, holding
+    /// everything else fixed; None when no move in range would liquidate it.
+    pub fn liquidation_price(&self, symbol: &str, prices: &Prices) -> Result<Option<f64>> {
+        if !self.positions.iter().any(|p| p.symbol == symbol) {
+            return Ok(None);
+        }
+        let mid = market_price(prices, symbol)?;
+        let at = |px: f64| -> Result<bool> {
+            let mut q = prices.clone();
+            q.insert(symbol.into(), px);
+            Ok(self.margin_level(&q)?.is_some_and(|ml| ml < STOPOUT))
+        };
+        if at(mid)? {
+            return Ok(Some(mid));
+        }
+        let mut found = None;
+        for (lo, hi) in [(mid * 1e-3, mid), (mid, mid * 1e3)] {
+            let (bad, good) = if lo < mid { (lo, hi) } else { (hi, lo) };
+            if !at(bad)? {
+                continue;
+            }
+            let (mut bad, mut good) = (bad, good);
+            for _ in 0..60 {
+                let m = (bad * good).sqrt();
+                if at(m)? { bad = m } else { good = m }
+            }
+            let px = (bad * good).sqrt();
+            if found.is_none_or(|f: f64| (px - mid).abs() < (f - mid).abs()) {
+                found = Some(px);
+            }
+        }
+        Ok(found)
+    }
+    /// Settle hourly funding on book-symbol positions: longs pay shorts when the price is
+    /// above fair value and vice versa. `rates` holds the per-hour rate for each symbol.
+    pub fn settle_funding(
+        &mut self,
+        rates: &BTreeMap<String, f64>,
+        prices: &Prices,
+        now: i64,
+    ) -> Result<Vec<Trade>> {
+        const HOUR: i64 = 3_600_000;
+        let held = self.positions.iter().any(|p| rates.contains_key(&p.symbol));
+        if !held {
+            self.funding_at = now;
+            return Ok(vec![]);
+        }
+        if self.funding_at == 0 {
+            self.funding_at = now;
+        }
+        let hours = ((now - self.funding_at) / HOUR).min(24);
+        if hours <= 0 {
+            return Ok(vec![]);
+        }
+        self.funding_at += hours * HOUR;
+        let mut trades = Vec::new();
+        for p in self.positions.clone() {
+            let Some(rate) = rates.get(&p.symbol) else {
+                continue;
+            };
+            let notional = p.lots * contract(&p.symbol) * market_price(prices, &p.symbol)?;
+            let sign = if p.side == "long" { -1.0 } else { 1.0 };
+            let fee = finite(cents(sign * rate * notional * hours as f64))?;
+            if fee == 0.0 {
+                continue;
+            }
+            self.balance += fee;
+            let mut t = self.trade(
+                "funding",
+                &p,
+                market_price(prices, &p.symbol)?,
+                Some(fee),
+                None,
+                now,
+            );
+            t.balance = self.balance;
+            trades.push(t);
+        }
         Ok(trades)
     }
     pub fn check_stopout(&mut self, prices: &Prices, now: i64) -> Result<Vec<Trade>> {
@@ -738,6 +987,8 @@ mod tests {
                 lots: 0.1,
                 entry: 1.0,
                 symbol: "FXSIM".into(),
+                tp: 0.0,
+                sl: 0.0,
             }],
             ..Account::default()
         };
@@ -755,6 +1006,8 @@ mod tests {
             side: "long".into(),
             lots: 0.1,
             symbol: "FXSIM".into(),
+            tp: 0.0,
+            sl: 0.0,
         };
         a.balance = 80.0;
         a.positions = vec![p(1, 1.0), p(2, 1.001)];
@@ -976,5 +1229,140 @@ mod cap_tests {
         assert!(lots_valid("EURUSD", MAX_LOTS));
         assert!(!lots_valid("EURUSD", MAX_LOTS + 1.0));
         assert!(!lots_valid("NSTAR", 1e106));
+    }
+}
+
+#[cfg(test)]
+mod exchange_tests {
+    use super::*;
+    fn q(price: f64) -> Prices {
+        [("NSTAR".to_string(), price)].into()
+    }
+    #[test]
+    fn spot_buy_sell_pays_fee_and_impact_and_counts_in_equity() {
+        let mut a = Account::default();
+        let t = a.spot("NSTAR", 10.0, &q(100.0), 1).unwrap();
+        assert_eq!((t.kind.as_str(), t.side.as_str()), ("spot", "buy"));
+        assert!(t.price > 100.0, "buy sweeps up: {}", t.price);
+        let cost = 10_000.0 - a.balance;
+        assert!((cost - t.price * 10.0 * 1.001).abs() < 1e-6);
+        let h = &a.spot["NSTAR"];
+        assert!((h.cost - cost / 10.0).abs() < 1e-9);
+        let eq = a.equity(&q(100.0)).unwrap();
+        assert!(eq < 10_000.0 && eq > 9_990.0, "{eq}");
+        assert!(a.spot("NSTAR", -10.5, &q(100.0), 2).is_err(), "oversell");
+        assert!(a.spot("NSTAR", 1_000.0, &q(100.0), 2).is_err(), "cash only");
+        let t = a.spot("NSTAR", -10.0, &q(120.0), 3).unwrap();
+        assert!(t.pnl.unwrap() > 190.0, "{:?}", t.pnl);
+        assert!(!a.spot.contains_key("NSTAR"));
+        assert!(a.spot("BTCUSDT", 1.0, &q(100.0), 4).is_err());
+    }
+    #[test]
+    fn spot_round_trip_loses_and_split_buys_match_one() {
+        let mut a = Account::default();
+        let mut live = q(100.0);
+        let t = a.spot("NSTAR", 50.0, &live, 1).unwrap();
+        apply_fill(&mut live, &t).unwrap();
+        assert!(live["NSTAR"] > 100.0);
+        let t = a.spot("NSTAR", -50.0, &live, 2).unwrap();
+        apply_fill(&mut live, &t).unwrap();
+        assert!((live["NSTAR"] - 100.0).abs() < 1e-6);
+        assert!(
+            a.balance < 10_000.0,
+            "pump and dump on spot must lose: {}",
+            a.balance
+        );
+    }
+    #[test]
+    fn triggers_validate_side_and_fire_once() {
+        let mut a = Account::default();
+        a.open("long", 1_000.0, "NSTAR", &q(100.0), 1, 0).unwrap();
+        assert!(
+            a.set_triggers(1, 90.0, 0.0, &q(100.0)).is_err(),
+            "tp below long"
+        );
+        assert!(
+            a.set_triggers(1, 0.0, 110.0, &q(100.0)).is_err(),
+            "sl above long"
+        );
+        a.set_triggers(1, 110.0, 95.0, &q(100.0)).unwrap();
+        assert!(a.check_triggers(&q(105.0), 1).unwrap().is_empty());
+        let t = a.check_triggers(&q(111.0), 2).unwrap();
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].kind, "tp");
+        assert!(t[0].pnl.unwrap() > 0.0);
+        assert!(a.positions.is_empty());
+        a.open("short", 1_000.0, "NSTAR", &q(100.0), 2, 0).unwrap();
+        a.set_triggers(2, 0.0, 104.0, &q(100.0)).unwrap();
+        assert_eq!(a.check_triggers(&q(104.5), 3).unwrap()[0].kind, "sl");
+        assert!(a.set_triggers(9, 1.0, 0.0, &q(100.0)).is_err());
+    }
+    #[test]
+    fn liquidation_price_is_where_stopout_starts() {
+        let mut a = Account {
+            balance: 1_000.0,
+            ..Account::default()
+        };
+        a.open("long", 50_000.0, "NSTAR", &q(100.0), 1, 0).unwrap();
+        let liq = a.liquidation_price("NSTAR", &q(100.0)).unwrap().unwrap();
+        assert!(liq < 100.0 && liq > 90.0, "{liq}");
+        let mut below = a.clone();
+        assert!(!below.check_stopout(&q(liq * 0.999), 1).unwrap().is_empty());
+        let mut above = a.clone();
+        assert!(above.check_stopout(&q(liq * 1.001), 1).unwrap().is_empty());
+        let mut short = Account {
+            balance: 1_000.0,
+            ..Account::default()
+        };
+        short
+            .open("short", 50_000.0, "NSTAR", &q(100.0), 1, 0)
+            .unwrap();
+        let liq = short
+            .liquidation_price("NSTAR", &q(100.0))
+            .unwrap()
+            .unwrap();
+        assert!(liq > 100.0 && liq < 110.0, "{liq}");
+        assert_eq!(
+            Account::default()
+                .liquidation_price("NSTAR", &q(100.0))
+                .unwrap(),
+            None
+        );
+    }
+    #[test]
+    fn funding_moves_cash_from_crowded_side_hourly() {
+        let rates: BTreeMap<String, f64> = [("NSTAR".to_string(), 0.0005)].into();
+        let mut a = Account::default();
+        a.open("long", 10_000.0, "NSTAR", &q(100.0), 1, 0).unwrap();
+        assert!(
+            a.settle_funding(&rates, &q(100.0), 1_000)
+                .unwrap()
+                .is_empty()
+        );
+        let hour = 3_600_000;
+        let t = a
+            .settle_funding(&rates, &q(100.0), 1_000 + 2 * hour + 5)
+            .unwrap();
+        // 100 NSTAR * $100 * 0.05% * 2 h = $10 paid by the long.
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].kind, "funding");
+        assert!((t[0].pnl.unwrap() + 10.0).abs() < 1e-9);
+        assert!(
+            a.settle_funding(&rates, &q(100.0), 1_000 + 2 * hour + 9)
+                .unwrap()
+                .is_empty()
+        );
+        let mut s = Account::default();
+        s.open("short", 10_000.0, "NSTAR", &q(100.0), 1, 0).unwrap();
+        s.settle_funding(&rates, &q(100.0), 7).unwrap();
+        let t = s.settle_funding(&rates, &q(100.0), 7 + hour).unwrap();
+        assert!((t[0].pnl.unwrap() - 5.0).abs() < 1e-9);
+    }
+    #[test]
+    fn legacy_account_json_without_new_fields_still_loads() {
+        let old = r#"{"balance":5.0,"leverage":100,"positions":[{"id":1,"side":"long","lots":1.0,"entry":1.1,"symbol":"FXSIM"}]}"#;
+        let a: Account = serde_json::from_str(old).unwrap();
+        assert!(a.spot.is_empty());
+        assert_eq!((a.positions[0].tp, a.positions[0].sl), (0.0, 0.0));
     }
 }

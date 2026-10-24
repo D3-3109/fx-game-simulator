@@ -65,6 +65,8 @@ async fn concurrent_risk_calls_settle_exactly_once() {
             lots: 0.1,
             entry: 1.0,
             symbol: "FXSIM".into(),
+            tp: 0.0,
+            sl: 0.0,
         }];
         Ok(vec![])
     })

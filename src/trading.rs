@@ -112,10 +112,8 @@ pub fn contract(symbol: &str) -> f64 {
 }
 
 pub fn lots_valid(symbol: &str, lots: f64) -> bool {
-    let (min, max, whole) = symbols::spec(symbol).map_or((0.01, f64::INFINITY, false), |s| {
-        (s.min_lots, s.max_lots, s.whole_lots)
-    });
-    lots.is_finite() && lots >= min && lots <= max && (!whole || lots.fract() == 0.0)
+    let (min, whole) = symbols::spec(symbol).map_or((0.01, false), |s| (s.min_lots, s.whole_lots));
+    lots.is_finite() && lots >= min && (!whole || lots.fract() == 0.0)
 }
 
 pub fn spread(symbol: &str, mid: f64) -> f64 {
@@ -395,11 +393,8 @@ impl Account {
             return Err("交易方向无效".into());
         }
         if !lots_valid(symbol, lots) {
-            let spec = symbols::spec(symbol);
-            return Err(if spec.is_some_and(|s| s.whole_lots) {
+            return Err(if symbols::spec(symbol).is_some_and(|s| s.whole_lots) {
                 "美股须为整数股且不少于1股".into()
-            } else if let Some(max) = spec.map(|s| s.max_lots).filter(|m| m.is_finite()) {
-                format!("手数须在0.01到{max}之间")
             } else {
                 "手数必须为有限数且不少于0.01".into()
             });
@@ -676,17 +671,6 @@ mod tests {
         );
         q.insert("USDCNH".into(), 6.7);
         assert!(!q.bid_ask.contains_key("USDCNH"));
-    }
-    #[test]
-    fn nstar_lot_cap_rejects_oversized_orders() {
-        assert!(lots_valid("NSTAR", 10.0));
-        assert!(!lots_valid("NSTAR", 10.01));
-        assert!(!lots_valid("NSTAR", 100.0));
-        assert!(lots_valid("BTCUSDT", 100.0));
-        let mut a = Account::default();
-        let q = quotes(&[("NSTAR", 100.0)]);
-        assert!(a.open("long", 11.0, "NSTAR", &q, 1, 0).is_err());
-        assert!(a.positions.is_empty());
     }
     #[test]
     fn nstar_margin_and_pnl_are_usd_at_its_price_level() {

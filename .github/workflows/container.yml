@@ -12,9 +12,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  IMAGE: ghcr.io/${{ github.repository }}
-
 jobs:
   # Same gates the README documents, so a broken build cannot reach an image.
   verify:
@@ -75,6 +72,9 @@ jobs:
       contents: read
       packages: write
     steps:
+      - name: Resolve image reference
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
 
@@ -123,6 +123,9 @@ jobs:
       contents: read
       packages: write
     steps:
+      - name: Resolve image reference
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
       - uses: actions/download-artifact@v4
         with:
           path: ${{ runner.temp }}/digests
@@ -159,14 +162,21 @@ jobs:
 
       - name: Verify both architectures are present
         run: |
-          docker buildx imagetools inspect "$IMAGE:${{ github.ref_name }}" \
-            --format '{{json .Manifest}}' | jq -r '.manifests[].platform | "\(.os)/\(.architecture)"'
+          # The smoke job pulls the sha tag, so verify the manifest via that ref.
+          docker buildx imagetools inspect "$IMAGE:sha-${GITHUB_SHA::7}" \
+            --format '{{json .Manifest}}' \
+            | jq -r '.manifests[] | .platform | "\(.os)/\(.architecture)"' | sort | tee /tmp/platforms
+          grep -qx 'linux/amd64' /tmp/platforms
+          grep -qx 'linux/arm64' /tmp/platforms
 
   # Smoke-test the published image: bootstrap the admin key, then register a user.
   smoke:
     needs: merge
     runs-on: ubuntu-24.04
     steps:
+      - name: Resolve image reference
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
       - name: Run the published image
         run: |
           set -eu

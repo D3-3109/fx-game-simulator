@@ -73,7 +73,7 @@ const fn stock(symbol: &'static str) -> Spec {
 }
 const SPECS: &[Spec] = &[
     lot(SIM, TIGHT, None),
-    lot(NSTAR, TIGHT, None),
+    coin(NSTAR),
     lot("BTCUSDT", TIGHT, None),
     lot("ETHUSDT", TIGHT, None),
     lot("EURUSDT", TIGHT, None),

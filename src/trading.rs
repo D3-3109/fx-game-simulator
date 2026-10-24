@@ -673,6 +673,18 @@ mod tests {
         assert!(!q.bid_ask.contains_key("USDCNH"));
     }
     #[test]
+    fn nstar_margin_and_pnl_are_usd_at_its_price_level() {
+        let mut a = Account::default();
+        let q = quotes(&[("NSTAR", 100.0)]);
+        assert_eq!(conversion("NSTAR").unwrap(), None);
+        a.open("long", 0.1, "NSTAR", &q, 1, 0).unwrap();
+        let p = &a.positions[0];
+        near(p.entry, 100.025);
+        near(p.margin(&q, a.leverage).unwrap(), 0.1);
+        let up = quotes(&[("NSTAR", 101.0)]);
+        near(p.pnl_at(101.0, &up).unwrap(), 0.0975);
+    }
+    #[test]
     fn invalid_numbers_and_directions_do_not_mutate() {
         let mut a = Account::default();
         let q = quotes(&[("FXSIM", 1.1)]);

@@ -204,7 +204,13 @@ jobs:
       - name: Confirm the container runs unprivileged and persisted the key
         run: |
           set -eu
-          test "$(docker exec fx-smoke id -u)" = "10001"
+          # `docker exec` defaults to the image USER (root here), so read the server
+          # process's own uid from /proc: that is what dropped privileges.
+          # The entrypoint `exec`s the server, so the server is PID 1 and inherits the
+          # uid that setpriv set. Reading /proc/1/status avoids any process search.
+          server_uid="$(docker exec fx-smoke awk '/^Uid:/{print $2}' /proc/1/status)"
+          echo "server uid=$server_uid"
+          test "$server_uid" = "10001"
           docker exec fx-smoke test -f /data/admin-key.json
 
       - name: Logs and cleanup

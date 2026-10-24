@@ -826,7 +826,7 @@ impl SimFeed {
         book.news(&mut rng);
         book.log += REVERT * (book.fair - book.log) + shock + self.trend;
         book.clamp();
-        if book.breaker(self.price) {
+        if book.breaker(self.price, &mut rng) {
             self.price
         } else {
             book.published()
@@ -852,21 +852,22 @@ const FAIR_VOL: f64 = 0.00012;
 const FAIR_REVERT: f64 = 4e-5;
 /// Fair value stays within base/4 ..= base*4 (25..=400 for NSTAR).
 const FAIR_BAND: f64 = 2.0 * std::f64::consts::LN_2;
-/// Pull of price toward fair value per tick: a displacement halves in ~46 s.
-const REVERT: f64 = 0.003;
+/// Pull of price toward fair value per tick: a displacement halves in ~90 s.
+const REVERT: f64 = 0.0015;
 /// Price stays within fair/2 ..= fair*2 whatever the flow.
 const STRETCH: f64 = std::f64::consts::LN_2;
 /// Share of flow impact that becomes fair value instead of reverting.
-const CONVICTION: f64 = 0.2;
+const CONVICTION: f64 = 0.35;
 const BREAKER_WINDOW: usize = 300;
 /// ln(1.10): a 10% move from any print in the last minute halts trading.
 const BREAKER_MOVE: f64 = 0.0953;
-const HALT_TICKS: u32 = 50;
+/// Halts last 2-3 s (10-15 ticks).
+const HALT_TICKS: std::ops::RangeInclusive<u32> = 10..=15;
 const RUMOR_LEAD: u32 = 25;
 const RUMOR_ACCURACY: f64 = 0.65;
 const NEWS_MIN_GAP: u32 = 1500;
-/// Flow that moves price by 1.5% or more (~1,500 NSTAR) is announced.
-const BIG_FLOW: f64 = 0.015;
+/// Flow that moves price by 3% or more (~1,500 NSTAR) is announced.
+const BIG_FLOW: f64 = 0.03;
 
 #[derive(Clone)]
 struct Book {
@@ -954,7 +955,7 @@ impl Book {
         }
     }
     /// True while halted. Trips when price moves 10% from any print in the last minute.
-    fn breaker(&mut self, last: f64) -> bool {
+    fn breaker(&mut self, last: f64, rng: &mut impl Rng) -> bool {
         if self.halt > 0 {
             self.halt -= 1;
             if self.halt > 0 {
@@ -980,11 +981,12 @@ impl Book {
         } else {
             return false;
         };
-        self.halt = HALT_TICKS;
+        self.halt = rng.random_range(HALT_TICKS);
         let pct = (self.log - from).exp_m1() * 100.0;
+        let secs = self.halt as f64 * 0.2;
         self.event(
             "halt",
-            format!("NSTAR 一分钟内波动 {pct:+.1}%，触发熔断，暂停交易 10 秒"),
+            format!("NSTAR 一分钟内波动 {pct:+.1}%，触发熔断，暂停交易 {secs:.1} 秒"),
         );
         true
     }

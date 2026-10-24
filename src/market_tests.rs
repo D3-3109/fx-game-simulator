@@ -360,7 +360,7 @@ fn nstar_breaker_halts_publishes_stale_price_then_resumes_with_gap() {
     assert!(!sim.quote().open);
     assert!(sim.live_mid().is_none());
     assert!(sim.book.events.iter().any(|e| e["kind"] == "halt"));
-    nstar_run(&mut sim, t, 11, 11 + HALT_TICKS as i64);
+    nstar_run(&mut sim, t, 11, 11 + *HALT_TICKS.end() as i64);
     assert!(sim.quote().open);
     assert!(sim.book.events.iter().any(|e| e["kind"] == "resume"));
     assert!(

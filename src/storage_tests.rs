@@ -272,3 +272,55 @@ async fn python_era_schema_accounts_tokens_and_legacy_currency_survive_restart()
     assert!(s.authenticate(&old).await.unwrap().is_none());
     assert!(s.authenticate(&new).await.unwrap().is_some());
 }
+
+#[tokio::test]
+async fn cache_tracks_commits_rollbacks_tokens_and_deletion() {
+    let (dir, s) = setup().await;
+    let tok = s.login("player", "password").await.unwrap();
+    assert_eq!(
+        s.authenticate(&tok).await.unwrap().as_deref(),
+        Some("player")
+    );
+    s.transaction("player", |a, sym, id| {
+        *sym = "FXSIM".into();
+        Ok(vec![a.open("long", 0.1, "FXSIM", &quotes(), id, 1)?])
+    })
+    .await
+    .unwrap();
+    let cached = s.user("player").await.unwrap();
+    assert_eq!(cached.account.positions.len(), 1);
+    assert_eq!(cached.symbol, "FXSIM");
+    assert_eq!(cached.last_trade.as_ref().unwrap()["kind"], "open");
+    // A failing commit must not leak its in-memory mutation into the cache.
+    sqlx::raw_sql(
+        "CREATE TRIGGER fail_trade BEFORE INSERT ON trades BEGIN SELECT RAISE(ABORT,'x'); END;",
+    )
+    .execute(&s.pool)
+    .await
+    .unwrap();
+    assert!(
+        s.transaction("player", |a, _, _| a.close(None, &quotes(), 2))
+            .await
+            .is_err()
+    );
+    assert_eq!(s.user("player").await.unwrap().account, cached.account);
+    // An operation error also leaves it untouched.
+    assert!(
+        s.transaction("player", |_, _, _| Err("nope".into()))
+            .await
+            .is_err()
+    );
+    assert_eq!(s.users().await.unwrap()[0].account, cached.account);
+    s.close().await;
+    // Restart rebuilds the cache from SQLite, matching what was committed.
+    let s = Store::open(&dir.path().join("test.db")).await.unwrap();
+    assert_eq!(s.user("player").await.unwrap().account, cached.account);
+    assert_eq!(
+        s.authenticate(&tok).await.unwrap().as_deref(),
+        Some("player")
+    );
+    s.delete("player", "player", 9).await.unwrap();
+    assert!(s.user("player").await.is_err());
+    assert!(s.users().await.unwrap().is_empty());
+    assert_eq!(s.authenticate(&tok).await.unwrap(), None);
+}

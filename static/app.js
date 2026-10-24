@@ -297,7 +297,7 @@ symSel.onchange=async()=>{
  const previous=cur.sym,next=symSel.value;if(symbolSaving||next===previous)return;
  symbolSaving=true;syncSymbolChoices();
  try{const j=await api('symbol',{symbol:next});
-  if(j.ok){cur.sym=next;syncSecondOption();renderQuote(NaN,next);renderMarket(market);renderBook(NaN);if(series)series.applyOptions({priceFormat:priceFormat(next)});lastBar=null;kLoaded=false;drawPosLines();loadK();await refresh()}
+  if(j.ok){cur.sym=next;syncSecondOption();renderQuote(NaN,next);renderMarket(market);renderBook(NaN);if(series)series.applyOptions({priceFormat:priceFormat(next)});lastBar=null;kLoaded=false;drawPosLines();loadK();await settle(j)}
  }catch(e){msg('币对切换失败：'+e)}
  finally{symbolSaving=false;syncSymbolChoices()}
 };
@@ -306,6 +306,8 @@ syncSymbolChoices();
 
 async function api(path,body){const r=await fetch('/api/'+path,{method:'POST',headers:authH({'Content-Type':'application/json'}),body:JSON.stringify(body||{})});
  if(r.status==401){logout();throw'auth'}const j=await r.json();if(!j.ok)msg('操作失败：'+j.err);return j}
+// Mutations return the new account; only fall back to a GET when the reply lacks it.
+const settle=j=>j.state?(connOk(),render(j.state)):refresh();
 let messageTimer=null;
 function msg(t){clearTimeout(messageTimer);$('msg').textContent=t;messageTimer=setTimeout(()=>$('msg').textContent='',6000)}
 function syncLotPresets(){
@@ -330,7 +332,7 @@ async function trade(side){
  if(!$('lots').reportValidity())return;
  orderBusy=true;syncOrderControls();
  try{const j=await api('trade',{side,lots:Number($('lots').value)});
-  if(j.ok){msg(`${cur.sym} ${side==='buy'?'买入':'卖出'}已成交`);await refresh()}
+  if(j.ok){msg(`${cur.sym} ${side==='buy'?'买入':'卖出'}已成交`);await settle(j)}
  }catch(e){msg('下单失败：'+e)}
  finally{orderBusy=false;syncOrderControls()}
 }
@@ -342,14 +344,14 @@ async function loanAction(path,amountId,done){
  const input=$(amountId);
  if(!input.reportValidity())return;
  const j=await api(path,{amount:Number(input.value)});
- if(j.ok){msg(done);await refresh()}
+ if(j.ok){msg(done);await settle(j)}
 }
 function borrowMoney(){return loanAction('borrow','borrow-amount','借款已到账')}
 function repayMoney(){return loanAction('repay','repay-amount','还款已完成')}
 async function resetAccount(){
  if(!confirm('确定重置账号吗？余额回到 10000，杠杆回到 100，持仓和贷款全部清空，交易记录保留。'))return;
  const j=await api('reset',{});
- if(j.ok){msg('账号已重置');await refresh()}
+ if(j.ok){msg('账号已重置');await settle(j)}
 }
 function renderDebt(s){
  const limit=s.debt_limit??100000;
@@ -367,7 +369,7 @@ async function closeAll(){
 }
 async function submitClose(body){
  orderBusy=true;syncOrderControls();
- try{const j=await api('close',body);if(j.ok){msg('平仓已完成');await refresh()}}
+ try{const j=await api('close',body);if(j.ok){msg('平仓已完成');await settle(j)}}
  catch(e){msg('平仓失败：'+e)}
  finally{orderBusy=false;syncOrderControls()}
 }
@@ -380,7 +382,7 @@ async function setLev(){
  $('lev-apply').textContent='保存中…';
  try{
   const j=await api('leverage',{leverage:value});
-  if(j.ok){accountLeverage=value;levDirty=false;input.value=value;await refresh()}
+  if(j.ok){accountLeverage=value;levDirty=false;input.value=value;await settle(j)}
   else{input.value=accountLeverage;levDirty=false}
  }catch(e){msg('杠杆保存失败，请重试：'+e)}
  finally{levSaving=false;input.disabled=$('lev-apply').disabled=curPos.length>0;$('lev-apply').textContent='应用杠杆'}
@@ -486,15 +488,20 @@ function render(s){
  if(s.symbol===cur.sym){renderQuote(s.price,s.symbol,s.bid,s.ask,s.quote_valid,s.quote_at);updateLast(s.price)}
 }
 let seenTrade=0,historySeq=0;
+let tradeCursor=false;
 function observeTrade(trade){
+ // The first state only aligns the cursor (boot already fetched history), even when the
+ // account has no trades yet; every later new trade reloads history.
+ const first=!tradeCursor;tradeCursor=true;
  if(!trade||trade.id<=seenTrade)return;
  seenTrade=trade.id;
  if(trade.kind==='stopout'&&trade.currency!=='LEGACY')msg(`已触发强平 #${trade.position_id} ${trade.symbol}：保证金比例 ${(trade.margin_level*100).toFixed(1)}%，已实现盈亏 ${money(trade.pnl)}。详情见成交记录。`);
- loadHistory();
+ if(!(first&&historyLoaded))loadHistory();
 }
 function escapeHtml(value){
  return String(value).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
+let historyLoaded=false;
 async function loadHistory(){
  const my=++historySeq;panelStatus('history','loading','Loading...');
  try{
@@ -504,7 +511,7 @@ async function loadHistory(){
    `<tr><td>${escapeHtml(new Date(t.time).toLocaleString())}</td><td class="${t.kind==='stopout'?'red':''}">${({open:'开仓',close:'平仓',stopout:'强平',tp:'止盈',sl:'止损',spot:t.side==='buy'?'现货买入':'现货卖出',funding:'资金费',reset:'重置',borrow:'借款',repay:'还款'})[t.kind]??t.kind}${t.currency==='LEGACY'?' · 旧口径':''}</td>`+
    `<td>${t.position_id||'—'}</td><td>${escapeHtml(pairName(t.symbol))}</td><td>${({long:'多',short:'空',buy:'买',sell:'卖'})[t.side]??'—'}</td>`+
    `<td>${t.kind==='spot'?units(t.lots*.01)+' NSTAR':t.lots}</td><td>${t.entry>0?priceText(t.entry,t.symbol):'—'}</td><td>${priceText(t.price,t.symbol)}</td><td class="${t.pnl==null?'':t.pnl>=0?'green':'red'}">${t.pnl==null?'-':t.currency==='LEGACY'&&!/USD(T)?$/.test(t.symbol)&&t.symbol!=='FXSIM'?'旧口径 '+amountFormat.format(t.pnl):money(t.pnl)}</td><td>${money(t.balance)}</td></tr>`).join('')||'<tr><td colspan="10" class="empty">暂无成交记录</td></tr>';
-  panelStatus('history');
+  historyLoaded=true;panelStatus('history');
  }catch(e){if(my===historySeq)panelStatus('history','error','成交记录加载失败，请重试')}
 }
 let connWasDown=false;
@@ -524,7 +531,8 @@ async function refresh(){
  }
 }
 /* ws */
-let ws=null,wsTimer=null;
+let ws=null,wsTimer=null,wsLive=false;
+const pollNeeded=()=>!wsLive&&!document.hidden;
 function wsConnect(){
  try{ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws?token=${TOKEN}`)}catch(e){return}
  ws.onmessage=e=>{const d=JSON.parse(e.data);
@@ -538,8 +546,8 @@ function wsConnect(){
   renderQuote(d.price,d.sym,d.bid,d.ask,d.quote_valid,d.quote_at);renderBook(d.price);
   if(isSim(d.sym)){updateSim(d.klines&&d.klines[cur.itv],d.time);return}
   updateLast(d.price)};
- ws.onopen=()=>{connOk();loadChat();loadSymbols()};
- ws.onclose=()=>{connDown();wsTimer=setTimeout(wsConnect,2000)};
+ ws.onopen=()=>{wsLive=true;connOk();loadChat();loadSymbols()};
+ ws.onclose=()=>{wsLive=false;connDown();wsTimer=setTimeout(wsConnect,2000)};
 }
 /* rank: ws推送渲染 */
 function renderLb(rows){
@@ -616,7 +624,7 @@ async function spotTrade(){
  if(orderBusy)return;if(!$('spot-units').reportValidity())return;
  orderBusy=true;syncOrderControls();$('spot-submit').disabled=true;
  try{const j=await api('spot',{side:spotSide,units:Number($('spot-units').value)});
-  if(j.ok){msg(`NSTAR 现货${spotSide==='buy'?'买入':'卖出'}已成交`);await refresh()}
+  if(j.ok){msg(`NSTAR 现货${spotSide==='buy'?'买入':'卖出'}已成交`);await settle(j)}
  }catch(e){msg('现货下单失败：'+e)}
  finally{orderBusy=false;$('spot-submit').disabled=false;syncOrderControls()}
 }
@@ -646,7 +654,7 @@ function openTpsl(id){
 function closeTpsl(){const d=$('tpsl-dialog');if(d.close)d.close()}
 async function saveTpsl(){
  const j=await api('tpsl',{id:tpslId,tp:Number($('tpsl-tp').value)||0,sl:Number($('tpsl-sl').value)||0});
- if(j.ok){closeTpsl();msg('止盈止损已更新');await refresh()}
+ if(j.ok){closeTpsl();msg('止盈止损已更新');await settle(j)}
 }
 /* 盘口: NSTAR 的对数深度簿可精确推算每一档；其他币对按点差画示意盘口。 */
 function renderBook(mid){
@@ -707,7 +715,12 @@ async function boot(){
  $('auth').style.display='none';$('shell').hidden=false;
  resizeSides();new ResizeObserver(resizeSides).observe($('wrap'));
  await loadSymbols();refresh();loadK();loadLeaderboard();loadHistory();loadChat();loadMarket();wsConnect();
- setInterval(refresh,5000);setInterval(loadK,30000);setTimeout(()=>loadK(),800);
- setInterval(fundingCountdown,1000);setInterval(()=>{if(cur.sym!=='NSTAR')loadMarket()},10000);
+ // WS pushes state, quotes, candles and market data; HTTP polling only covers a dropped
+ // socket, and nothing polls while the tab is hidden.
+ setInterval(()=>{if(pollNeeded())refresh()},5000);
+ setInterval(()=>{if(pollNeeded()||!isSim(cur.sym)&&!document.hidden)loadK()},30000);
+ setInterval(fundingCountdown,1000);
+ setInterval(()=>{if(!document.hidden&&cur.sym!=='NSTAR'&&$('chatpane').querySelector('[data-chat-pane="tape"]')?.hidden===false)loadMarket()},15000);
+ document.addEventListener('visibilitychange',()=>{if(!document.hidden){refresh();if(!wsLive)loadK()}});
 }
 if(TOKEN)boot();else{$('auth').style.display='flex'}

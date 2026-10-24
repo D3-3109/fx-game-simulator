@@ -278,12 +278,17 @@ async fn sim_rest_and_ws_share_authoritative_ohlc() {
     let store = Arc::new(Store::open(&dir.path().join("sim.db")).await.unwrap());
     let market = Market::offline(store, Prices::new()).await.unwrap();
     let now = (now_ms() + 60000) / 1000 * 1000;
-    market.record_sim(1.12, now).await.unwrap();
+    // The first tick into a new candle carries the closed one too.
+    let rolled = market.record_sim(1.12, now).await.unwrap();
+    assert_eq!(rolled["klines"]["1s"].as_array().unwrap().len(), 2);
     market.record_sim(0.8, now + 100).await.unwrap();
     let packet = market.record_sim(1.1, now + 200).await.unwrap();
     for (interval, _) in symbols::INTERVALS {
         let rest = market.klines("FXSIM", interval, 2).await.unwrap();
-        assert_eq!(packet["klines"][interval], rest["klines"]);
+        // Later ticks inside the candle send only the forming one.
+        let live = packet["klines"][interval].as_array().unwrap();
+        assert_eq!(live.len(), 1, "{interval}");
+        assert_eq!(live[0], *rest["klines"].as_array().unwrap().last().unwrap());
         assert_eq!(packet["time"], rest["updated_at"]);
         let last = rest["klines"].as_array().unwrap().last().unwrap();
         assert_eq!(last[3], 0.8);

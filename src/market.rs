@@ -679,6 +679,10 @@ struct SimFeed {
     left: u32,
     updated_at: i64,
     bars: BTreeMap<i64, VecDeque<[f64; 5]>>,
+    /// Intervals whose candle closed since the last packet.
+    rolled: std::collections::BTreeSet<i64>,
+    stats_at: i64,
+    sent_print: f64,
 }
 impl SimFeed {
     fn new(symbol: &'static str, base: f64, now: i64) -> Self {
@@ -700,6 +704,9 @@ impl SimFeed {
                     )
                 })
                 .collect(),
+            rolled: Default::default(),
+            stats_at: 0,
+            sent_print: 0.0,
         }
     }
     async fn load(store: &Store, symbol: &'static str, base: f64, now: i64) -> Result<Self> {
@@ -739,6 +746,7 @@ impl SimFeed {
                 continue;
             }
             if t != bars.back().unwrap()[0] {
+                self.rolled.insert(*sec);
                 bars.push_back([t, price, price, price, price]);
                 if bars.len() > 1000 {
                     bars.pop_front();
@@ -770,16 +778,28 @@ impl SimFeed {
             ..Quote::single(self.price, self.updated_at)
         }
     }
-    fn packet(&self) -> Value {
+    /// Live tick for every socket. Only the forming candle of each interval is sent, plus
+    /// the one that just closed when an interval rolled over since the last packet, and the
+    /// market panel at most once a second or when new prints arrived.
+    fn packet(&mut self) -> Value {
         let mut packet = self.quote().packet(self.symbol, self.updated_at);
         packet["time"] = json!(self.updated_at);
         if trading::depth(self.symbol) > 0.0 {
-            packet["market"] = self.stats();
+            let prints = self.book.tape.back().map_or(0.0, |p| p[0]);
+            if prints != self.sent_print || self.updated_at - self.stats_at >= 1000 {
+                packet["market"] = self.stats();
+                self.sent_print = prints;
+                self.stats_at = self.updated_at;
+            }
         }
+        let rolled = std::mem::take(&mut self.rolled);
         packet["klines"] = json!(
             symbols::INTERVALS
                 .iter()
-                .map(|(itv, sec)| (*itv, json!(self.klines(*sec, 2))))
+                .map(|(itv, sec)| {
+                    let n = if rolled.contains(sec) { 2 } else { 1 };
+                    (*itv, json!(self.klines(*sec, n)))
+                })
                 .collect::<BTreeMap<_, _>>()
         );
         packet

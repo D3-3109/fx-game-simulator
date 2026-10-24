@@ -534,7 +534,7 @@ const candle = price => {
 
   // Switching clears former symbol's position lines immediately.
   removed=[];
-  run("loadK=()=>{};refresh=()=>{};api=async()=>({ok:true});cur.sym='BTCUSDT';priceLines=[{price:60000}];curPos=[{sym:'BTCUSDT',entry:60000,side:'long',lots:.1}];symSel.value='FXSIM';itvSel.value='5m';");
+  run("realApi=api;realRefresh=refresh;realLoadK=loadK;loadK=()=>{};refresh=()=>{};api=async()=>({ok:true});cur.sym='BTCUSDT';priceLines=[{price:60000}];curPos=[{sym:'BTCUSDT',entry:60000,side:'long',lots:.1}];symSel.value='FXSIM';itvSel.value='5m';");
   await run('symSel.onchange()');
   assert.equal(removed.length, 1, 'old position line survives symbol switch');
   assert.equal(run('priceLines.length'), 0);
@@ -621,5 +621,25 @@ const candle = price => {
   run("renderTape([[1800000000000,100.5,3],[1800000000000,99.5,-2]])");
   assert.match(elements['tape-rows'].innerHTML,/t-buy">100\.50/);assert.match(elements['tape-rows'].innerHTML,/t-sell">99\.50/);
   run("renderTape([])");assert.match(elements['tape-rows'].innerHTML,/暂无成交/);
+  // Mutations render the state embedded in their reply instead of issuing GET /api/state.
+  // An earlier block stubbed api/refresh/loadK; restore the shipped implementations.
+  run('api=realApi;refresh=realRefresh;loadK=realLoadK');
+  const before=requests.length;
+  context.fetch=async url=>{requests.push(url);return {status:200,json:async()=>({ok:true,state:{...JSON.parse(context.exState),balance:4321}})};};
+  run("orderBusy=false;applySymbols({version:300,rows:[{symbol:'NSTAR',enabled:true}]});cur.sym='NSTAR';renderQuote(100,'NSTAR',99.97,100.03,true)");
+  await run("trade('buy')");
+  assert.deepEqual(requests.slice(before),['/api/trade'],'order reply still triggered a state poll');
+  assert.match(elements.acct.innerHTML,/\$4,321\.00/);
+  context.fetch=async url=>{requests.push(url);return {status:200,json:async()=>({ok:true})};};
+  const noState=requests.length;await run("trade('buy')");
+  assert.deepEqual(requests.slice(noState),['/api/trade','/api/state'],'missing state must fall back to GET');
+  // A brand-new account's first trade still reloads history (cursor aligned on empty state).
+  run('tradeCursor=false;seenTrade=0;historyLoaded=true;observeTrade(undefined)');
+  const hist=requests.length;run("observeTrade({id:1,kind:'open'})");
+  assert.equal(requests.slice(hist).filter(u=>u==='/api/history').length,1,'first trade of a new account skipped history');
+  // Polling pauses while the socket is live or the tab is hidden.
+  run('wsLive=true');assert.equal(run('pollNeeded()'),false);
+  run('wsLive=false');assert.equal(run('pollNeeded()'),true);
+  context.fetch=normalFetch;
   console.log('PASS: chart scales/OHLC, stale-state guards, layout/loading, trading controls, v5 loading, split quotes/daily changes, out-of-flow toasts and exchange panels');
 })().catch(error => { console.error(error); process.exitCode = 1; });

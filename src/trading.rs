@@ -5,7 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const CONTRACT: f64 = 100_000.0;
 pub const STOPOUT: f64 = 0.5;
-pub const MAX_LEVERAGE: u64 = 9_007_199_254_740_991;
+pub const MAX_LEVERAGE: u64 = 50_000;
+pub const MAX_LOTS: f64 = 100_000.0;
 pub const LOAN_RATE: f64 = 0.10;
 fn cents(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
@@ -113,7 +114,7 @@ pub fn contract(symbol: &str) -> f64 {
 
 pub fn lots_valid(symbol: &str, lots: f64) -> bool {
     let (min, whole) = symbols::spec(symbol).map_or((0.01, false), |s| (s.min_lots, s.whole_lots));
-    lots.is_finite() && lots >= min && (!whole || lots.fract() == 0.0)
+    lots.is_finite() && lots >= min && lots <= MAX_LOTS && (!whole || lots.fract() == 0.0)
 }
 
 pub fn spread(symbol: &str, mid: f64) -> f64 {
@@ -680,9 +681,9 @@ mod tests {
         a.open("long", 0.1, "NSTAR", &q, 1, 0).unwrap();
         let p = &a.positions[0];
         near(p.entry, 100.025);
-        near(p.margin(&q, a.leverage).unwrap(), 0.1);
+        near(p.margin(&q, a.leverage).unwrap(), 0.001);
         let up = quotes(&[("NSTAR", 101.0)]);
-        near(p.pnl_at(101.0, &up).unwrap(), 0.0975);
+        near(p.pnl_at(101.0, &up).unwrap(), 0.000975);
     }
     #[test]
     fn invalid_numbers_and_directions_do_not_mutate() {
@@ -694,5 +695,21 @@ mod tests {
         assert!(a.open("oops", 0.1, "FXSIM", &q, 1, 0).is_err());
         assert_eq!(a, Account::default());
         assert!(market_price(&quotes(&[("FXSIM", f64::NAN)]), "FXSIM").is_err());
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+    #[test]
+    fn leverage_and_lot_caps_reject_inflation() {
+        let mut a = Account::default();
+        a.leverage = MAX_LEVERAGE;
+        assert!(a.validate().is_ok());
+        a.leverage = MAX_LEVERAGE + 1;
+        assert!(a.validate().is_err());
+        assert!(lots_valid("EURUSD", MAX_LOTS));
+        assert!(!lots_valid("EURUSD", MAX_LOTS + 1.0));
+        assert!(!lots_valid("NSTAR", 1e106));
     }
 }

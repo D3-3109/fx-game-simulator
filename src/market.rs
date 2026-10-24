@@ -736,7 +736,7 @@ impl SimFeed {
             _ => {}
         }
         let scale = self.base / 1.1;
-        let impulse = self.push * self.price * 0.001;
+        let impulse = self.push * 0.0002 * self.base;
         self.push *= 0.9;
         ((self.price + 0.003 * (self.base - self.price) + (shock + self.trend) * scale + impulse)
             .max(0.5 * scale)

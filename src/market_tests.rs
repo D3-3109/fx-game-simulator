@@ -331,3 +331,28 @@ fn nstar_player_push_moves_price_then_fades_back() {
         sim.push
     );
 }
+
+#[test]
+fn nstar_player_flow_is_bounded_and_returns_to_base() {
+    let t = 1800000000000;
+    for _ in 0..20 {
+        let mut sim = SimFeed::new("NSTAR", 100.0, t);
+        let mut peak = 100.0f64;
+        for step in 1..=100 {
+            sim.push += 2.0;
+            let price = sim.next_price();
+            sim.record(price, t + step * 200);
+            peak = peak.max(price);
+        }
+        assert!(peak < 200.0, "burst must not run away: peak {peak}");
+        for step in 101..=3000 {
+            let price = sim.next_price();
+            sim.record(price, t + step * 200);
+        }
+        assert!(
+            (sim.price - 100.0).abs() < 10.0,
+            "should return near base: {}",
+            sim.price
+        );
+    }
+}

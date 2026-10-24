@@ -306,6 +306,28 @@ async function closePos(id){
  if(orderBusy||!id)return;
  await submitClose({id});
 }
+async function loanAction(path,amountId,done){
+ const input=$(amountId);
+ if(!input.reportValidity())return;
+ const j=await api(path,{amount:Number(input.value)});
+ if(j.ok){msg(done);await refresh()}
+}
+function borrowMoney(){return loanAction('borrow','borrow-amount','借款已到账')}
+function repayMoney(){return loanAction('repay','repay-amount','还款已完成')}
+async function resetAccount(){
+ if(!confirm('确定重置账号吗？余额回到 10000，杠杆回到 100，持仓和贷款全部清空，交易记录保留。'))return;
+ const j=await api('reset',{});
+ if(j.ok){msg('账号已重置');await refresh()}
+}
+function renderDebt(s){
+ const limit=s.debt_limit??100000;
+ let text=`负债 ${money(s.debt??0)} / 上限 ${money(limit)}`;
+ if(s.debt_since>0){
+  const left=Math.max(0,30*60*1000-(Date.now()-s.debt_since));
+  text+=`，超限倒计时 ${Math.floor(left/60000)}:${String(Math.floor(left/1000)%60).padStart(2,'0')}，到期自动重置`;
+ }
+ $('debt-status').textContent=text;
+}
 async function closeAll(){
  if(orderBusy||!curPos.length)return;
  if(!confirm(`确认平掉全部 ${curPos.length} 笔持仓？\n将按各币对当前报价结算，无法撤销。`))return;
@@ -407,6 +429,7 @@ function render(s){
   `<div class="account-stat"><span>可用保证金 / USD</span><b>${money(s.equity-s.used)}</b></div></div>`+
   `<div class="account-meta"><span>保证金比例 <strong class="${mlc}">${mls}</strong></span>`+
   `<span>强平线 <strong>${Math.round(stopout*100)}%</strong></span><span>杠杆 <strong>1:${s.leverage}</strong></span></div>`;
+ renderDebt(s);
  accountLeverage=s.leverage;
  if(!levSaving&&(!levDirty||s.positions.length)){$('lev').value=s.leverage;levDirty=false}
  $('lev').disabled=$('lev-apply').disabled=levSaving||s.positions.length>0;

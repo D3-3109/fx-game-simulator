@@ -269,6 +269,29 @@ async fn post_inner(app: &App, path: &str, headers: &HeaderMap, body: &Value) ->
                 })
                 .await?;
         }
+        "/api/reset" => {
+            app.store
+                .transaction(&name, |a, _, _| Ok(vec![a.reset(now)]))
+                .await?;
+        }
+        "/api/borrow" => {
+            let amount = number(body, "amount")?;
+            app.store
+                .transaction(&name, |a, _, _| {
+                    a.borrow(amount, now)?;
+                    Ok(vec![a.loan_trade("borrow", amount, now)])
+                })
+                .await?;
+        }
+        "/api/repay" => {
+            let amount = number(body, "amount")?;
+            app.store
+                .transaction(&name, |a, _, _| {
+                    a.repay(amount, now)?;
+                    Ok(vec![a.loan_trade("repay", amount, now)])
+                })
+                .await?;
+        }
         "/api/close" => {
             let id = if body["id"].is_null() {
                 None

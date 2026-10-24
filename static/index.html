@@ -40,6 +40,20 @@
  </form>
  <div class="close-section"><button id="close-all" type="button" onclick="closeAll()">全部平仓</button></div>
  <div id="acct" aria-label="账户概览"><span class="muted">正在加载账户…</span></div>
+<div id="loan-panel" class="loan-panel">
+ <div id="debt-status" class="debt-status" role="status" aria-live="polite"></div>
+ <div class="loan-row">
+  <label>借款金额 / USD<input id="borrow-amount" type="number" min="1" step="1" value="1000"></label>
+  <button id="borrow-btn" type="button" onclick="borrowMoney()">借款</button>
+ </div>
+ <div class="loan-row">
+  <label>还款金额 / USD<input id="repay-amount" type="number" min="1" step="1" value="1000"></label>
+  <button id="repay-btn" type="button" onclick="repayMoney()">还款</button>
+ </div>
+ <div class="loan-row">
+  <button id="reset-btn" type="button" class="danger" onclick="resetAccount()">重置账号（清空余额、持仓和贷款）</button>
+ </div>
+</div>
 </aside>
 <div id="left-splitter" class="splitter vertical" role="separator" aria-label="调整下单栏宽度"
  aria-orientation="vertical" tabindex="0" aria-valuemin="160" aria-valuemax="520" aria-valuenow="240" title="左右拖动；方向键微调，双击恢复"></div>

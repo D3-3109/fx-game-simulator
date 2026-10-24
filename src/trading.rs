@@ -6,6 +6,10 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const CONTRACT: f64 = 100_000.0;
 pub const STOPOUT: f64 = 0.5;
 pub const MAX_LEVERAGE: u64 = 9_007_199_254_740_991;
+pub const LOAN_RATE: f64 = 0.10;
+fn cents(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
 #[derive(Debug, Clone, Default)]
 pub struct Prices {
     pub mid: BTreeMap<String, f64>,
@@ -186,7 +190,16 @@ pub struct Account {
     #[serde(default = "one")]
     pub next_id: u64,
     pub positions: Vec<Position>,
+    #[serde(default)]
+    pub loan: f64,
+    #[serde(default)]
+    pub interest_at: i64,
+    #[serde(default)]
+    pub debt_since: i64,
 }
+
+pub const DEBT_LIMIT: f64 = 100_000.0;
+pub const DEBT_GRACE_MS: i64 = 30 * 60 * 1000;
 
 impl Default for Account {
     fn default() -> Self {
@@ -195,6 +208,9 @@ impl Default for Account {
             leverage: 100,
             next_id: 1,
             positions: vec![],
+            loan: 0.0,
+            interest_at: 0,
+            debt_since: 0,
         }
     }
 }
@@ -241,9 +257,99 @@ impl Account {
         }
         Ok(())
     }
+    pub fn accrue(&mut self, now: i64) {
+        if self.loan <= 0.0 {
+            self.interest_at = now;
+            return;
+        }
+        let hours = (now - self.interest_at) / 3_600_000;
+        if hours <= 0 {
+            return;
+        }
+        let growth = (1.0 + LOAN_RATE / 8760.0).powf(hours.min(100_000) as f64);
+        self.loan = cents(self.loan * growth);
+        self.interest_at += hours * 3_600_000;
+    }
+    pub fn borrow(&mut self, amount: f64, now: i64) -> Result<()> {
+        if !amount.is_finite() || amount <= 0.0 {
+            return Err("借款金额必须为正数".into());
+        }
+        self.accrue(now);
+        self.loan = cents(self.loan + amount);
+        self.balance += amount;
+        self.validate()
+    }
+    pub fn repay(&mut self, amount: f64, now: i64) -> Result<()> {
+        if !amount.is_finite() || amount <= 0.0 {
+            return Err("还款金额必须为正数".into());
+        }
+        self.accrue(now);
+        let pay = amount.min(self.loan).min(self.balance.max(0.0));
+        if pay <= 0.0 {
+            return Err("余额不足，无法还款".into());
+        }
+        self.loan = cents(self.loan - pay);
+        self.balance -= pay;
+        self.validate()
+    }
+    pub fn debt(&self) -> f64 {
+        self.loan + (-self.balance).max(0.0)
+    }
+    /// Starts, clears, or reports expiry of the 30-minute debt grace period.
+    pub fn debt_expired(&mut self, now: i64) -> bool {
+        if self.debt() <= DEBT_LIMIT {
+            self.debt_since = 0;
+            return false;
+        }
+        if self.debt_since == 0 {
+            self.debt_since = now;
+            return false;
+        }
+        now - self.debt_since >= DEBT_GRACE_MS
+    }
+    pub fn reset(&mut self, now: i64) -> Trade {
+        let balance = Account::default().balance;
+        let trade = Trade {
+            time: now,
+            kind: "reset".into(),
+            position_id: 0,
+            symbol: String::new(),
+            side: String::new(),
+            lots: 0.0,
+            entry: 0.0,
+            price: 0.0,
+            pnl: None,
+            balance,
+            margin_level: None,
+            currency: "USD".into(),
+        };
+        let next_id = self.next_id;
+        *self = Account {
+            next_id,
+            ..Account::default()
+        };
+        trade
+    }
+    pub fn loan_trade(&self, kind: &str, amount: f64, now: i64) -> Trade {
+        Trade {
+            time: now,
+            kind: kind.into(),
+            position_id: 0,
+            symbol: String::new(),
+            side: String::new(),
+            lots: 0.0,
+            entry: 0.0,
+            price: amount,
+            pnl: None,
+            balance: self.balance,
+            margin_level: None,
+            currency: "USD".into(),
+        }
+    }
     pub fn equity(&self, prices: &Prices) -> Result<f64> {
         finite(
             self.balance
+                - self.loan
                 + self
                     .positions
                     .iter()
@@ -434,6 +540,45 @@ mod tests {
         let before = a.clone();
         assert!(a.check_stopout(&q, 2).is_err());
         assert_eq!(a, before);
+    }
+    #[test]
+    fn loan_borrow_repay_accrue_and_equity() {
+        let mut a = Account::default();
+        let q = quotes(&[]);
+        a.borrow(1000.0, 0).unwrap();
+        assert_eq!(a.balance, 11000.0);
+        assert_eq!(a.loan, 1000.0);
+        assert_eq!(a.equity(&q).unwrap(), 10000.0);
+        a.accrue(3_600_000 * 8760);
+        assert!((a.loan - 1105.17).abs() < 0.02);
+        a.repay(500.0, 3_600_000 * 8760).unwrap();
+        assert_eq!(a.balance, 10500.0);
+        assert!(a.repay(-1.0, 0).is_err());
+        assert!(a.repay(f64::NAN, 0).is_err());
+        assert!(a.borrow(0.0, 0).is_err());
+    }
+    #[test]
+    fn debt_grace_starts_clears_and_expires_into_reset() {
+        let mut a = Account::default();
+        let t0 = 1_000_000;
+        a.borrow(DEBT_LIMIT + 1.0, t0).unwrap();
+        assert!(!a.debt_expired(t0));
+        assert_eq!(a.debt_since, t0);
+        assert!(!a.debt_expired(t0 + DEBT_GRACE_MS - 1));
+        a.repay(10.0, t0 + DEBT_GRACE_MS - 1).unwrap();
+        assert!(!a.debt_expired(t0 + DEBT_GRACE_MS));
+        assert_eq!(a.debt_since, 0);
+        a.borrow(DEBT_LIMIT, t0 + DEBT_GRACE_MS).unwrap();
+        let start = t0 + DEBT_GRACE_MS;
+        assert!(!a.debt_expired(start + 1));
+        assert!(a.debt_expired(start + 1 + DEBT_GRACE_MS));
+        a.next_id = 9;
+        let trade = a.reset(start + DEBT_GRACE_MS);
+        assert_eq!(trade.kind, "reset");
+        assert_eq!(a.balance, 10000.0);
+        assert_eq!(a.loan, 0.0);
+        assert_eq!(a.debt_since, 0);
+        assert_eq!(a.next_id, 9);
     }
     #[test]
     fn stock_whole_shares_and_percent_spread() {

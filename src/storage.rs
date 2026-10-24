@@ -15,7 +15,7 @@ use sqlx::{
 use std::{
     collections::BTreeMap,
     path::Path,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicI64, AtomicU64, Ordering},
     time::Duration,
 };
 use subtle::ConstantTimeEq;
@@ -62,6 +62,7 @@ pub struct Store {
     // ponytail: one process-wide mutation lock; per-account locks if throughput requires it.
     gate: Mutex<()>,
     next_id: AtomicU64,
+    nstar_flow: AtomicI64,
     login_aliases: Mutex<BTreeMap<String, String>>,
 }
 
@@ -127,6 +128,7 @@ impl Store {
             pool,
             gate: Mutex::new(()),
             next_id: AtomicU64::new(next_id),
+            nstar_flow: AtomicI64::new(0),
             login_aliases: Mutex::new(BTreeMap::new()),
         })
     }
@@ -235,15 +237,30 @@ impl Store {
             require_tradable(&mut tx, &user.symbol).await?;
         }
         persist(&mut tx, &user).await?;
+        let flow: i64 = trades
+            .iter()
+            .filter(|t| t.symbol == symbols::NSTAR && (t.kind == "open" || t.kind == "close"))
+            .map(|t| match (t.kind.as_str(), t.side.as_str()) {
+                ("open", "long") | ("close", "short") => (t.lots * 1000.0).round() as i64,
+                ("open", "short") | ("close", "long") => -((t.lots * 1000.0).round() as i64),
+                _ => 0,
+            })
+            .sum();
         for trade in trades {
             insert_trade(&mut tx, name, &trade).await?;
         }
         tx.commit().await?;
+        if flow != 0 {
+            self.nstar_flow.fetch_add(flow, Ordering::SeqCst);
+        }
         if opened {
             self.next_id
                 .fetch_max(user.account.next_id, Ordering::SeqCst);
         }
         Ok(())
+    }
+    pub fn take_nstar_flow(&self) -> i64 {
+        self.nstar_flow.swap(0, Ordering::SeqCst)
     }
     pub async fn select_symbol(&self, name: &str, symbol: &str) -> Result<()> {
         let _guard = self.gate.lock().await;

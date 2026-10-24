@@ -303,3 +303,31 @@ fn combined_upstream_subscription_is_shared_sorted_and_filters_fx() {
         )
     );
 }
+
+#[test]
+fn nstar_player_push_moves_price_then_fades_back() {
+    let t = 1800000000000;
+    let mut sim = SimFeed::new("NSTAR", 100.0, t);
+    let start = sim.price;
+    sim.push = 50.0;
+    let mut peak = start;
+    for step in 1..=5 {
+        let price = sim.next_price();
+        sim.record(price, t + step * 200);
+        peak = peak.max(price);
+    }
+    assert!(
+        peak > start + 0.5,
+        "push should lift price: start {start} peak {peak}"
+    );
+    sim.push = 0.0;
+    for step in 6..=205 {
+        let price = sim.next_price();
+        sim.record(price, t + step * 200);
+    }
+    assert!(
+        sim.push.abs() < 0.01,
+        "push should decay to near zero: {}",
+        sim.push
+    );
+}

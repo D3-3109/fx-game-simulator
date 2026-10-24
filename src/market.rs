@@ -467,6 +467,8 @@ impl Market {
         self.tick_feed(&self.sim).await
     }
     pub async fn tick_nstar(&self) -> Result<Value> {
+        let flow = self.store.take_nstar_flow();
+        self.nstar.lock().await.push += flow as f64 / 1000.0;
         self.tick_feed(&self.nstar).await
     }
     async fn tick_feed(&self, feed: &Mutex<SimFeed>) -> Result<Value> {
@@ -600,6 +602,7 @@ struct SimFeed {
     symbol: &'static str,
     base: f64,
     price: f64,
+    push: f64,
     trend: f64,
     kind: usize,
     left: u32,
@@ -612,6 +615,7 @@ impl SimFeed {
             symbol,
             base,
             price: base,
+            push: 0.0,
             trend: 0.0,
             kind: 0,
             left: 0,
@@ -732,7 +736,9 @@ impl SimFeed {
             _ => {}
         }
         let scale = self.base / 1.1;
-        ((self.price + 0.003 * (self.base - self.price) + (shock + self.trend) * scale)
+        let impulse = self.push * self.price * 0.001;
+        self.push *= 0.9;
+        ((self.price + 0.003 * (self.base - self.price) + (shock + self.trend) * scale + impulse)
             .max(0.5 * scale)
             * 1e5)
             .round()

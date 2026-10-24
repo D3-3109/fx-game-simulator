@@ -690,6 +690,8 @@ async fn atomic_trade_failure_stays_visible_as_503_and_no_browser_stopout() {
                 lots: 0.1,
                 entry: 1.0,
                 symbol: "FXSIM".into(),
+                tp: 0.0,
+                sl: 0.0,
             }];
             Ok(vec![])
         })
@@ -858,4 +860,87 @@ fn forwarded_for_counts_only_through_trusted_proxies() {
         let mapped = "::ffff:10.0.0.2".parse::<std::net::IpAddr>().ok();
         assert_eq!(app.client_ip(mapped, &headers), ip("203.0.113.5"));
     });
+}
+
+#[tokio::test]
+async fn nstar_spot_wallet_tpsl_and_public_market_panel() {
+    let h = Harness::new().await;
+    let token = h.register("spotter").await;
+    let (status, market) = h.request("/api/market", None, "").await;
+    assert_eq!(status, 200, "{market}");
+    for key in [
+        "high_24h",
+        "low_24h",
+        "volume_24h",
+        "fair",
+        "funding_rate",
+        "tape",
+    ] {
+        assert!(!market[key].is_null(), "{key} missing: {market}");
+    }
+    let (status, v) = h
+        .request("/api/spot", Some(json!({"side":"buy","units":5})), &token)
+        .await;
+    assert_eq!(status, 200, "{v}");
+    let state = h.request("/api/state", None, &token).await.1;
+    let spot = &state["spot"][0];
+    assert_eq!(spot["sym"], "NSTAR");
+    assert!((spot["units"].as_f64().unwrap() - 5.0).abs() < 1e-9);
+    assert!(state["balance"].as_f64().unwrap() < 10_000.0);
+    assert!(state["nstar_price"].as_f64().unwrap() > 0.0);
+    let (status, v) = h
+        .request("/api/spot", Some(json!({"side":"sell","units":6})), &token)
+        .await;
+    assert_eq!(status, 400, "oversell: {v}");
+    let (status, v) = h
+        .request("/api/spot", Some(json!({"side":"sell","units":5})), &token)
+        .await;
+    assert_eq!(status, 200, "{v}");
+    let history = h.request("/api/history", None, &token).await.1;
+    assert!(
+        history["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["kind"] == "spot")
+    );
+    // A trade print reaches the public tape.
+    let market = h.request("/api/market", None, "").await.1;
+    assert!(!market["tape"].as_array().unwrap().is_empty());
+    // Perpetual NSTAR with take-profit / stop-loss.
+    let (status, _) = h
+        .request("/api/symbol", Some(json!({"symbol":"NSTAR"})), &token)
+        .await;
+    assert_eq!(status, 200);
+    let (status, v) = h
+        .request(
+            "/api/trade",
+            Some(json!({"side":"buy","lots":1000})),
+            &token,
+        )
+        .await;
+    assert_eq!(status, 200, "{v}");
+    let state = h.request("/api/state", None, &token).await.1;
+    let p = &state["positions"][0];
+    let (id, mid) = (p["id"].as_u64().unwrap(), state["price"].as_f64().unwrap());
+    assert!(p["liq"].is_null() || p["liq"].as_f64().unwrap() < mid);
+    assert_eq!(p["leverage"], 100);
+    let (status, v) = h
+        .request(
+            "/api/tpsl",
+            Some(json!({"id":id,"tp":mid*0.5,"sl":0})),
+            &token,
+        )
+        .await;
+    assert_eq!(status, 400, "tp below long: {v}");
+    let (status, v) = h
+        .request(
+            "/api/tpsl",
+            Some(json!({"id":id,"tp":mid*1.5,"sl":mid*0.5})),
+            &token,
+        )
+        .await;
+    assert_eq!(status, 200, "{v}");
+    let p = &h.request("/api/state", None, &token).await.1["positions"][0];
+    assert!((p["tp"].as_f64().unwrap() - mid * 1.5).abs() < 1e-6);
 }

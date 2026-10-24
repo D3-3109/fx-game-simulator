@@ -64,6 +64,15 @@ pub fn start(app: Arc<App>) -> JoinSet<()> {
             sleep(Duration::from_secs(2)).await;
         }
     });
+    let a = app.clone();
+    tasks.spawn(async move {
+        loop {
+            sleep(Duration::from_secs(60)).await;
+            if let Err(e) = a.settle_funding().await {
+                eprintln!("[funding] {e}; will retry");
+            }
+        }
+    });
     if !app.market.is_offline() {
         let a = app.clone();
         tasks.spawn(async move {

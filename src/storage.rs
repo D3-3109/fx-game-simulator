@@ -305,8 +305,10 @@ impl Store {
             .map(|t| {
                 let units = t.lots * trading::contract(symbols::NSTAR);
                 match (t.kind.as_str(), t.side.as_str()) {
-                    ("open", "long") | ("close", "short") => units,
-                    ("open", "short") | ("close", "long") => -units,
+                    ("open", "long") | ("close" | "tp" | "sl", "short") | ("spot", "buy") => units,
+                    ("open", "short") | ("close" | "tp" | "sl", "long") | ("spot", "sell") => {
+                        -units
+                    }
                     _ => 0.0,
                 }
             })
@@ -639,9 +641,9 @@ fn validate_password(name: &str, pwd: &str) -> Result<()> {
     }
     Ok(())
 }
-/// Signed NSTAR units held (long positive).
+/// Signed NSTAR units held (long positive), perpetual positions and spot alike.
 fn nstar_units(account: &Account) -> f64 {
-    account
+    let perp: f64 = account
         .positions
         .iter()
         .filter(|p| p.symbol == symbols::NSTAR)
@@ -649,7 +651,8 @@ fn nstar_units(account: &Account) -> f64 {
             let units = p.lots * trading::contract(symbols::NSTAR);
             if p.side == "long" { units } else { -units }
         })
-        .sum()
+        .sum();
+    perp + account.spot.get(symbols::NSTAR).map_or(0.0, |h| h.units)
 }
 async fn load_user(conn: &mut SqliteConnection, name: &str) -> Result<User> {
     let row = sqlx::query("SELECT symbol,account FROM users WHERE name=?")

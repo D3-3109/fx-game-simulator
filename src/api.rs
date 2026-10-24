@@ -199,6 +199,11 @@ async fn get_inner(app: &App, uri: &Uri, headers: &HeaderMap) -> ApiResult {
             Ok(v)
         }
         "/api/leaderboard" => app.leaderboard().await.map_err(upstream),
+        "/api/market" => {
+            let mut v = app.market.nstar_stats().await;
+            v["ok"] = json!(true);
+            Ok(v)
+        }
         "/api/klines" => {
             let q = params(uri)?;
             let symbol = q
@@ -328,7 +333,7 @@ async fn post_inner(
             let u = app.store.user(&name).await?;
             app.store.require_tradable(&u.symbol).await?;
             let symbols: Vec<&str> = std::iter::once(u.symbol.as_str())
-                .chain(u.account.positions.iter().map(|p| p.symbol.as_str()))
+                .chain(u.account.symbols())
                 .collect();
             let mut prices = app
                 .market
@@ -351,6 +356,51 @@ async fn post_inner(
                 .await;
             commit(app, desk).await;
             result?;
+        }
+        "/api/spot" => {
+            let side = text(body, "side")?;
+            let units = number(body, "units")?;
+            let units = match side {
+                "buy" => units,
+                "sell" => -units,
+                _ => return Err(bad("交易方向无效")),
+            };
+            let symbol = symbols::NSTAR;
+            app.store.require_tradable(symbol).await?;
+            let u = app.store.user(&name).await?;
+            let held: Vec<&str> = u.account.symbols().collect();
+            let mut prices = app
+                .market
+                .trading_prices(held.iter().copied().filter(|s| *s != symbols::NSTAR))
+                .await?;
+            let desk = app.market.nstar_desk().await;
+            desk.price(&mut prices)?;
+            let result = app
+                .store
+                .transaction(&name, |a, _, _| {
+                    let trade = a.spot(symbol, units, &prices, now)?;
+                    let mut after = prices.clone();
+                    trading::apply_fill(&mut after, &trade)?;
+                    let mut trades = vec![trade];
+                    trades.extend(a.check_stopout(&after, now)?);
+                    Ok(trades)
+                })
+                .await;
+            commit(app, Some(desk)).await;
+            result?;
+        }
+        "/api/tpsl" => {
+            let id = integer(body, "id")?;
+            let tp = body["tp"].as_f64().unwrap_or(0.0);
+            let sl = body["sl"].as_f64().unwrap_or(0.0);
+            let u = app.store.user(&name).await?;
+            let prices = app.market.prices(u.account.symbols()).await?;
+            app.store
+                .transaction(&name, |a, _, _| {
+                    a.set_triggers(id, tp, sl, &prices)?;
+                    Ok(vec![])
+                })
+                .await?;
         }
         "/api/reset" => {
             app.store

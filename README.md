@@ -41,6 +41,27 @@ PY
 
 局域网访问时，启动参数加 `--listen 0.0.0.0:8000`，通过 `http://<本机局域网 IP>:8000` 访问；数据库、静态目录和管理员配置参数不变。HTTP 未加密，仅用于可信网络。
 
+## 容器（all-in-one）
+
+`ghcr.io/d3-3109/fx-game-simulator` 是含服务端、静态资源与 PSK 生成器的单镜像，支持 `linux/amd64` 与 `linux/arm64`。也可用本目录的 `docker-compose.yml`，或用 `docker build -t fx-sim .` 本地构建。
+
+```sh
+docker run -d --name fx-sim -p 8000:8000 -v "$PWD/data:/data" \
+  -e FX_ADMIN_PSK='换成一个足够长的口令' \
+  ghcr.io/d3-3109/fx-game-simulator:latest
+```
+
+与直接运行的区别：
+
+- 数据目录固定为 `/data`，含 `fx_sim.db` 与 `admin-key.json`；**必须挂卷**，否则容器删除即丢账户与历史。
+- 首次启动从 `FX_ADMIN_PSK` 生成管理员配置（PBKDF2 20 万轮，与 `App::admin_login` 同一实现）。未设置时随机生成并**只在启动日志打印一次**，用 `docker logs fx-sim` 查看。已有 `admin-key.json` 时不覆盖，改口令须先删该文件。
+- 无参数时入口脚本自动拼出 `--listen 0.0.0.0:8000 --db /data/fx_sim.db --static-dir /app/static --admin-key /data/admin-key.json`；显式传参则原样覆盖。
+- 容器以 `fxsim`（uid 10001）运行；以 root 启动时入口脚本先把 `/data` 交付给该用户，再降权 `exec`。
+- 镜像内 `ca-certificates` 供 Binance WebSocket 校验 TLS（该连接走系统信任库、不读代理变量）；FX REST 走 `FX_PROXY`。容器内的 `127.0.0.1` 是容器自身，代理应写宿主机名，例如 `FX_PROXY=http://host.docker.internal:7890`。
+- 镜像自带 `HEALTHCHECK`，探测无需鉴权的 `/api/symbols`。
+
+CI 见 `.github/workflows/container.yml`：先跑 `test_chart.js`、`fmt`、`clippy -D warnings`、`cargo test`，通过后才构建推送；PR 只构建 `amd64` 不推送，`main` 与 `v*` 标签推送双架构，随后用真实镜像做一次管理员登录与注册冒烟。
+
 ## 验证
 
 需要 Node（前端图表回归）。从仓库根目录执行：

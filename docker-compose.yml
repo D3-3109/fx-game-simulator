@@ -1,0 +1,22 @@
+# All-in-one image: the server, static assets and the PSK provisioner in one container.
+services:
+  fx-sim:
+    image: ghcr.io/d3-3109/fx-game-simulator:latest
+    # Or build locally instead of pulling:
+    # build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      # Holds fx_sim.db and admin-key.json; without it every restart loses accounts.
+      - ./data:/data
+    environment:
+      # First start only: pin the admin PSK instead of reading it from the logs.
+      # Delete ./data/admin-key.json to re-provision with a new value.
+      FX_ADMIN_PSK: "${FX_ADMIN_PSK:-}"
+      # Quotes need an outbound proxy where biquote.io is not directly reachable.
+      # Inside the container 127.0.0.1 is the container itself, so name the host.
+      FX_PROXY: "${FX_PROXY:-}"
+    extra_hosts:
+      # Required on Linux; Docker Desktop provides this name automatically.
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped

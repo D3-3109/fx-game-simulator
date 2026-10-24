@@ -1,0 +1,25 @@
+# Keep the build context to sources only; target/ alone is hundreds of MB.
+target/
+.git/
+.github/
+
+# Live accounts, administrator secrets and SQLite sidecars never enter an image.
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+fx_state.json
+.pi/
+.env
+.env.*
+!/.env.example
+*.log
+tiingo_apikeys.txt
+
+# Local tooling and editor state
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store
+.vscode/
+.idea/

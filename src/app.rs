@@ -1,5 +1,5 @@
 use crate::{
-    limits::{Limiter, Limits},
+    limits::{Limiter, Limits, Net},
     market::Market,
     storage::{self, Store},
     symbols, trading,
@@ -36,7 +36,7 @@ pub struct App {
     pub limits: Limits,
     pub limiter: Limiter,
     /// Proxy hops whose `X-Forwarded-For` is trusted; empty means use the socket peer.
-    pub trusted_proxies: Vec<std::net::IpAddr>,
+    pub trusted_proxies: Vec<Net>,
 }
 pub struct Presence {
     id: u64,
@@ -70,7 +70,7 @@ impl App {
         self.limits = limits;
         self
     }
-    pub fn with_trusted_proxies(mut self, proxies: Vec<std::net::IpAddr>) -> Self {
+    pub fn with_trusted_proxies(mut self, proxies: Vec<Net>) -> Self {
         self.trusted_proxies = proxies;
         self
     }
@@ -83,7 +83,8 @@ impl App {
         headers: &axum::http::HeaderMap,
     ) -> Option<std::net::IpAddr> {
         let peer = peer.map(|ip| ip.to_canonical());
-        if !peer.is_some_and(|p| self.trusted_proxies.contains(&p)) {
+        let trusted = |ip: &std::net::IpAddr| self.trusted_proxies.iter().any(|n| n.contains(*ip));
+        if !peer.as_ref().is_some_and(trusted) {
             return peer;
         }
         let hops: Vec<std::net::IpAddr> = headers
@@ -94,10 +95,7 @@ impl App {
             .filter_map(|s| s.trim().parse::<std::net::IpAddr>().ok())
             .map(|ip| ip.to_canonical())
             .collect();
-        hops.into_iter()
-            .rev()
-            .find(|ip| !self.trusted_proxies.contains(ip))
-            .or(peer)
+        hops.into_iter().rev().find(|ip| !trusted(ip)).or(peer)
     }
     pub fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);

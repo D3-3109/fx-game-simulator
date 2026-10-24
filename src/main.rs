@@ -13,10 +13,11 @@ struct Args {
     static_dir: PathBuf,
     #[arg(long)]
     admin_key: PathBuf,
-    /// Reverse proxy whose X-Forwarded-For is trusted for per-IP limits; repeatable.
-    /// Without it, limits key on the TCP peer, so behind a proxy everyone shares one key.
+    /// Reverse proxy address or CIDR (e.g. 172.16.0.0/12) whose X-Forwarded-For is trusted
+    /// for per-IP limits; comma-separated or repeated. Without it, limits key on the TCP
+    /// peer, so behind a proxy everyone shares one key.
     #[arg(long = "trusted-proxy", value_delimiter = ',')]
-    trusted_proxies: Vec<std::net::IpAddr>,
+    trusted_proxies: Vec<fx_sim_rust::limits::Net>,
 }
 
 #[tokio::main]

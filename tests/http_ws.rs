@@ -837,8 +837,9 @@ fn forwarded_for_counts_only_through_trusted_proxies() {
         let store = Arc::new(Store::open(&dir.path().join("t.db")).await.unwrap());
         let market = Arc::new(Market::offline(store.clone(), [].into()).await.unwrap());
         let proxy: std::net::IpAddr = "10.0.0.2".parse().unwrap();
-        let app =
-            App::new(store, market, dir.path().join("k.json")).with_trusted_proxies(vec![proxy]);
+        let docker = "172.16.0.0/12".parse().unwrap();
+        let app = App::new(store, market, dir.path().join("k.json"))
+            .with_trusted_proxies(vec!["10.0.0.2".parse().unwrap(), docker]);
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
             "x-forwarded-for",
@@ -852,6 +853,8 @@ fn forwarded_for_counts_only_through_trusted_proxies() {
             app.client_ip(ip("198.51.100.1"), &headers),
             ip("198.51.100.1")
         );
+        // Any address in a trusted CIDR counts as the proxy, so container restarts are safe.
+        assert_eq!(app.client_ip(ip("172.18.0.7"), &headers), ip("203.0.113.5"));
         let mapped = "::ffff:10.0.0.2".parse::<std::net::IpAddr>().ok();
         assert_eq!(app.client_ip(mapped, &headers), ip("203.0.113.5"));
     });

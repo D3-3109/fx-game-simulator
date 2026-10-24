@@ -59,6 +59,7 @@ docker run -d --name fx-sim -p 8000:8000 -v "$PWD/data:/data" \
 - 容器以 `fxsim`（uid 10001）运行；以 root 启动时入口脚本先把 `/data` 交付给该用户，再降权 `exec`。
 - 镜像内 `ca-certificates` 供 Binance WebSocket 校验 TLS（该连接走系统信任库、不读代理变量）；FX REST 走 `FX_PROXY`。容器内的 `127.0.0.1` 是容器自身，代理应写宿主机名，例如 `FX_PROXY=http://host.docker.internal:7890`。
 - 镜像自带 `HEALTHCHECK`，探测无需鉴权的 `/api/symbols`。
+- 按 IP 限流（IPv6 按 /64）：接口每秒 50 次（突发 300），登录每秒 1 次（突发 30），WebSocket 每 IP 最多 100 个；注册每 IP 每小时 2 个、每天 5 个，全站每小时 30 个。放在 Caddy/nginx 后面时**必须**设置 `FX_TRUSTED_PROXY`（地址或网段，如 `172.16.0.0/12` 覆盖 Docker 默认网络），否则所有玩家共用代理那一份额度；此时不要再把 8000 端口暴露到公网。
 
 CI 见 `.github/workflows/container.yml`：先跑 `test_chart.js`、`fmt`、`clippy -D warnings`、`cargo test`，通过后才构建推送；PR 只构建 `amd64` 不推送，`main` 与 `v*` 标签推送双架构，随后用真实镜像做一次管理员登录与注册冒烟。
 

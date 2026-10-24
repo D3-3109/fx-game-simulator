@@ -348,8 +348,7 @@ impl Account {
     }
     pub fn equity(&self, prices: &Prices) -> Result<f64> {
         finite(
-            self.balance
-                - self.loan
+            self.balance - self.loan
                 + self
                     .positions
                     .iter()
@@ -398,7 +397,9 @@ impl Account {
         }
         self.validate()?;
         let px = execution_price(prices, symbol, side == "long")?;
-        let need = finite(lots * contract(symbol) * px * usd_rate(prices, symbol)? / self.leverage as f64)?;
+        let need = finite(
+            lots * contract(symbol) * px * usd_rate(prices, symbol)? / self.leverage as f64,
+        )?;
         let free = self.equity(prices)? - self.used_margin(prices)?;
         if need > free {
             return Err(format!("保证金不足: 需 ${need:.2}，可用 ${free:.2}（USD）"));

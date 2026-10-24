@@ -41,7 +41,10 @@ pub fn start(app: Arc<App>) -> JoinSet<()> {
     tasks.spawn(async move {
         loop {
             if let Ok(users) = a.store.users().await {
-                for u in users.into_iter().filter(|u| u.account.debt() > 0.0 || u.account.debt_since != 0) {
+                for u in users
+                    .into_iter()
+                    .filter(|u| u.account.debt() > 0.0 || u.account.debt_since != 0)
+                {
                     let now = crate::storage::now_ms();
                     let result = a
                         .store
@@ -90,7 +93,10 @@ pub fn start(app: Arc<App>) -> JoinSet<()> {
 async fn stock_loop(app: Arc<App>) {
     loop {
         let active = app.active_symbols().await.unwrap_or_default();
-        for symbol in active.iter().filter(|s| symbols::STOCK.contains(&s.as_str())) {
+        for symbol in active
+            .iter()
+            .filter(|s| symbols::STOCK.contains(&s.as_str()))
+        {
             if app.market.price(symbol).await.is_err() {
                 eprintln!("[stock] quote unavailable for {symbol}; will retry");
             }

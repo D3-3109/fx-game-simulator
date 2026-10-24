@@ -3,7 +3,9 @@ pub const CRYPTO: &[&str] = &[
     "BTCUSDT", "ETHUSDT", "EURUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT",
     "TRXUSDT", "AVAXUSDT", "LINKUSDT",
 ];
-pub const STOCK: &[&str] = &["AAPL", "TSLA", "NVDA", "MSFT", "AMZN", "GOOGL", "META", "AMD"];
+pub const STOCK: &[&str] = &[
+    "AAPL", "TSLA", "NVDA", "MSFT", "AMZN", "GOOGL", "META", "AMD",
+];
 pub const FX: &[&str] = &[
     "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD", "EURJPY", "GBPJPY",
     "USDCNH", "USDCNY", "EURCNH",

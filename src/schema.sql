@@ -29,5 +29,6 @@ CREATE TABLE IF NOT EXISTS admin_events (
     time INTEGER NOT NULL, request_id TEXT UNIQUE, detail TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sim_bars (
-    sec INTEGER, t INTEGER, o REAL, h REAL, l REAL, c REAL, PRIMARY KEY(sec,t)
+    symbol TEXT NOT NULL DEFAULT 'FXSIM', sec INTEGER, t INTEGER, o REAL, h REAL, l REAL, c REAL,
+    PRIMARY KEY(symbol,sec,t)
 );

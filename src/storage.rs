@@ -88,6 +88,28 @@ impl Store {
                 .execute(&pool)
                 .await?;
         }
+        let sim_fields = sqlx::query("PRAGMA table_info(sim_bars)")
+            .fetch_all(&pool)
+            .await?;
+        if !sim_fields
+            .iter()
+            .any(|r| r.get::<String, _>("name") == "symbol")
+        {
+            let mut tx = pool.begin().await?;
+            sqlx::query("ALTER TABLE sim_bars RENAME TO sim_bars_old")
+                .execute(&mut *tx)
+                .await?;
+            sqlx::raw_sql(schema).execute(&mut *tx).await?;
+            sqlx::query(
+                "INSERT INTO sim_bars(symbol,sec,t,o,h,l,c) SELECT 'FXSIM',sec,t,o,h,l,c FROM sim_bars_old",
+            )
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("DROP TABLE sim_bars_old")
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+        }
         let mut next_id = 1;
         for row in sqlx::query("SELECT account FROM users")
             .fetch_all(&pool)
@@ -448,12 +470,14 @@ impl Store {
         tx.commit().await?;
         Ok(())
     }
-    pub async fn load_bars(&self, sec: i64) -> Result<Vec<[f64; 5]>> {
-        let rows =
-            sqlx::query("SELECT t,o,h,l,c FROM sim_bars WHERE sec=? ORDER BY t DESC LIMIT 1000")
-                .bind(sec)
-                .fetch_all(&self.pool)
-                .await?;
+    pub async fn load_bars(&self, symbol: &str, sec: i64) -> Result<Vec<[f64; 5]>> {
+        let rows = sqlx::query(
+            "SELECT t,o,h,l,c FROM sim_bars WHERE symbol=? AND sec=? ORDER BY t DESC LIMIT 1000",
+        )
+        .bind(symbol)
+        .bind(sec)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows
             .into_iter()
             .rev()
@@ -468,20 +492,24 @@ impl Store {
             })
             .collect())
     }
-    pub async fn save_bars(&self, bars: &[(i64, [f64; 5], i64)]) -> Result<()> {
+    pub async fn save_bars(&self, symbol: &str, bars: &[(i64, [f64; 5], i64)]) -> Result<()> {
         let _guard = self.gate.lock().await;
         let mut tx = self.pool.begin().await?;
         for (sec, b, oldest) in bars {
-            sqlx::query("INSERT OR REPLACE INTO sim_bars VALUES(?,?,?,?,?,?)")
-                .bind(sec)
-                .bind(b[0] as i64)
-                .bind(b[1])
-                .bind(b[2])
-                .bind(b[3])
-                .bind(b[4])
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query("DELETE FROM sim_bars WHERE sec=? AND t<?")
+            sqlx::query(
+                "INSERT OR REPLACE INTO sim_bars(symbol,sec,t,o,h,l,c) VALUES(?,?,?,?,?,?,?)",
+            )
+            .bind(symbol)
+            .bind(sec)
+            .bind(b[0] as i64)
+            .bind(b[1])
+            .bind(b[2])
+            .bind(b[3])
+            .bind(b[4])
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("DELETE FROM sim_bars WHERE symbol=? AND sec=? AND t<?")
+                .bind(symbol)
                 .bind(sec)
                 .bind(oldest)
                 .execute(&mut *tx)

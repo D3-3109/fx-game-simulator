@@ -209,9 +209,9 @@ async fn sqlite_sim_restart_retains_closed_extremes_and_does_not_fill_gap() {
     let mut sim = SimFeed::new(t);
     sim.record(0.9, t + 200);
     sim.record(1.09, t + 400);
-    store.save_bars(&sim.pending()).await.unwrap();
+    store.save_bars("FXSIM", &sim.pending()).await.unwrap();
     sim.record(1.11, t + 60000);
-    store.save_bars(&sim.pending()).await.unwrap();
+    store.save_bars("FXSIM", &sim.pending()).await.unwrap();
     let old = sim.klines(60, 1000);
     store.close().await;
     let store = Store::open(&path).await.unwrap();
@@ -273,7 +273,7 @@ async fn sim_rest_and_ws_share_authoritative_ohlc() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::open(&dir.path().join("sim.db")).await.unwrap());
     let market = Market::offline(store, Prices::new()).await.unwrap();
-    let now = now_ms() + 60000;
+    let now = (now_ms() + 60000) / 1000 * 1000;
     market.record_sim(1.12, now).await.unwrap();
     market.record_sim(0.8, now + 100).await.unwrap();
     let packet = market.record_sim(1.1, now + 200).await.unwrap();

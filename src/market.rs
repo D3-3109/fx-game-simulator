@@ -444,7 +444,7 @@ impl Market {
         let mut next = sim.clone();
         next.record(valid(price)?, now);
         self.store
-            .save_bars(&next.pending())
+            .save_bars(symbols::SIM, &next.pending())
             .await
             .map_err(|_| "模拟行情保存失败")?;
         let packet = next.packet();
@@ -460,7 +460,7 @@ impl Market {
         let now = now_ms();
         next.record(price, now);
         self.store
-            .save_bars(&next.pending())
+            .save_bars(symbols::SIM, &next.pending())
             .await
             .map_err(|_| "模拟行情保存失败")?;
         let packet = next.packet();
@@ -611,7 +611,7 @@ impl SimFeed {
         let mut loaded = Vec::new();
         for (_, sec) in symbols::INTERVALS {
             let bars = store
-                .load_bars(*sec)
+                .load_bars(symbols::SIM, *sec)
                 .await
                 .map_err(|_| "模拟历史读取失败")?;
             if !bars.is_empty() {
@@ -628,7 +628,7 @@ impl SimFeed {
         }
         sim.record(sim.price, now);
         store
-            .save_bars(&sim.pending())
+            .save_bars(symbols::SIM, &sim.pending())
             .await
             .map_err(|_| "模拟历史保存失败")?;
         Ok(sim)

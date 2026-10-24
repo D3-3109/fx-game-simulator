@@ -1,4 +1,5 @@
 pub const SIM: &str = "FXSIM";
+pub const NSTAR: &str = "NSTAR";
 pub const CRYPTO: &[&str] = &[
     "BTCUSDT", "ETHUSDT", "EURUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT",
     "TRXUSDT", "AVAXUSDT", "LINKUSDT",
@@ -72,6 +73,7 @@ const fn stock(symbol: &'static str) -> Spec {
 }
 const SPECS: &[Spec] = &[
     lot(SIM, TIGHT, None),
+    lot(NSTAR, TIGHT, None),
     lot("BTCUSDT", TIGHT, None),
     lot("ETHUSDT", TIGHT, None),
     lot("EURUSDT", TIGHT, None),

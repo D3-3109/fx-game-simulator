@@ -28,6 +28,7 @@ pub struct Spec {
     /// Units traded per lot.
     pub contract: f64,
     pub min_lots: f64,
+    pub max_lots: f64,
     pub whole_lots: bool,
     /// Absolute spread, used when `pct` is zero.
     pub spread: f64,
@@ -43,6 +44,7 @@ const fn lot(symbol: &'static str, spread: f64, settle: Option<&'static str>) ->
         symbol,
         contract: 100_000.0,
         min_lots: 0.01,
+        max_lots: f64::INFINITY,
         whole_lots: false,
         spread,
         pct: 0.0,
@@ -54,6 +56,7 @@ const fn coin(symbol: &'static str) -> Spec {
         symbol,
         contract: 1.0,
         min_lots: 0.01,
+        max_lots: f64::INFINITY,
         whole_lots: false,
         spread: 0.0,
         pct: 0.0005,
@@ -65,6 +68,7 @@ const fn stock(symbol: &'static str) -> Spec {
         symbol,
         contract: 1.0,
         min_lots: 1.0,
+        max_lots: f64::INFINITY,
         whole_lots: true,
         spread: 0.0,
         pct: 0.0005,
@@ -73,7 +77,10 @@ const fn stock(symbol: &'static str) -> Spec {
 }
 const SPECS: &[Spec] = &[
     lot(SIM, TIGHT, None),
-    coin(NSTAR),
+    Spec {
+        max_lots: 10.0,
+        ..coin(NSTAR)
+    },
     lot("BTCUSDT", TIGHT, None),
     lot("ETHUSDT", TIGHT, None),
     lot("EURUSDT", TIGHT, None),

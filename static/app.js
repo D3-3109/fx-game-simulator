@@ -234,11 +234,11 @@ function drawPosLines(){
 const STOCKS=['AAPL','TSLA','NVDA','MSFT','AMZN','GOOGL','META','AMD'];
 const symSel=$('sym'),itvSel=$('itv');
 'EURUSDT BTCUSDT ETHUSDT SOLUSDT XRPUSDT BNBUSDT DOGEUSDT ADAUSDT TRXUSDT AVAXUSDT LINKUSDT EURUSD GBPUSD USDJPY USDCHF USDCAD AUDUSD NZDUSD EURJPY GBPJPY USDCNY USDCNH FXSIM'.split(' ').forEach(s=>symSel.add(new Option(s==='FXSIM'?'FXSIM · 模拟币':s,s)));
-['1m','5m','15m','30m','1h','4h','1d','1w'].forEach(i=>itvSel.add(new Option(i)));
 function syncSecondOption(){
- const has=[...itvSel.options].some(o=>o.value==='1s');
- if(cur.sym==='FXSIM'&&!has)itvSel.add(new Option('1s'),0);
- if(cur.sym!=='FXSIM'&&has){[...itvSel.options].find(o=>o.value==='1s').remove();if(cur.itv==='1s')cur.itv='1m'}
+ const fx=cur.sym==='FXSIM';
+ if(!fx&&cur.itv==='1s')cur.itv='1m';
+ itvSel.replaceChildren();
+ (fx?['1s','1m','5m','15m','30m','1h','4h','1d','1w']:['1m','5m','15m','30m','1h','4h','1d','1w']).forEach(i=>itvSel.add(new Option(i)));
  itvSel.value=cur.itv;
 }
 syncSecondOption();
@@ -252,6 +252,7 @@ function syncSymbolChoices(){
   }
   symSel.value=cur.sym;
  }
+ syncSecondOption();
  syncOrderControls();
 }
 function syncOrderControls(){

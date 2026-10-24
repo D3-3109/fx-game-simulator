@@ -18,6 +18,7 @@ RUN mkdir -p src examples \
 COPY src ./src
 COPY examples ./examples
 COPY tests ./tests
+COPY static ./static
 RUN cargo build --locked --release --bins --examples \
  && strip target/release/fx-sim-rust target/release/examples/admin_key
 

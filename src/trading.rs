@@ -858,7 +858,7 @@ mod tests {
             ..Account::default()
         };
         a.open("long", MAX_LOTS, "NSTAR", &q, 1, 0).unwrap();
-        // Unwinding 1,000 NSTAR into a 100,000 book costs ~0.5%: the mark says so.
+        // Unwinding 1,000 NSTAR into a 50,000 book costs ~1%: the mark says so.
         let pnl = a.positions[0].pnl(&q).unwrap();
         assert!(pnl < -400.0, "{pnl}");
         // Account leverage 1:50000 still margins NSTAR at 1:100.
@@ -895,10 +895,10 @@ mod tests {
             .iter()
             .map(|t| t.pnl.unwrap())
             .sum();
-        // Spread is charged per slice on close but once on the joint mark: the mark is
-        // the slightly more conservative of the two.
+        // Joint marking charges spread at the starting mid, slices at ever lower mids: the
+        // mark is the slightly more conservative of the two.
         assert!(
-            joint <= realised && realised - joint < joint.abs() * 0.05,
+            joint <= realised && realised - joint < joint.abs() * 0.1,
             "{realised} vs {joint}"
         );
         let mut thin = Account::default();

@@ -43,7 +43,7 @@ function renderQuote(price,symbol,bid,ask,valid=true,at){
  document.title=`${formatted} | ${symbol}`;
  const [whole,decimal]=formatted.split('.');
  node.innerHTML=Number.isFinite(price)?Number(whole).toLocaleString('en-US')+(decimal?`<span class="quote-decimal">.${decimal}</span>`:''):'—';
- $('quote-unit').textContent=symbol==='FXSIM'||STOCKS.includes(symbol)?'USD':symbol.endsWith('USDT')?'USDT':symbol.slice(-3);
+ $('quote-unit').textContent=isSim(symbol)||STOCKS.includes(symbol)?'USD':symbol.endsWith('USDT')?'USDT':symbol.slice(-3);
  quoteLast=Number.isFinite(price)?price:null;
  renderQuoteChange();
  if(quoteLast!==null)loadQuoteReference(symbol);
@@ -246,7 +246,7 @@ symSel.value=cur.sym;itvSel.value=cur.itv;
 let tradableSymbols=null,symbolsVersion=-1,symbolSaving=false;
 function syncSymbolChoices(){
  if(tradableSymbols!==null){
-  symSel.replaceChildren();tradableSymbols.forEach(s=>symSel.add(new Option(s==='FXSIM'?'FXSIM · 模拟币':s,s)));
+  symSel.replaceChildren();tradableSymbols.forEach(s=>symSel.add(new Option(s==='FXSIM'?'FXSIM · 模拟币':s==='NSTAR'?'NSTAR · 北极星币':s,s)));
   if(!tradableSymbols.includes(cur.sym)){
    const option=new Option(cur.sym+' · 已禁用（仅查看）',cur.sym);option.disabled=true;symSel.add(option);
   }
@@ -372,8 +372,9 @@ function mergeSimBars(data,stamp){
  simBars=[...bars.values()].sort((a,b)=>a.time-b.time).slice(-500);simStamp=stamp;
  lastBar={...simBars[simBars.length-1]};lastBarLive=false;return true;
 }
+const isSim=sym=>sym==='FXSIM'||sym==='NSTAR';
 function updateSim(rows,stamp){
- if(!rows||!series||!kLoaded||cur.sym!=='FXSIM'||lastSym!==cur.sym||lastItv!==cur.itv)return;
+ if(!rows||!series||!kLoaded||!isSim(cur.sym)||lastSym!==cur.sym||lastItv!==cur.itv)return;
  const data=rows.map(k=>({time:k[0]/1000,open:k[1],high:k[2],low:k[3],close:k[4]}));
  if(mergeSimBars(data,stamp))series.setData(simBars);
 }
@@ -391,7 +392,7 @@ async function loadK(){
   if(!latest)throw '无K线数据';
   observePrices(sym,j.klines.flatMap(k=>k.slice(1,5)));
   series.applyOptions({priceFormat:priceFormat(sym)});
-  if(sym==='FXSIM'){
+  if(isSim(sym)){
    if(reset){simBars=[];simStamp=0}
    if(!mergeSimBars(data,j.updated_at||0))return;
    series.setData(simBars);  // 后端完整OHLC含闭合前一根，不从抽样价格猜影线。
@@ -420,7 +421,7 @@ async function loadK(){
  }
 }
 function updateLast(price){
- if(cur.sym==='FXSIM'||!series||!kLoaded||lastSym!==cur.sym||lastItv!==cur.itv||!price)return;
+ if(isSim(cur.sym)||!series||!kLoaded||lastSym!==cur.sym||lastItv!==cur.itv||!price)return;
  const offset=cur.itv==='1w'?3*86400:0;
  const t=Math.floor((Date.now()/1000+offset)/SEC[cur.itv])*SEC[cur.itv]-offset;
  const base=(lastBar&&lastBar.time===t)?lastBar:{time:t,open:price,high:price,low:price,close:price};
@@ -502,7 +503,7 @@ function wsConnect(){
   if(d.type==='state'){connOk();render(d);return}
   if(d.sym!==cur.sym)return;
   renderQuote(d.price,d.sym,d.bid,d.ask,d.quote_valid,d.quote_at);
-  if(d.sym==='FXSIM'){updateSim(d.klines&&d.klines[cur.itv],d.time);return}
+  if(isSim(d.sym)){updateSim(d.klines&&d.klines[cur.itv],d.time);return}
   updateLast(d.price)};
  ws.onopen=()=>{connOk();loadChat();loadSymbols()};
  ws.onclose=()=>{connDown();wsTimer=setTimeout(wsConnect,2000)};

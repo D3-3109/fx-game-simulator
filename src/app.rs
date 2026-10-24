@@ -212,6 +212,9 @@ impl App {
                 .flat_map(|u| u.account.positions.iter().map(|p| p.symbol.as_str()))
                 .filter(|s| !s.is_empty()),
         )?;
-        Ok(needed.into_iter().filter(|s| s != symbols::SIM).collect())
+        Ok(needed
+            .into_iter()
+            .filter(|s| s != symbols::SIM && s != symbols::NSTAR)
+            .collect())
     }
 }

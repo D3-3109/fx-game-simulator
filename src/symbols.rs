@@ -115,13 +115,13 @@ pub fn all() -> Vec<&'static str> {
         .chain(FX)
         .chain(STOCK)
         .copied()
-        .chain([SIM])
+        .chain([SIM, NSTAR])
         .collect();
     out.sort();
     out
 }
 pub fn provider(symbol: &str) -> Option<&'static str> {
-    if symbol == SIM {
+    if symbol == SIM || symbol == NSTAR {
         Some("本地模拟")
     } else if CRYPTO.contains(&symbol) {
         Some("Binance")

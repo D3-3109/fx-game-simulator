@@ -61,7 +61,11 @@ pub fn market_price(prices: &Prices, symbol: &str) -> Result<f64> {
 }
 
 pub fn conversion(symbol: &str) -> Result<Option<&'static str>> {
-    if symbol.is_empty() || symbol == "FXSIM" || symbol.ends_with("USD") || symbol.ends_with("USDT")
+    if symbol.is_empty()
+        || symbol == "FXSIM"
+        || symbol == "NSTAR"
+        || symbol.ends_with("USD")
+        || symbol.ends_with("USDT")
     {
         return Ok(None);
     }

@@ -43,7 +43,7 @@ function renderQuote(price,symbol,bid,ask,valid=true,at){
  document.title=`${formatted} | ${symbol}`;
  const [whole,decimal]=formatted.split('.');
  node.innerHTML=Number.isFinite(price)?Number(whole).toLocaleString('en-US')+(decimal?`<span class="quote-decimal">.${decimal}</span>`:''):'—';
- $('quote-unit').textContent=symbol==='FXSIM'?'USD':symbol.endsWith('USDT')?'USDT':symbol.slice(-3);
+ $('quote-unit').textContent=symbol==='FXSIM'||STOCKS.includes(symbol)?'USD':symbol.endsWith('USDT')?'USDT':symbol.slice(-3);
  quoteLast=Number.isFinite(price)?price:null;
  renderQuoteChange();
  if(quoteLast!==null)loadQuoteReference(symbol);
@@ -231,8 +231,9 @@ function drawPosLines(){
   price:p.entry,color:p.side=='long'?'#26a69a':'#ef5350',lineWidth:1,lineStyle:2,
   axisLabelVisible:true,title:(p.side=='long'?'多 ':'空 ')+p.lots}));
 }
+const STOCKS=['AAPL','TSLA','NVDA','MSFT','AMZN','GOOGL','META','AMD'];
 const symSel=$('sym'),itvSel=$('itv');
-'EURUSDT BTCUSDT ETHUSDT EURUSD GBPUSD USDJPY USDCHF USDCAD AUDUSD NZDUSD EURJPY GBPJPY USDCNY USDCNH FXSIM'.split(' ').forEach(s=>symSel.add(new Option(s==='FXSIM'?'FXSIM · 模拟币':s,s)));
+'EURUSDT BTCUSDT ETHUSDT SOLUSDT XRPUSDT BNBUSDT DOGEUSDT ADAUSDT TRXUSDT AVAXUSDT LINKUSDT EURUSD GBPUSD USDJPY USDCHF USDCAD AUDUSD NZDUSD EURJPY GBPJPY USDCNY USDCNH FXSIM'.split(' ').forEach(s=>symSel.add(new Option(s==='FXSIM'?'FXSIM · 模拟币':s,s)));
 ['1m','5m','15m','30m','1h','4h','1d','1w'].forEach(i=>itvSel.add(new Option(i)));
 symSel.value=cur.sym;itvSel.value=cur.itv;
 let tradableSymbols=null,symbolsVersion=-1,symbolSaving=false;
@@ -250,6 +251,9 @@ function syncOrderControls(){
  const allowed=tradableSymbols!==null&&tradableSymbols.includes(cur.sym);
  symSel.disabled=orderBusy||symbolSaving||tradableSymbols?.length===0;
  $('order-symbol').textContent=cur.sym;
+ const whole=STOCKS.includes(cur.sym);
+ $('lots').min=whole?1:0.01;$('lots').step=whole?1:0.01;
+ document.querySelectorAll('[data-lots]').forEach((b,i)=>{const v=(whole?[1,10,50,100]:[0.01,0.1,0.5,1])[i];b.dataset.lots=v;b.textContent=whole?String(v):v.toFixed(2)});
  $('trade-buy').disabled=$('trade-sell').disabled=orderBusy||symbolSaving||!allowed||!quoteReady;
  $('close-all').disabled=orderBusy||curPos.length===0;
  $('close-all').textContent=orderBusy?'正在处理…':'全部平仓';
@@ -285,7 +289,7 @@ function msg(t){clearTimeout(messageTimer);$('msg').textContent=t;messageTimer=s
 function syncLotPresets(){
  document.querySelectorAll('[data-lots]').forEach(button=>button.setAttribute('aria-pressed',Number(button.dataset.lots)===Number($('lots').value)));
 }
-function setLots(value){$('lots').value=value.toFixed(2);syncLotPresets()}
+function setLots(value){$('lots').value=STOCKS.includes(cur.sym)?value:value.toFixed(2);syncLotPresets()}
 $('lots').addEventListener('input',syncLotPresets);syncLotPresets();
 async function trade(side){
  if(orderBusy)return;

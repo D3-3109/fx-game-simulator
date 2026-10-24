@@ -52,11 +52,27 @@ pub fn start(app: Arc<App>) -> JoinSet<()> {
         tasks.spawn(async move {
             fx_loop(a).await;
         });
+        let a = app.clone();
+        tasks.spawn(async move {
+            stock_loop(a).await;
+        });
         tasks.spawn(async move {
             binance_loop(app, "wss://data-stream.binance.vision").await;
         });
     }
     tasks
+}
+
+async fn stock_loop(app: Arc<App>) {
+    loop {
+        let active = app.active_symbols().await.unwrap_or_default();
+        for symbol in active.iter().filter(|s| symbols::STOCK.contains(&s.as_str())) {
+            if app.market.price(symbol).await.is_err() {
+                eprintln!("[stock] quote unavailable for {symbol}; will retry");
+            }
+        }
+        sleep(Duration::from_secs(10)).await;
+    }
 }
 
 async fn fx_loop(app: Arc<App>) {

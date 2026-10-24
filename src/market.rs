@@ -45,7 +45,7 @@ impl Quote {
     }
     pub fn packet(self, symbol: &str, now: i64) -> Value {
         let (bid, ask) = self.bid_ask.unwrap_or_else(|| {
-            let half = trading::spread(symbol) / 2.0;
+            let half = trading::spread(symbol, self.price) / 2.0;
             (self.price - half, self.price + half)
         });
         json!({"sym":symbol,"price":self.price,"bid":bid,"ask":ask,
@@ -136,6 +136,10 @@ impl Market {
             Ok(Quote::single(self.sim.lock().await.price, start))
         } else if symbols::FX.contains(&symbol) {
             self.biquote_quote(symbol).await
+        } else if symbols::STOCK.contains(&symbol) {
+            self.yahoo_price(symbol)
+                .await
+                .map(|price| Quote::single(price, start))
         } else {
             self.fetch_price(symbol)
                 .await

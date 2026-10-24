@@ -1,4 +1,5 @@
 //! Pure USD accounting. No storage, network, or wall-clock access.
+use crate::symbols;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -60,6 +61,9 @@ pub fn conversion(symbol: &str) -> Result<Option<&'static str>> {
     {
         return Ok(None);
     }
+    if let Some(spec) = symbols::spec(symbol) {
+        return Ok(spec.settle);
+    }
     for (currency, pair) in [
         ("JPY", "USDJPY"),
         ("CHF", "USDCHF"),
@@ -95,11 +99,21 @@ pub fn usd_rate(prices: &Prices, symbol: &str) -> Result<f64> {
     })
 }
 
-pub fn spread(symbol: &str) -> f64 {
-    if symbol.ends_with("JPY") {
-        0.02
-    } else {
-        0.0002
+pub fn contract(symbol: &str) -> f64 {
+    symbols::spec(symbol).map_or(CONTRACT, |s| s.contract)
+}
+
+pub fn lots_valid(symbol: &str, lots: f64) -> bool {
+    let (min, whole) = symbols::spec(symbol).map_or((0.01, false), |s| (s.min_lots, s.whole_lots));
+    lots.is_finite() && lots >= min && (!whole || lots.fract() == 0.0)
+}
+
+pub fn spread(symbol: &str, mid: f64) -> f64 {
+    match symbols::spec(symbol) {
+        Some(spec) if spec.pct > 0.0 => mid * spec.pct,
+        Some(spec) => spec.spread,
+        None if symbol.ends_with("JPY") => 0.02,
+        None => 0.0002,
     }
 }
 
@@ -113,9 +127,9 @@ pub fn execution_price(prices: &Prices, symbol: &str, buy: bool) -> Result<f64> 
         if buy { ask } else { bid }
     } else {
         mid + if buy {
-            spread(symbol) / 2.0
+            spread(symbol, mid) / 2.0
         } else {
-            -spread(symbol) / 2.0
+            -spread(symbol, mid) / 2.0
         }
     };
     if !px.is_finite() || px <= 0.0 {
@@ -141,7 +155,7 @@ impl Position {
         } else {
             self.entry - quote
         };
-        finite(diff * self.lots * CONTRACT * usd_rate(prices, &self.symbol)?)
+        finite(diff * self.lots * contract(&self.symbol) * usd_rate(prices, &self.symbol)?)
     }
     pub fn pnl(&self, prices: &Prices) -> Result<f64> {
         let quote = if prices.bid_ask.contains_key(&self.symbol) {
@@ -154,7 +168,7 @@ impl Position {
     pub fn margin(&self, prices: &Prices, leverage: u64) -> Result<f64> {
         finite(
             self.lots
-                * CONTRACT
+                * contract(&self.symbol)
                 * market_price(prices, &self.symbol)?
                 * usd_rate(prices, &self.symbol)?
                 / leverage as f64,
@@ -218,7 +232,7 @@ impl Account {
         for p in &self.positions {
             if !matches!(p.side.as_str(), "long" | "short")
                 || !p.lots.is_finite()
-                || p.lots < 0.01
+                || !lots_valid(&p.symbol, p.lots)
                 || !p.entry.is_finite()
                 || p.entry <= 0.0
             {
@@ -269,12 +283,16 @@ impl Account {
         if !matches!(side, "long" | "short") {
             return Err("交易方向无效".into());
         }
-        if !lots.is_finite() || lots < 0.01 {
-            return Err("手数必须为有限数且不少于0.01".into());
+        if !lots_valid(symbol, lots) {
+            return Err(if symbols::spec(symbol).is_some_and(|s| s.whole_lots) {
+                "美股须为整数股且不少于1股".into()
+            } else {
+                "手数必须为有限数且不少于0.01".into()
+            });
         }
         self.validate()?;
         let px = execution_price(prices, symbol, side == "long")?;
-        let need = finite(lots * CONTRACT * px * usd_rate(prices, symbol)? / self.leverage as f64)?;
+        let need = finite(lots * contract(symbol) * px * usd_rate(prices, symbol)? / self.leverage as f64)?;
         let free = self.equity(prices)? - self.used_margin(prices)?;
         if need > free {
             return Err(format!("保证金不足: 需 ${need:.2}，可用 ${free:.2}（USD）"));
@@ -416,6 +434,19 @@ mod tests {
         let before = a.clone();
         assert!(a.check_stopout(&q, 2).is_err());
         assert_eq!(a, before);
+    }
+    #[test]
+    fn stock_whole_shares_and_percent_spread() {
+        assert!(lots_valid("AAPL", 1.0));
+        assert!(lots_valid("AAPL", 10.0));
+        assert!(!lots_valid("AAPL", 0.5));
+        assert!(!lots_valid("AAPL", 1.5));
+        assert!(lots_valid("BTCUSDT", 0.01));
+        assert!(!lots_valid("BTCUSDT", 0.001));
+        assert!((spread("AAPL", 200.0) - 0.1).abs() < 1e-9);
+        assert_eq!(contract("AAPL"), 1.0);
+        assert_eq!(contract("EURUSD"), 100_000.0);
+        assert_eq!(conversion("AAPL").unwrap(), None);
     }
     #[test]
     fn cross_margin_and_spread() {

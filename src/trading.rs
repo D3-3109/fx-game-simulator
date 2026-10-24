@@ -112,6 +112,60 @@ pub fn contract(symbol: &str) -> f64 {
     symbols::spec(symbol).map_or(CONTRACT, |s| s.contract)
 }
 
+/// Units that move a simulated book by one log unit; 0 for externally quoted symbols.
+pub fn depth(symbol: &str) -> f64 {
+    symbols::spec(symbol).map_or(0.0, |s| s.depth)
+}
+
+/// Leverage applied to one symbol: the account setting, never above the symbol's ceiling.
+pub fn leverage_for(symbol: &str, leverage: u64) -> u64 {
+    match symbols::spec(symbol) {
+        Some(s) if s.max_leverage > 0 => leverage.min(s.max_leverage),
+        _ => leverage,
+    }
+}
+
+/// Average price for sweeping `units` (positive buys) through a book whose log price moves
+/// `units / depth`. Prices depend only on cumulative flow, so a split order costs the same.
+pub fn sweep(mid: f64, units: f64, depth: f64) -> f64 {
+    let d = units / depth;
+    if d.abs() < 1e-12 {
+        mid
+    } else {
+        mid * d.exp_m1() / d
+    }
+}
+
+/// Move a book symbol's local mid by a fill, so later checks in the same operation see it.
+pub fn apply_fill(prices: &mut Prices, trade: &Trade) -> Result<()> {
+    let depth = depth(&trade.symbol);
+    if depth <= 0.0 {
+        return Ok(());
+    }
+    let buy = matches!(
+        (trade.kind.as_str(), trade.side.as_str()),
+        ("open", "long") | ("close" | "stopout", "short")
+    );
+    let units = trade.lots * contract(&trade.symbol) * if buy { 1.0 } else { -1.0 };
+    let mid = market_price(prices, &trade.symbol)?;
+    prices
+        .mid
+        .insert(trade.symbol.clone(), finite(mid * (units / depth).exp())?);
+    Ok(())
+}
+
+/// Fill price for trading `lots` of a book symbol, including its spread.
+fn book_price(prices: &Prices, symbol: &str, lots: f64, buy: bool) -> Result<f64> {
+    let mid = market_price(prices, symbol)?;
+    let units = lots * contract(symbol) * if buy { 1.0 } else { -1.0 };
+    let half = spread(symbol, mid) / 2.0;
+    let px = sweep(mid, units, depth(symbol)) + if buy { half } else { -half };
+    if !px.is_finite() || px <= 0.0 {
+        return Err("成交价无效".into());
+    }
+    Ok(px)
+}
+
 pub fn lots_valid(symbol: &str, lots: f64) -> bool {
     let (min, whole) = symbols::spec(symbol).map_or((0.01, false), |s| (s.min_lots, s.whole_lots));
     lots.is_finite() && lots >= min && lots <= MAX_LOTS && (!whole || lots.fract() == 0.0)
@@ -166,9 +220,17 @@ impl Position {
         };
         finite(diff * self.lots * contract(&self.symbol) * usd_rate(prices, &self.symbol)?)
     }
+    /// Price this position would close at now; book symbols are marked at liquidation value.
+    pub fn exit_price(&self, prices: &Prices) -> Result<f64> {
+        if depth(&self.symbol) > 0.0 {
+            book_price(prices, &self.symbol, self.lots, self.side == "short")
+        } else {
+            execution_price(prices, &self.symbol, self.side == "short")
+        }
+    }
     pub fn pnl(&self, prices: &Prices) -> Result<f64> {
-        let quote = if prices.bid_ask.contains_key(&self.symbol) {
-            execution_price(prices, &self.symbol, self.side == "short")?
+        let quote = if depth(&self.symbol) > 0.0 || prices.bid_ask.contains_key(&self.symbol) {
+            self.exit_price(prices)?
         } else {
             market_price(prices, &self.symbol)?
         };
@@ -180,7 +242,7 @@ impl Position {
                 * contract(&self.symbol)
                 * market_price(prices, &self.symbol)?
                 * usd_rate(prices, &self.symbol)?
-                / leverage as f64,
+                / leverage_for(&self.symbol, leverage) as f64,
         )
     }
 }
@@ -401,9 +463,28 @@ impl Account {
             });
         }
         self.validate()?;
-        let px = execution_price(prices, symbol, side == "long")?;
+        let cap = symbols::spec(symbol).map_or(0.0, |s| s.max_open_lots);
+        if cap > 0.0 {
+            let held: f64 = self
+                .positions
+                .iter()
+                .filter(|p| p.symbol == symbol)
+                .map(|p| p.lots)
+                .sum();
+            if held + lots > cap {
+                return Err(format!(
+                    "{symbol} 单账户持仓上限 {cap} 手，当前已持 {held} 手"
+                ));
+            }
+        }
+        let px = if depth(symbol) > 0.0 {
+            book_price(prices, symbol, lots, side == "long")?
+        } else {
+            execution_price(prices, symbol, side == "long")?
+        };
         let need = finite(
-            lots * contract(symbol) * px * usd_rate(prices, symbol)? / self.leverage as f64,
+            lots * contract(symbol) * px * usd_rate(prices, symbol)?
+                / leverage_for(symbol, self.leverage) as f64,
         )?;
         let free = self.equity(prices)? - self.used_margin(prices)?;
         if need > free {
@@ -417,6 +498,21 @@ impl Account {
             symbol: symbol.into(),
         };
         let trade = self.trade("open", &p, px, None, None, now);
+        if depth(symbol) > 0.0 {
+            // Book positions are marked at what unwinding them would fetch; the order must
+            // leave margin free after its own round-trip impact, not just its entry margin.
+            let mut next = self.clone();
+            next.positions.push(p.clone());
+            let mut after = prices.clone();
+            apply_fill(&mut after, &trade)?;
+            let free = next.equity(&after)? - next.used_margin(&after)?;
+            if free < 0.0 {
+                return Err(format!(
+                    "保证金不足（含 {symbol} 冲击成本）: 缺 ${:.2}（USD），请减小手数",
+                    -free
+                ));
+            }
+        }
         self.positions.push(p);
         self.next_id = self.next_id.max(id + 1);
         Ok(trade)
@@ -448,17 +544,19 @@ impl Account {
     fn settle(
         &mut self,
         index: usize,
-        prices: &Prices,
+        prices: &mut Prices,
         kind: &str,
         ml: Option<f64>,
         now: i64,
     ) -> Result<Trade> {
         let p = &self.positions[index];
-        let px = execution_price(prices, &p.symbol, p.side == "short")?;
+        let px = p.exit_price(prices)?;
         let pnl = p.pnl_at(px, prices)?;
         self.balance = finite(self.balance + pnl)?;
         let p = self.positions.remove(index);
-        Ok(self.trade(kind, &p, px, Some(pnl), ml, now))
+        let trade = self.trade(kind, &p, px, Some(pnl), ml, now);
+        apply_fill(prices, &trade)?;
+        Ok(trade)
     }
     pub fn close(&mut self, id: Option<u64>, prices: &Prices, now: i64) -> Result<Vec<Trade>> {
         if self.positions.is_empty() {
@@ -475,16 +573,19 @@ impl Account {
         }
         // Work on a clone: unavailable conversion/overflow cannot partly close a basket.
         let mut next = self.clone();
+        let mut prices = prices.clone();
         let mut trades = Vec::new();
         for id in targets {
             let index = next.positions.iter().position(|p| p.id == id).unwrap();
-            trades.push(next.settle(index, prices, "close", None, now)?);
+            trades.push(next.settle(index, &mut prices, "close", None, now)?);
         }
         *self = next;
         Ok(trades)
     }
     pub fn check_stopout(&mut self, prices: &Prices, now: i64) -> Result<Vec<Trade>> {
         let mut next = self.clone();
+        let mut prices = prices.clone();
+        let prices = &mut prices;
         let mut trades = Vec::new();
         while !next.positions.is_empty() {
             let ml = next.margin_level(prices)?;
@@ -680,10 +781,112 @@ mod tests {
         assert_eq!(conversion("NSTAR").unwrap(), None);
         a.open("long", 0.1, "NSTAR", &q, 1, 0).unwrap();
         let p = &a.positions[0];
-        near(p.entry, 100.025);
-        near(p.margin(&q, a.leverage).unwrap(), 0.001);
+        // 0.001 NSTAR barely touches the book: spread dominates.
+        assert!((p.entry - 100.025).abs() < 1e-5, "{}", p.entry);
+        // Account is 1:100 but NSTAR is capped at 1:20.
+        assert!((p.margin(&q, a.leverage).unwrap() - 0.005).abs() < 1e-9);
         let up = quotes(&[("NSTAR", 101.0)]);
-        near(p.pnl_at(101.0, &up).unwrap(), 0.000975);
+        assert!((p.pnl_at(101.0, &up).unwrap() - 0.000975).abs() < 1e-5);
+    }
+    #[test]
+    fn nstar_round_trip_pays_impact_twice_and_cannot_pump_for_profit() {
+        // The old model let $1k of margin pump 100k lots and walk away with millions.
+        let q = quotes(&[("NSTAR", 100.0)]);
+        for lots in [1_000.0, 10_000.0, MAX_LOTS] {
+            let mut a = Account {
+                balance: 1e9,
+                ..Account::default()
+            };
+            let open = a.open("long", lots, "NSTAR", &q, 1, 0).unwrap();
+            let mut after = q.clone();
+            apply_fill(&mut after, &open).unwrap();
+            assert!(after["NSTAR"] > 100.0, "buy lifts the book");
+            let close = a.close(None, &after, 1).unwrap();
+            let pnl = close[0].pnl.unwrap();
+            assert!(pnl < 0.0, "{lots} lots round trip made {pnl}");
+            apply_fill(&mut after, &close[0]).unwrap();
+            assert!(
+                (after["NSTAR"] - 100.0).abs() < 1e-6,
+                "book returns to start"
+            );
+        }
+    }
+    #[test]
+    fn nstar_split_orders_cost_the_same_as_one_sweep() {
+        let q = quotes(&[("NSTAR", 100.0)]);
+        let mut one = Account::default();
+        let big = one.open("long", 2_000.0, "NSTAR", &q, 1, 0).unwrap();
+        let mut many = Account::default();
+        let mut live = q.clone();
+        let mut cost = 0.0;
+        for i in 0..20 {
+            let t = many.open("long", 100.0, "NSTAR", &live, i + 1, 0).unwrap();
+            apply_fill(&mut live, &t).unwrap();
+            cost += t.price * 100.0;
+        }
+        // Spread is charged per order on each slice's own price, so only that differs.
+        let rel = (cost / 2_000.0 - big.price) / big.price;
+        assert!(
+            rel.abs() < 1e-3,
+            "split {} vs sweep {}",
+            cost / 2_000.0,
+            big.price
+        );
+    }
+    #[test]
+    fn nstar_is_marked_at_liquidation_value_and_caps_size() {
+        let q = quotes(&[("NSTAR", 100.0)]);
+        let mut a = Account {
+            balance: 1e9,
+            leverage: MAX_LEVERAGE,
+            ..Account::default()
+        };
+        a.open("long", MAX_LOTS, "NSTAR", &q, 1, 0).unwrap();
+        // Unwinding 1,000 NSTAR into a 20,000 book costs ~2.5%: the mark says so.
+        let pnl = a.positions[0].pnl(&q).unwrap();
+        assert!(pnl < -2_000.0, "{pnl}");
+        // Account leverage 1:50000 still margins NSTAR at 1:20.
+        let margin = a.positions[0].margin(&q, a.leverage).unwrap();
+        assert!((margin - MAX_LOTS * 0.01 * 100.0 / 20.0).abs() < 1e-6);
+        for id in 2..=5 {
+            a.open("long", MAX_LOTS, "NSTAR", &q, id, 0).unwrap();
+        }
+        // Gross cap: 5,000 NSTAR per account, longs and shorts alike.
+        assert!(a.open("short", 0.01, "NSTAR", &q, 6, 0).is_err());
+    }
+    #[test]
+    fn nstar_order_must_survive_its_own_impact() {
+        let q = quotes(&[("NSTAR", 100.0)]);
+        let mut a = Account::default();
+        // $10k at 1:20 nominally covers $200k (2,000 NSTAR), but the ~10% round-trip
+        // impact of that size would wipe the account, so the second half is refused.
+        a.open("long", 100_000.0, "NSTAR", &q, 1, 0).unwrap();
+        let mut live = q.clone();
+        apply_fill(
+            &mut live,
+            &a.trade("open", &a.positions[0], 0.0, None, None, 0),
+        )
+        .unwrap();
+        assert!(a.open("long", 100_000.0, "NSTAR", &live, 2, 0).is_err());
+        assert_eq!(a.positions.len(), 1);
+    }
+    #[test]
+    fn nstar_cascade_stopout_pays_its_own_impact() {
+        let q = quotes(&[("NSTAR", 100.0)]);
+        let mut a = Account {
+            balance: 2_000.0,
+            ..Account::default()
+        };
+        let mut live = q.clone();
+        for id in 1..=3 {
+            let t = a.open("long", 10_000.0, "NSTAR", &live, id, 0).unwrap();
+            apply_fill(&mut live, &t).unwrap();
+        }
+        let crash = quotes(&[("NSTAR", 85.0)]);
+        let trades = a.check_stopout(&crash, 1).unwrap();
+        assert_eq!(trades.len(), 3);
+        // Each forced sale fills lower than the one before.
+        assert!(trades[0].price > trades[1].price && trades[1].price > trades[2].price);
     }
     #[test]
     fn invalid_numbers_and_directions_do_not_mutate() {

@@ -4,7 +4,7 @@
 mod tests;
 use crate::{
     symbols,
-    trading::{Account, Trade},
+    trading::{self, Account, Trade},
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -15,7 +15,7 @@ use sqlx::{
 use std::{
     collections::BTreeMap,
     path::Path,
-    sync::atomic::{AtomicI64, AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 use subtle::ConstantTimeEq;
@@ -62,7 +62,8 @@ pub struct Store {
     // ponytail: one process-wide mutation lock; per-account locks if throughput requires it.
     gate: Mutex<()>,
     next_id: AtomicU64,
-    nstar_flow: AtomicI64,
+    /// NSTAR units (player, forced) settled but not yet applied to the book.
+    nstar_flow: std::sync::Mutex<(f64, f64)>,
     login_aliases: Mutex<BTreeMap<String, String>>,
 }
 
@@ -128,7 +129,7 @@ impl Store {
             pool,
             gate: Mutex::new(()),
             next_id: AtomicU64::new(next_id),
-            nstar_flow: AtomicI64::new(0),
+            nstar_flow: std::sync::Mutex::new((0.0, 0.0)),
             login_aliases: Mutex::new(BTreeMap::new()),
         })
     }
@@ -220,6 +221,7 @@ impl Store {
         let mut tx = self.pool.begin().await?;
         let mut user = load_user(&mut tx, name).await?;
         let id = self.next_id.load(Ordering::SeqCst);
+        let held = nstar_units(&user.account);
         let trades = operation(&mut user.account, &mut user.symbol, id)?;
         let opened = trades.iter().any(|t| t.kind == "open");
         user.account.validate()?;
@@ -237,21 +239,29 @@ impl Store {
             require_tradable(&mut tx, &user.symbol).await?;
         }
         persist(&mut tx, &user).await?;
-        let flow: i64 = trades
+        // Net change in held NSTAR is exactly the flow, including stopouts and resets that
+        // abandon positions. Only voluntary orders count as player flow.
+        let total = nstar_units(&user.account) - held;
+        let player: f64 = trades
             .iter()
-            .filter(|t| t.symbol == symbols::NSTAR && (t.kind == "open" || t.kind == "close"))
-            .map(|t| match (t.kind.as_str(), t.side.as_str()) {
-                ("open", "long") | ("close", "short") => (t.lots * 1000.0).round() as i64,
-                ("open", "short") | ("close", "long") => -((t.lots * 1000.0).round() as i64),
-                _ => 0,
+            .filter(|t| t.symbol == symbols::NSTAR)
+            .map(|t| {
+                let units = t.lots * trading::contract(symbols::NSTAR);
+                match (t.kind.as_str(), t.side.as_str()) {
+                    ("open", "long") | ("close", "short") => units,
+                    ("open", "short") | ("close", "long") => -units,
+                    _ => 0.0,
+                }
             })
             .sum();
         for trade in trades {
             insert_trade(&mut tx, name, &trade).await?;
         }
         tx.commit().await?;
-        if flow != 0 {
-            self.nstar_flow.fetch_add(flow, Ordering::SeqCst);
+        if total != 0.0 {
+            let mut flow = self.nstar_flow.lock().unwrap();
+            flow.0 += player;
+            flow.1 += total - player;
         }
         if opened {
             self.next_id
@@ -259,8 +269,8 @@ impl Store {
         }
         Ok(())
     }
-    pub fn take_nstar_flow(&self) -> i64 {
-        self.nstar_flow.swap(0, Ordering::SeqCst)
+    pub fn take_nstar_flow(&self) -> (f64, f64) {
+        std::mem::take(&mut *self.nstar_flow.lock().unwrap())
     }
     pub async fn select_symbol(&self, name: &str, symbol: &str) -> Result<()> {
         let _guard = self.gate.lock().await;
@@ -414,6 +424,8 @@ impl Store {
                 .await?;
         }
         tx.commit().await?;
+        // A deleted account's NSTAR book is unwound into the market like a stopout.
+        self.nstar_flow.lock().unwrap().1 -= nstar_units(&user.account);
         self.login_aliases
             .lock()
             .await
@@ -537,6 +549,18 @@ impl Store {
     }
 }
 
+/// Signed NSTAR units held (long positive).
+fn nstar_units(account: &Account) -> f64 {
+    account
+        .positions
+        .iter()
+        .filter(|p| p.symbol == symbols::NSTAR)
+        .map(|p| {
+            let units = p.lots * trading::contract(symbols::NSTAR);
+            if p.side == "long" { units } else { -units }
+        })
+        .sum()
+}
 async fn load_user(conn: &mut SqliteConnection, name: &str) -> Result<User> {
     let row = sqlx::query("SELECT symbol,account FROM users WHERE name=?")
         .bind(name)

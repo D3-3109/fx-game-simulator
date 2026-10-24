@@ -35,6 +35,12 @@ pub struct Spec {
     pub pct: f64,
     /// Settlement pair for the account currency; None means USD.
     pub settle: Option<&'static str>,
+    /// Effective leverage ceiling for this symbol; 0 means the account leverage applies.
+    pub max_leverage: u64,
+    /// Gross open lots one account may hold in this symbol; 0 means only the per-order cap.
+    pub max_open_lots: f64,
+    /// Units that move the price by one log unit (e≈2.72x); 0 means no simulated order book.
+    pub depth: f64,
 }
 const TIGHT: f64 = 0.0002;
 const WIDE: f64 = 0.02;
@@ -47,6 +53,9 @@ const fn lot(symbol: &'static str, spread: f64, settle: Option<&'static str>) ->
         spread,
         pct: 0.0,
         settle,
+        max_leverage: 0,
+        max_open_lots: 0.0,
+        depth: 0.0,
     }
 }
 const fn coin(symbol: &'static str) -> Spec {
@@ -58,6 +67,9 @@ const fn coin(symbol: &'static str) -> Spec {
         spread: 0.0,
         pct: 0.0005,
         settle: None,
+        max_leverage: 0,
+        max_open_lots: 0.0,
+        depth: 0.0,
     }
 }
 const fn stock(symbol: &'static str) -> Spec {
@@ -69,12 +81,20 @@ const fn stock(symbol: &'static str) -> Spec {
         spread: 0.0,
         pct: 0.0005,
         settle: None,
+        max_leverage: 0,
+        max_open_lots: 0.0,
+        depth: 0.0,
     }
 }
 const SPECS: &[Spec] = &[
     lot(SIM, TIGHT, None),
+    // 1 lot = 0.01 NSTAR. ~200 NSTAR (~$20k) moves the price ~1%; one account tops out
+    // at 5,000 NSTAR gross (~28% impact), and its fills pay for every step of that move.
     Spec {
         contract: 0.01,
+        max_leverage: 20,
+        max_open_lots: 500_000.0,
+        depth: 20_000.0,
         ..coin(NSTAR)
     },
     lot("BTCUSDT", TIGHT, None),

@@ -138,7 +138,7 @@ impl Market {
         let result = if symbol == symbols::SIM {
             Ok(Quote::single(self.sim.lock().await.price, start))
         } else if symbol == symbols::NSTAR {
-            Ok(Quote::single(self.nstar.lock().await.price, start))
+            Ok(self.nstar.lock().await.quote())
         } else if symbols::FX.contains(&symbol) {
             self.biquote_quote(symbol).await
         } else if symbols::STOCK.contains(&symbol) {
@@ -464,16 +464,20 @@ impl Market {
         Ok(packet)
     }
     pub async fn tick_sim(&self) -> Result<Value> {
-        self.tick_feed(&self.sim).await
+        Ok(self.tick_feed(&self.sim).await?.0)
     }
-    pub async fn tick_nstar(&self) -> Result<Value> {
-        let flow = self.store.take_nstar_flow();
-        self.nstar.lock().await.push += flow as f64 / 1000.0;
+    /// One NSTAR tick: the packet, plus market events (rumors, news, halts, whales) for everyone.
+    pub async fn tick_nstar(&self) -> Result<(Value, Vec<Value>)> {
         self.tick_feed(&self.nstar).await
     }
-    async fn tick_feed(&self, feed: &Mutex<SimFeed>) -> Result<Value> {
+    async fn tick_feed(&self, feed: &Mutex<SimFeed>) -> Result<(Value, Vec<Value>)> {
         let mut sim = feed.lock().await;
         let mut next = sim.clone();
+        if next.symbol == symbols::NSTAR {
+            // Liquidations and resets settled outside the desk land on the next tick.
+            let (player, forced) = self.store.take_nstar_flow();
+            next.flow(player, forced);
+        }
         let price = next.next_price();
         let symbol = next.symbol;
         let now = now_ms();
@@ -482,11 +486,57 @@ impl Market {
             .save_bars(symbol, &next.pending())
             .await
             .map_err(|_| "模拟行情保存失败")?;
+        let events = std::mem::take(&mut next.book.events);
         let packet = next.packet();
+        let quote = next.quote();
         *sim = next;
         drop(sim);
-        self.on_quote(symbol, price, now).await?;
-        Ok(packet)
+        self.on_market_quote(symbol, quote).await?;
+        Ok((packet, events))
+    }
+    /// Lock the NSTAR book for one account operation. Orders are priced and applied one at a
+    /// time, so splitting an order across requests cannot reuse a mid it already moved.
+    pub async fn nstar_desk(&self) -> NstarDesk<'_> {
+        NstarDesk {
+            market: self,
+            feed: self.nstar.lock().await,
+        }
+    }
+}
+
+pub struct NstarDesk<'a> {
+    market: &'a Market,
+    feed: tokio::sync::MutexGuard<'a, SimFeed>,
+}
+impl NstarDesk<'_> {
+    /// Price NSTAR from the live book; refuses while the circuit breaker holds trading.
+    pub fn price(&self, prices: &mut Prices) -> Result<()> {
+        let mid = self.feed.live_mid().ok_or("NSTAR 熔断中，暂停交易")?;
+        prices.insert(symbols::NSTAR.into(), mid);
+        Ok(())
+    }
+    /// Move the book by the committed flow and publish the new price before unlocking.
+    pub async fn commit(self) -> Result<(Value, Vec<Value>)> {
+        let Self { market, mut feed } = self;
+        let (player, forced) = market.store.take_nstar_flow();
+        feed.flow(player, forced);
+        let price = feed.book.published();
+        feed.record(price, now_ms());
+        if market
+            .store
+            .save_bars(feed.symbol, &feed.pending())
+            .await
+            .is_err()
+        {
+            // The book already moved in memory; the next tick persists the candle.
+            eprintln!("[nstar] order candle persistence failed; will retry on tick");
+        }
+        let events = std::mem::take(&mut feed.book.events);
+        let packet = feed.packet();
+        let quote = feed.quote();
+        drop(feed);
+        market.on_market_quote(symbols::NSTAR, quote).await?;
+        Ok((packet, events))
     }
 }
 
@@ -602,8 +652,9 @@ struct SimFeed {
     symbol: &'static str,
     base: f64,
     price: f64,
-    push: f64,
     trend: f64,
+    /// Order-book state; only used when the symbol has depth (NSTAR).
+    book: Book,
     kind: usize,
     left: u32,
     updated_at: i64,
@@ -615,8 +666,8 @@ impl SimFeed {
             symbol,
             base,
             price: base,
-            push: 0.0,
             trend: 0.0,
+            book: Book::new(base, base),
             kind: 0,
             left: 0,
             updated_at: now,
@@ -645,6 +696,7 @@ impl SimFeed {
             }
         }
         sim.price = sim.bars[&60].back().unwrap()[4];
+        sim.book = Book::new(base, sim.price);
         for (sec, bars) in &mut sim.bars {
             if !loaded.contains(sec) {
                 let t = ((now / 1000) / sec * sec) as f64;
@@ -692,9 +744,14 @@ impl SimFeed {
             .map(|b| [b[0] * 1000.0, b[1], b[2], b[3], b[4]])
             .collect()
     }
+    fn quote(&self) -> Quote {
+        Quote {
+            open: self.book.halt == 0,
+            ..Quote::single(self.price, self.updated_at)
+        }
+    }
     fn packet(&self) -> Value {
-        let mut packet =
-            Quote::single(self.price, self.updated_at).packet(self.symbol, self.updated_at);
+        let mut packet = self.quote().packet(self.symbol, self.updated_at);
         packet["time"] = json!(self.updated_at);
         packet["klines"] = json!(
             symbols::INTERVALS
@@ -704,8 +761,7 @@ impl SimFeed {
         );
         packet
     }
-    fn next_price(&mut self) -> f64 {
-        let mut rng = rand::rng();
+    fn regime(&mut self, rng: &mut impl Rng) {
         if self.left == 0 {
             let r = rng.random::<f64>() * 10.0;
             let mut sum = 0.0;
@@ -719,6 +775,13 @@ impl SimFeed {
             self.left = [20, 6, 40, 15, 15][self.kind];
         }
         self.left -= 1;
+    }
+    fn next_price(&mut self) -> f64 {
+        if trading::depth(self.symbol) > 0.0 {
+            return self.next_book_price();
+        }
+        let mut rng = rand::rng();
+        self.regime(&mut rng);
         self.trend *= 0.95;
         let mut shock: f64 = StandardNormal.sample(&mut rng);
         shock *= 0.0004;
@@ -736,12 +799,214 @@ impl SimFeed {
             _ => {}
         }
         let scale = self.base / 1.1;
-        let impulse = self.push * 0.0002 * self.base;
-        self.push *= 0.9;
-        ((self.price + 0.003 * (self.base - self.price) + (shock + self.trend) * scale + impulse)
+        ((self.price + 0.003 * (self.base - self.price) + (shock + self.trend) * scale)
             .max(0.5 * scale)
             * 1e5)
             .round()
             / 1e5
+    }
+    /// Log-price walk around a drifting fair value, with news shocks and a circuit breaker.
+    /// While halted the book keeps moving unpublished, so trading resumes with a gap.
+    fn next_book_price(&mut self) -> f64 {
+        let mut rng = rand::rng();
+        self.regime(&mut rng);
+        self.trend *= 0.95;
+        let mut shock: f64 = StandardNormal.sample(&mut rng);
+        shock *= TICK_VOL;
+        match self.kind {
+            1 => shock *= 6.0,
+            2 => self.trend += if rng.random::<bool>() { 0.3 } else { -0.3 } * TICK_VOL,
+            3 => shock -= 1.5 * TICK_VOL,
+            4 => shock += 1.5 * TICK_VOL,
+            _ => {}
+        }
+        let drift: f64 = StandardNormal.sample(&mut rng);
+        let book = &mut self.book;
+        book.fair += FAIR_REVERT * (book.base - book.fair) + drift * FAIR_VOL;
+        book.news(&mut rng);
+        book.log += REVERT * (book.fair - book.log) + shock + self.trend;
+        book.clamp();
+        if book.breaker(self.price) {
+            self.price
+        } else {
+            book.published()
+        }
+    }
+    /// Apply player and liquidation flow (signed units) to the book right away.
+    fn flow(&mut self, units: f64, forced: f64) {
+        let depth = trading::depth(self.symbol);
+        if depth > 0.0 {
+            self.book.flow(units, depth, false);
+            self.book.flow(forced, depth, true);
+        }
+    }
+    /// Unrounded mid the next fill is priced from; None while the breaker holds trading.
+    fn live_mid(&self) -> Option<f64> {
+        (self.book.halt == 0).then(|| self.book.log.exp())
+    }
+}
+
+const TICK_VOL: f64 = 0.0003;
+const FAIR_VOL: f64 = 0.00012;
+/// Fair value drifts back toward base with a ~1 h half-life.
+const FAIR_REVERT: f64 = 4e-5;
+/// Fair value stays within base/4 ..= base*4 (25..=400 for NSTAR).
+const FAIR_BAND: f64 = 2.0 * std::f64::consts::LN_2;
+/// Pull of price toward fair value per tick: a displacement halves in ~46 s.
+const REVERT: f64 = 0.003;
+/// Price stays within fair/2 ..= fair*2 whatever the flow.
+const STRETCH: f64 = std::f64::consts::LN_2;
+/// Share of flow impact that becomes fair value instead of reverting.
+const CONVICTION: f64 = 0.2;
+const BREAKER_WINDOW: usize = 300;
+/// ln(1.10): a 10% move from any print in the last minute halts trading.
+const BREAKER_MOVE: f64 = 0.0953;
+const HALT_TICKS: u32 = 75;
+const RUMOR_LEAD: u32 = 25;
+const RUMOR_ACCURACY: f64 = 0.65;
+const NEWS_MIN_GAP: u32 = 1500;
+/// Flow that moves price by 2.5% or more is announced.
+const BIG_FLOW: f64 = 0.025;
+
+#[derive(Clone)]
+struct Book {
+    /// True log price; while halted it keeps moving but is not published.
+    log: f64,
+    fair: f64,
+    base: f64,
+    halt: u32,
+    window: VecDeque<f64>,
+    news_in: u32,
+    pending: Option<f64>,
+    events: Vec<Value>,
+}
+impl Book {
+    fn new(base: f64, price: f64) -> Self {
+        let lb = base.ln();
+        let log = price.ln();
+        let mut book = Self {
+            log,
+            fair: log,
+            base: lb,
+            halt: 0,
+            window: VecDeque::from([log]),
+            news_in: NEWS_MIN_GAP,
+            pending: None,
+            events: Vec::new(),
+        };
+        book.clamp();
+        book
+    }
+    fn clamp(&mut self) {
+        self.fair = self
+            .fair
+            .clamp(self.base - FAIR_BAND, self.base + FAIR_BAND);
+        self.log = self.log.clamp(self.fair - STRETCH, self.fair + STRETCH);
+    }
+    fn published(&self) -> f64 {
+        (self.log.exp() * 1e5).round() / 1e5
+    }
+    fn event(&mut self, kind: &str, text: String) {
+        self.events
+            .push(json!({"type":"nstar","kind":kind,"text":text,"time":now_ms()}));
+    }
+    /// A rumor, right 65% of the time, precedes each news shock by five seconds.
+    fn news(&mut self, rng: &mut impl Rng) {
+        const GOOD: &[&str] = &[
+            "传闻：北极星基金会即将公布重大合作",
+            "传闻：头部交易所准备上线 NSTAR 永续合约",
+            "传闻：神秘巨鲸正在场外吸筹",
+        ];
+        const BAD: &[&str] = &[
+            "传闻：北极星核心钱包疑似异动",
+            "传闻：监管机构点名调查 NSTAR 项目方",
+            "传闻：早期投资人解锁筹码准备出货",
+        ];
+        self.news_in = self.news_in.saturating_sub(1);
+        if self.news_in == RUMOR_LEAD {
+            let up = rng.random::<bool>();
+            let size = rng.random_range(0.02..0.07);
+            self.pending = Some(if up { size } else { -size });
+            let hint = if rng.random::<f64>() < RUMOR_ACCURACY {
+                up
+            } else {
+                !up
+            };
+            let pool = if hint { GOOD } else { BAD };
+            let text = pool[rng.random_range(0..pool.len())];
+            self.event("rumor", format!("{text}（5 秒后见分晓，消息未经证实）"));
+        }
+        if self.news_in == 0 {
+            if let Some(jump) = self.pending.take() {
+                self.fair += jump;
+                self.log += jump * 0.5;
+                let pct = jump.exp_m1() * 100.0;
+                let text = if jump > 0.0 {
+                    format!("利好落地：NSTAR 公允价值 {pct:+.1}%")
+                } else {
+                    format!("利空坐实：NSTAR 公允价值 {pct:+.1}%")
+                };
+                self.event("news", text);
+            }
+            let mean = NEWS_MIN_GAP as f64;
+            let gap: f64 = rand_distr::Exp::new(1.0 / mean).unwrap().sample(rng);
+            self.news_in = NEWS_MIN_GAP + gap.min(mean * 6.0) as u32;
+        }
+    }
+    /// True while halted. Trips when price moves 10% from any print in the last minute.
+    fn breaker(&mut self, last: f64) -> bool {
+        if self.halt > 0 {
+            self.halt -= 1;
+            if self.halt > 0 {
+                return true;
+            }
+            self.window = VecDeque::from([self.log]);
+            let gap = (self.log.exp() / last - 1.0) * 100.0;
+            self.event("resume", format!("NSTAR 恢复交易，跳空 {gap:+.1}%"));
+            return false;
+        }
+        self.window.push_back(self.log);
+        if self.window.len() > BREAKER_WINDOW {
+            self.window.pop_front();
+        }
+        let (lo, hi) = self
+            .window
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(lo, hi), x| (lo.min(*x), hi.max(*x)));
+        let from = if self.log - lo > BREAKER_MOVE {
+            lo
+        } else if hi - self.log > BREAKER_MOVE {
+            hi
+        } else {
+            return false;
+        };
+        self.halt = HALT_TICKS;
+        let pct = (self.log - from).exp_m1() * 100.0;
+        self.event(
+            "halt",
+            format!("NSTAR 一分钟内波动 {pct:+.1}%，触发熔断，暂停交易 15 秒"),
+        );
+        true
+    }
+    /// Signed units bought (+) or sold (-) move the book immediately.
+    fn flow(&mut self, units: f64, depth: f64, forced: bool) {
+        if units == 0.0 {
+            return;
+        }
+        let d = units / depth;
+        self.log += d;
+        self.fair += CONVICTION * d;
+        self.clamp();
+        if d.abs() >= BIG_FLOW {
+            let side = if units > 0.0 { "买入" } else { "卖出" };
+            let pct = d.exp_m1() * 100.0;
+            let size = units.abs();
+            let text = if forced {
+                format!("强平潮：{size:.0} NSTAR 被强制{side}，价格 {pct:+.1}%")
+            } else {
+                format!("巨鲸出没：有人一口气{side} {size:.0} NSTAR，价格 {pct:+.1}%")
+            };
+            self.event("whale", text);
+        }
     }
 }

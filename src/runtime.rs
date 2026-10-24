@@ -79,7 +79,10 @@ pub fn start(app: Arc<App>) -> JoinSet<()> {
         tasks.spawn(async move {
             loop {
                 match a.market.tick_nstar().await {
-                    Ok(packet) => a.broadcast(packet),
+                    Ok((packet, events)) => {
+                        a.broadcast(packet);
+                        events.into_iter().for_each(|e| a.broadcast(e));
+                    }
                     Err(_) => eprintln!("[nstar] tick persistence/settlement failed; will retry"),
                 }
                 sleep(Duration::from_millis(200)).await;

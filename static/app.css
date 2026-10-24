@@ -39,6 +39,11 @@ button:active:not(:disabled){transform:translateY(1px)}
 .account-meta strong{font-weight:500;color:var(--text)}.account-meta .green{color:var(--green)}.account-meta .red{color:var(--red)}
 #msg{position:absolute;top:12px;left:50%;transform:translateX(-50%);z-index:6;width:max-content;max-width:calc(100% - 32px);margin:0;padding:8px 12px;background:#302a20;color:#f4cc84;border:1px solid #55482e;border-radius:6px;overflow-wrap:anywhere;font-size:12px;pointer-events:none}
 #msg:empty{display:none}
+#nstar-feed{position:absolute;left:12px;bottom:34px;z-index:5;margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:4px;max-width:min(420px,calc(100% - 90px));pointer-events:none}#nstar-feed:empty{display:none}
+#nstar-feed li{font-size:11px;line-height:1.45;padding:5px 9px;border-radius:5px;background:#161c26e6;border:1px solid var(--line);color:var(--text);overflow-wrap:anywhere;animation:feed-in .18s ease-out}
+#nstar-feed li[data-kind='rumor']{color:#f0c57c;border-color:#55482e}#nstar-feed li[data-kind='halt']{color:var(--red);border-color:#6a3940;font-weight:600}
+#nstar-feed li[data-kind='news']{border-color:#3d5170}#nstar-feed li[data-kind='whale']{color:var(--accent)}#nstar-feed time{color:var(--muted);margin-right:6px}
+@keyframes feed-in{from{opacity:0;transform:translateY(4px)}}@media(prefers-reduced-motion:reduce){#nstar-feed li{animation:none}}
 #workspace{flex:1;min-height:0;display:grid;grid-template-rows:minmax(120px,.68fr) 10px minmax(170px,.32fr)}
 #lowerpanels{min-height:0;display:grid;grid-template-rows:minmax(80px,.6fr) 10px minmax(80px,.4fr)}
 #chartpane{display:flex;flex-direction:column;min-height:0;overflow:hidden;position:relative}

@@ -304,55 +304,99 @@ fn combined_upstream_subscription_is_shared_sorted_and_filters_fx() {
     );
 }
 
+fn nstar_run(sim: &mut SimFeed, t: i64, from: i64, to: i64) {
+    for step in from..to {
+        let price = sim.next_price();
+        sim.record(price, t + step * 200);
+    }
+}
+
 #[test]
-fn nstar_player_push_moves_price_then_fades_back() {
+fn nstar_flow_moves_price_by_depth_then_mostly_reverts() {
     let t = 1800000000000;
     let mut sim = SimFeed::new("NSTAR", 100.0, t);
-    let start = sim.price;
-    sim.push = 50.0;
-    let mut peak = start;
-    for step in 1..=5 {
-        let price = sim.next_price();
-        sim.record(price, t + step * 200);
-        peak = peak.max(price);
+    // 1,000 NSTAR (~$100k) is 5% of depth: about +5.1% immediately.
+    sim.flow(1000.0, 0.0);
+    let moved = sim.book.log.exp();
+    assert!((moved / 100.0 - 1.0 - 0.0513).abs() < 1e-3, "{moved}");
+    assert!(sim.book.events.iter().any(|e| e["kind"] == "whale"));
+    // Within ~5 minutes most of the push is gone; only conviction (20%) and noise remain.
+    let mut errs = Vec::new();
+    for _ in 0..40 {
+        let mut s = sim.clone();
+        nstar_run(&mut s, t, 1, 1500);
+        errs.push(s.book.log - s.book.fair);
     }
-    assert!(
-        peak > start + 0.5,
-        "push should lift price: start {start} peak {peak}"
-    );
-    sim.push = 0.0;
-    for step in 6..=205 {
-        let price = sim.next_price();
-        sim.record(price, t + step * 200);
+    let mean = errs.iter().sum::<f64>() / errs.len() as f64;
+    assert!(mean.abs() < 0.02, "price should rejoin fair value: {mean}");
+}
+
+#[test]
+fn nstar_price_is_bounded_by_fair_value_and_band() {
+    let t = 1800000000000;
+    let mut sim = SimFeed::new("NSTAR", 100.0, t);
+    for _ in 0..200 {
+        sim.flow(5000.0, 0.0);
     }
+    assert!(sim.book.fair <= (400.0f64).ln() + 1e-9);
+    assert!(sim.book.log <= sim.book.fair + std::f64::consts::LN_2 + 1e-9);
+    assert!(sim.book.log.exp() <= 800.0 + 1e-6);
+    for _ in 0..400 {
+        sim.flow(-5000.0, 0.0);
+    }
+    assert!(sim.book.log.exp() >= 12.5 - 1e-6);
+}
+
+#[test]
+fn nstar_breaker_halts_publishes_stale_price_then_resumes_with_gap() {
+    let t = 1800000000000;
+    let mut sim = SimFeed::new("NSTAR", 100.0, t);
+    nstar_run(&mut sim, t, 1, 10);
+    let before = sim.price;
+    sim.flow(4000.0, 0.0); // ~+22%: well past the 10% breaker
+    nstar_run(&mut sim, t, 10, 11);
+    assert_eq!(sim.price, before, "halt freezes the published price");
+    assert!(!sim.quote().open);
+    assert!(sim.live_mid().is_none());
+    assert!(sim.book.events.iter().any(|e| e["kind"] == "halt"));
+    nstar_run(&mut sim, t, 11, 11 + HALT_TICKS as i64);
+    assert!(sim.quote().open);
+    assert!(sim.book.events.iter().any(|e| e["kind"] == "resume"));
     assert!(
-        sim.push.abs() < 0.01,
-        "push should decay to near zero: {}",
-        sim.push
+        sim.price > before * 1.05,
+        "resume gaps toward the true price"
     );
 }
 
 #[test]
-fn nstar_player_flow_is_bounded_and_returns_to_base() {
+fn nstar_day_stays_in_a_sane_range_with_news_and_rumors() {
     let t = 1800000000000;
-    for _ in 0..20 {
-        let mut sim = SimFeed::new("NSTAR", 100.0, t);
-        let mut peak = 100.0f64;
-        for step in 1..=100 {
-            sim.push += 2.0;
-            let price = sim.next_price();
-            sim.record(price, t + step * 200);
-            peak = peak.max(price);
+    let mut sim = SimFeed::new("NSTAR", 100.0, t);
+    let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+    let mut kinds = std::collections::BTreeMap::<String, usize>::new();
+    // Two simulated hours.
+    for step in 1..36_000 {
+        let price = sim.next_price();
+        sim.record(price, t + step * 200);
+        lo = lo.min(price);
+        hi = hi.max(price);
+        for e in sim.book.events.drain(..) {
+            *kinds.entry(e["kind"].as_str().unwrap().into()).or_default() += 1;
         }
-        assert!(peak < 200.0, "burst must not run away: peak {peak}");
-        for step in 101..=3000 {
-            let price = sim.next_price();
-            sim.record(price, t + step * 200);
-        }
-        assert!(
-            (sim.price - 100.0).abs() < 10.0,
-            "should return near base: {}",
-            sim.price
-        );
     }
+    assert!(lo > 25.0 && hi < 400.0, "range {lo}..{hi}");
+    assert!(kinds.get("news").copied().unwrap_or(0) >= 3, "{kinds:?}");
+    assert_eq!(kinds.get("news"), kinds.get("rumor"), "{kinds:?}");
+}
+
+#[test]
+fn fxsim_keeps_its_original_walk() {
+    let t = 1800000000000;
+    let mut sim = SimFeed::new("FXSIM", 1.1, t);
+    for step in 1..3000 {
+        let price = sim.next_price();
+        sim.record(price, t + step * 200);
+    }
+    assert!(sim.price > 0.55 && sim.price < 2.0, "{}", sim.price);
+    assert!(sim.book.events.is_empty());
 }

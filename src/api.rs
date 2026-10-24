@@ -1,7 +1,8 @@
 use crate::{
     app::{App, Event},
+    market::NstarDesk,
     storage::{self, Error},
-    trading, web,
+    symbols, trading, web,
 };
 use axum::{
     Json, Router,
@@ -105,6 +106,25 @@ pub fn router(app: Arc<App>, static_dir: PathBuf) -> Router {
         .layer(DefaultBodyLimit::max(65536))
         .with_state(app)
         .merge(web::static_router(static_dir))
+}
+/// Hold the NSTAR book for orders touching it, so each fill is priced off the latest mid.
+async fn nstar_desk<'a>(app: &'a App, symbols: &[&str]) -> Option<NstarDesk<'a>> {
+    if symbols.contains(&symbols::NSTAR) {
+        Some(app.market.nstar_desk().await)
+    } else {
+        None
+    }
+}
+/// Apply committed NSTAR flow and publish the moved price and any whale/halt alerts.
+async fn commit(app: &App, desk: Option<NstarDesk<'_>>) {
+    let Some(desk) = desk else { return };
+    match desk.commit().await {
+        Ok((packet, events)) => {
+            app.broadcast(packet);
+            events.into_iter().for_each(|e| app.broadcast(e));
+        }
+        Err(_) => eprintln!("[nstar] order settlement broadcast failed; tick will retry"),
+    }
 }
 async fn api_get(State(app): State<Arc<App>>, uri: Uri, headers: HeaderMap) -> Response {
     response(get_inner(&app, &uri, &headers).await)
@@ -254,20 +274,30 @@ async fn post_inner(app: &App, path: &str, headers: &HeaderMap, body: &Value) ->
             let lots = number(body, "lots")?;
             let u = app.store.user(&name).await?;
             app.store.require_tradable(&u.symbol).await?;
-            let prices = app
+            let symbols: Vec<&str> = std::iter::once(u.symbol.as_str())
+                .chain(u.account.positions.iter().map(|p| p.symbol.as_str()))
+                .collect();
+            let mut prices = app
                 .market
-                .trading_prices(
-                    std::iter::once(u.symbol.as_str())
-                        .chain(u.account.positions.iter().map(|p| p.symbol.as_str())),
-                )
+                .trading_prices(symbols.iter().copied().filter(|s| *s != symbols::NSTAR))
                 .await?;
-            app.store
+            let desk = nstar_desk(app, &symbols).await;
+            if let Some(desk) = &desk {
+                desk.price(&mut prices)?;
+            }
+            let result = app
+                .store
                 .transaction(&name, |a, symbol, id| {
-                    let mut trades = vec![a.open(side, lots, symbol, &prices, id, now)?];
-                    trades.extend(a.check_stopout(&prices, now)?);
+                    let trade = a.open(side, lots, symbol, &prices, id, now)?;
+                    let mut after = prices.clone();
+                    trading::apply_fill(&mut after, &trade)?;
+                    let mut trades = vec![trade];
+                    trades.extend(a.check_stopout(&after, now)?);
                     Ok(trades)
                 })
-                .await?;
+                .await;
+            commit(app, desk).await;
+            result?;
         }
         "/api/reset" => {
             app.store
@@ -300,19 +330,27 @@ async fn post_inner(app: &App, path: &str, headers: &HeaderMap, body: &Value) ->
                 if id == 0 { None } else { Some(id) }
             };
             let u = app.store.user(&name).await?;
-            let prices = app
+            let symbols: Vec<&str> = u
+                .account
+                .positions
+                .iter()
+                .filter(|p| id.is_none_or(|id| id == p.id))
+                .map(|p| p.symbol.as_str())
+                .collect();
+            let mut prices = app
                 .market
-                .trading_prices(
-                    u.account
-                        .positions
-                        .iter()
-                        .filter(|p| id.is_none_or(|id| id == p.id))
-                        .map(|p| p.symbol.as_str()),
-                )
+                .trading_prices(symbols.iter().copied().filter(|s| *s != symbols::NSTAR))
                 .await?;
-            app.store
+            let desk = nstar_desk(app, &symbols).await;
+            if let Some(desk) = &desk {
+                desk.price(&mut prices)?;
+            }
+            let result = app
+                .store
                 .transaction(&name, |a, _, _| a.close(id, &prices, now))
-                .await?;
+                .await;
+            commit(app, desk).await;
+            result?;
         }
         "/api/leverage" => {
             let leverage = integer(body, "leverage")?;

@@ -259,15 +259,17 @@ function syncOrderControls(){
  const allowed=tradableSymbols!==null&&tradableSymbols.includes(cur.sym);
  symSel.disabled=orderBusy||symbolSaving||tradableSymbols?.length===0;
  $('order-symbol').textContent=cur.sym;
- const whole=STOCKS.includes(cur.sym);
+ const whole=STOCKS.includes(cur.sym),star=cur.sym==='NSTAR';
  $('lots').min=whole?1:0.01;$('lots').step=whole?1:0.01;
- document.querySelectorAll('[data-lots]').forEach((b,i)=>{const v=(whole?[1,10,50,100]:[0.01,0.1,0.5,1])[i];b.dataset.lots=v;b.textContent=whole?String(v):v.toFixed(2)});
+ // NSTAR: 1 手 = 0.01 枚 ≈ $1；预设对应 $100 / $1k / $10k / $100k 名义价值。
+ document.querySelectorAll('[data-lots]').forEach((b,i)=>{const v=(whole?[1,10,50,100]:star?[100,1000,10000,100000]:[0.01,0.1,0.5,1])[i];b.dataset.lots=v;b.textContent=whole?String(v):star?(v>=1000?v/1000+'k':String(v)):v.toFixed(2)});
  $('trade-buy').disabled=$('trade-sell').disabled=orderBusy||symbolSaving||!allowed||!quoteReady;
  $('close-all').disabled=orderBusy||curPos.length===0;
  $('close-all').textContent=orderBusy?'正在处理…':'全部平仓';
  document.querySelectorAll('.close-position').forEach(button=>button.disabled=orderBusy);
  $('symbol-status').textContent=orderBusy?'订单提交中，请稍候…':tradableSymbols===null?'正在获取币种配置…':allowed?'':
   tradableSymbols.length?'该币对已禁用，已有持仓仍可平仓':'暂无启用的币对，已有持仓仍可平仓';
+ if(allowed&&!orderBusy&&cur.sym==='NSTAR')$('symbol-status').textContent=nstarHalted?'NSTAR 熔断中，暂停交易':'NSTAR 杠杆上限 1:20 · 大单自带冲击成本，单账户上限 5,000 枚';
 }
 function applySymbols(settings){
  if(settings.version<symbolsVersion)return;
@@ -297,7 +299,17 @@ function msg(t){clearTimeout(messageTimer);$('msg').textContent=t;messageTimer=s
 function syncLotPresets(){
  document.querySelectorAll('[data-lots]').forEach(button=>button.setAttribute('aria-pressed',Number(button.dataset.lots)===Number($('lots').value)));
 }
-function setLots(value){const n=Number(value);$('lots').value=STOCKS.includes(cur.sym)?String(n):n.toFixed(2);syncLotPresets()}
+function setLots(value){const n=Number(value);$('lots').value=STOCKS.includes(cur.sym)||cur.sym==='NSTAR'&&n>=1?String(n):n.toFixed(2);syncLotPresets()}
+/* NSTAR 快讯: 传闻/消息/熔断/巨鲸，所有人可见，仅保留最近 4 条。 */
+let nstarHalted=false,nstarFeed=[];
+function nstarEvent(e){
+ if(e.kind==='halt')nstarHalted=true;
+ if(e.kind==='resume')nstarHalted=false;
+ nstarFeed=[...nstarFeed,e].slice(-4);
+ $('nstar-feed').innerHTML=nstarFeed.map(x=>`<li data-kind="${escapeHtml(x.kind)}"><time>${escapeHtml(new Date(x.time).toLocaleTimeString())}</time>${escapeHtml(x.text)}</li>`).join('');
+ if(cur.sym==='NSTAR'&&(e.kind==='halt'||e.kind==='resume'))msg(e.text);
+ syncOrderControls();
+}
 $('lots').addEventListener('input',syncLotPresets);syncLotPresets();
 async function trade(side){
  if(orderBusy)return;
@@ -500,6 +512,7 @@ function wsConnect(){
   if(d.type==='symbols'){applySymbols(d);return}
   if(d.type==='chat'){renderChat([d.row]);return}
   if(d.type==='lb'){renderLb(d.rows);return}
+  if(d.type==='nstar'){nstarEvent(d);return}
   if(d.type==='state'){connOk();render(d);return}
   if(d.sym!==cur.sym)return;
   renderQuote(d.price,d.sym,d.bid,d.ask,d.quote_valid,d.quote_at);

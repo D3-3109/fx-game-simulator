@@ -235,6 +235,13 @@ const STOCKS=['AAPL','TSLA','NVDA','MSFT','AMZN','GOOGL','META','AMD'];
 const symSel=$('sym'),itvSel=$('itv');
 'EURUSDT BTCUSDT ETHUSDT SOLUSDT XRPUSDT BNBUSDT DOGEUSDT ADAUSDT TRXUSDT AVAXUSDT LINKUSDT EURUSD GBPUSD USDJPY USDCHF USDCAD AUDUSD NZDUSD EURJPY GBPJPY USDCNY USDCNH FXSIM'.split(' ').forEach(s=>symSel.add(new Option(s==='FXSIM'?'FXSIM · 模拟币':s,s)));
 ['1m','5m','15m','30m','1h','4h','1d','1w'].forEach(i=>itvSel.add(new Option(i)));
+function syncSecondOption(){
+ const has=[...itvSel.options].some(o=>o.value==='1s');
+ if(cur.sym==='FXSIM'&&!has)itvSel.add(new Option('1s'),0);
+ if(cur.sym!=='FXSIM'&&has){[...itvSel.options].find(o=>o.value==='1s').remove();if(cur.itv==='1s')cur.itv='1m'}
+ itvSel.value=cur.itv;
+}
+syncSecondOption();
 symSel.value=cur.sym;itvSel.value=cur.itv;
 let tradableSymbols=null,symbolsVersion=-1,symbolSaving=false;
 function syncSymbolChoices(){
@@ -275,7 +282,7 @@ symSel.onchange=async()=>{
  const previous=cur.sym,next=symSel.value;if(symbolSaving||next===previous)return;
  symbolSaving=true;syncSymbolChoices();
  try{const j=await api('symbol',{symbol:next});
-  if(j.ok){cur.sym=next;renderQuote(NaN,next);if(series)series.applyOptions({priceFormat:priceFormat(next)});lastBar=null;kLoaded=false;drawPosLines();loadK();await refresh()}
+  if(j.ok){cur.sym=next;syncSecondOption();renderQuote(NaN,next);if(series)series.applyOptions({priceFormat:priceFormat(next)});lastBar=null;kLoaded=false;drawPosLines();loadK();await refresh()}
  }catch(e){msg('币对切换失败：'+e)}
  finally{symbolSaving=false;syncSymbolChoices()}
 };
@@ -354,7 +361,7 @@ async function setLev(){
  finally{levSaving=false;input.disabled=$('lev-apply').disabled=curPos.length>0;$('lev-apply').textContent='应用杠杆'}
 }
 
-const SEC={'1m':60,'5m':300,'15m':900,'30m':1800,'1h':3600,'4h':14400,'1d':86400,'1w':604800};
+const SEC={'1s':1,'1m':60,'5m':300,'15m':900,'30m':1800,'1h':3600,'4h':14400,'1d':86400,'1w':604800};
 let kLoaded=false,lastBarLive=false;
 let kSeq=0,simBars=[],simStamp=0;
 function mergeSimBars(data,stamp){

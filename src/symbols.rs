@@ -11,6 +11,7 @@ pub const FX: &[&str] = &[
     "USDCNH", "USDCNY", "EURCNH",
 ];
 pub const INTERVALS: &[(&str, i64)] = &[
+    ("1s", 1),
     ("1m", 60),
     ("5m", 300),
     ("15m", 900),

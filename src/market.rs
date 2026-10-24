@@ -292,6 +292,9 @@ impl Market {
             .find(|(i, _)| *i == interval)
             .map(|(_, s)| *s)
             .ok_or("不支持的周期")?;
+        if sec == 1 && symbol != symbols::SIM {
+            return Err("仅模拟币支持1秒周期".into());
+        }
         if !(1..=1000).contains(&limit) {
             return Err("K线数量无效".into());
         }

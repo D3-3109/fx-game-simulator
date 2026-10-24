@@ -703,8 +703,10 @@ mod cap_tests {
     use super::*;
     #[test]
     fn leverage_and_lot_caps_reject_inflation() {
-        let mut a = Account::default();
-        a.leverage = MAX_LEVERAGE;
+        let mut a = Account {
+            leverage: MAX_LEVERAGE,
+            ..Account::default()
+        };
         assert!(a.validate().is_ok());
         a.leverage = MAX_LEVERAGE + 1;
         assert!(a.validate().is_err());

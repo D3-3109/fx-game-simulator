@@ -29,6 +29,10 @@ fi
 if [ "$#" -eq 0 ]; then
   set -- --listen "${listen}" --db "${db_path}" \
     --static-dir "${static_dir}" --admin-key "${admin_key}"
+  # Behind a reverse proxy, name it so per-IP limits see real clients (comma-separated).
+  if [ -n "${FX_TRUSTED_PROXY:-}" ]; then
+    set -- "$@" --trusted-proxy "${FX_TRUSTED_PROXY}"
+  fi
 fi
 
 if [ "$(id -u)" = "0" ]; then

@@ -13,6 +13,10 @@ struct Args {
     static_dir: PathBuf,
     #[arg(long)]
     admin_key: PathBuf,
+    /// Reverse proxy whose X-Forwarded-For is trusted for per-IP limits; repeatable.
+    /// Without it, limits key on the TCP peer, so behind a proxy everyone shares one key.
+    #[arg(long = "trusted-proxy", value_delimiter = ',')]
+    trusted_proxies: Vec<std::net::IpAddr>,
 }
 
 #[tokio::main]
@@ -39,15 +43,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map_err(std::io::Error::other)?,
     );
-    let app = Arc::new(App::new(store.clone(), market, args.admin_key));
+    let app = Arc::new(
+        App::new(store.clone(), market, args.admin_key).with_trusted_proxies(args.trusted_proxies),
+    );
     let mut tasks = runtime::start(app.clone());
     eprintln!("FX Rust listening on http://{}", listener.local_addr()?);
-    axum::serve(listener, api::router(app.clone(), static_dir))
-        .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            app.shutdown();
-        })
-        .await?;
+    axum::serve(
+        listener,
+        api::router(app.clone(), static_dir).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        app.shutdown();
+    })
+    .await?;
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     store.close().await;

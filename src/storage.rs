@@ -3,6 +3,7 @@
 #[path = "storage_tests.rs"]
 mod tests;
 use crate::{
+    limits::Quota,
     symbols,
     trading::{self, Account, Trade},
 };
@@ -165,12 +166,56 @@ impl Store {
         }
         Ok(self.login_aliases.lock().await.get(tok).cloned())
     }
+    /// Trusted in-process registration (tests, tools); bypasses client quotas.
     pub async fn register(&self, name: &str, pwd: &str) -> Result<String> {
-        if !(1..=16).contains(&name.chars().count()) || pwd.is_empty() {
-            return Err(invalid("名字1-16字,密码必填"));
-        }
+        self.register_from(name, pwd, "local", &Quota::NONE, now_ms())
+            .await
+    }
+    /// Registration under per-client and global quotas; callers validate credentials
+    /// first with `validate_credentials`. Quota rows outlive account deletion so delete-and-retry gains nothing.
+    pub async fn register_from(
+        &self,
+        name: &str,
+        pwd: &str,
+        client: &str,
+        quota: &Quota,
+        now: i64,
+    ) -> Result<String> {
         let _guard = self.gate.lock().await;
-        if sqlx::query("SELECT name FROM users WHERE name=?")
+        let since = |ms: i64| now - ms;
+        let count = |sql: &'static str, key: Option<&str>, from: i64| {
+            let q = sqlx::query_scalar::<_, i64>(sql);
+            let q = match key {
+                Some(k) => q.bind(k.to_owned()),
+                None => q,
+            };
+            q.bind(from)
+        };
+        const HOUR: i64 = 3_600_000;
+        let by_client = "SELECT COUNT(*) FROM registrations WHERE client=? AND time>?";
+        if count(by_client, Some(client), since(HOUR))
+            .fetch_one(&self.pool)
+            .await?
+            >= quota.per_client_hour
+            || count(by_client, Some(client), since(24 * HOUR))
+                .fetch_one(&self.pool)
+                .await?
+                >= quota.per_client_day
+        {
+            return Err(invalid("该网络注册过于频繁，请稍后再试"));
+        }
+        if count(
+            "SELECT COUNT(*) FROM registrations WHERE time>?",
+            None,
+            since(HOUR),
+        )
+        .fetch_one(&self.pool)
+        .await?
+            >= quota.global_hour
+        {
+            return Err(invalid("当前注册人数过多，请稍后再试"));
+        }
+        if sqlx::query("SELECT name FROM users WHERE name=? COLLATE NOCASE")
             .bind(name)
             .fetch_optional(&self.pool)
             .await?
@@ -184,8 +229,20 @@ impl Store {
             next_id: self.next_id.load(Ordering::SeqCst),
             ..Account::default()
         };
+        let mut tx = self.pool.begin().await?;
         sqlx::query("INSERT INTO users(name,salt,hash,token,symbol,account,created) VALUES(?,?,?,?,'USDJPY',?,?)")
-            .bind(name).bind(&salt).bind(password_hash(&salt,pwd)).bind(&tok).bind(serde_json::to_string(&account)?).bind(now_ms()/1000).execute(&self.pool).await?;
+            .bind(name).bind(&salt).bind(password_hash(&salt,pwd)).bind(&tok).bind(serde_json::to_string(&account)?).bind(now/1000).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO registrations(client,time,name) VALUES(?,?,?)")
+            .bind(client)
+            .bind(now)
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM registrations WHERE time<?")
+            .bind(since(7 * 24 * HOUR))
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(tok)
     }
     pub async fn login(&self, name: &str, pwd: &str) -> Result<String> {
@@ -549,6 +606,39 @@ impl Store {
     }
 }
 
+/// Rules for new accounts. Existing accounts keep logging in with whatever they have.
+pub fn validate_credentials(name: &str, pwd: &str) -> Result<()> {
+    validate_name(name)?;
+    validate_password(name, pwd)
+}
+/// Names: 2-16 characters of letters (any script), digits, `_` or `-`, not all digits.
+fn validate_name(name: &str) -> Result<()> {
+    let n = name.chars().count();
+    if !(2..=16).contains(&n)
+        || !name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+        || name.chars().all(|c| c.is_ascii_digit())
+    {
+        return Err(invalid(
+            "用户名需2-16字，仅限文字、数字、_或-，且不能全为数字",
+        ));
+    }
+    Ok(())
+}
+fn validate_password(name: &str, pwd: &str) -> Result<()> {
+    let n = pwd.chars().count();
+    if !(8..=128).contains(&n) {
+        return Err(invalid("密码需8-128位"));
+    }
+    let letters = pwd.chars().any(|c| c.is_alphabetic());
+    let digits = pwd.chars().any(|c| c.is_ascii_digit());
+    let distinct = pwd.chars().collect::<std::collections::BTreeSet<_>>().len();
+    if !letters || !digits || distinct < 4 || pwd.eq_ignore_ascii_case(name) {
+        return Err(invalid("密码需同时包含字母和数字，且不能与用户名相同"));
+    }
+    Ok(())
+}
 /// Signed NSTAR units held (long positive).
 fn nstar_units(account: &Account) -> f64 {
     account

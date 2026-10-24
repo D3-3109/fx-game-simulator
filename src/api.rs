@@ -1,18 +1,20 @@
 use crate::{
     app::{App, Event},
+    limits::{SocketSlot, client_key},
     market::NstarDesk,
     storage::{self, Error},
     symbols, trading, web,
 };
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Bytes,
     extract::{
-        DefaultBodyLimit, Query, State,
+        ConnectInfo, DefaultBodyLimit, Query, Request, State,
         rejection::BytesRejection,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, StatusCode, Uri},
+    http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -104,6 +106,7 @@ pub fn router(app: Arc<App>, static_dir: PathBuf) -> Router {
         .route("/ws", get(ws_upgrade))
         .route("/api/{*path}", get(api_get).post(api_post))
         .layer(DefaultBodyLimit::max(65536))
+        .layer(middleware::from_fn_with_state(app.clone(), guard))
         .with_state(app)
         .merge(web::static_router(static_dir))
 }
@@ -125,6 +128,46 @@ async fn commit(app: &App, desk: Option<NstarDesk<'_>>) {
         }
         Err(_) => eprintln!("[nstar] order settlement broadcast failed; tick will retry"),
     }
+}
+/// Rate-limit key of the caller, set by `guard` for every API and WebSocket request.
+#[derive(Clone)]
+struct Client(String);
+
+fn too_many(retry: u64) -> Response {
+    let mut r = Failure(
+        StatusCode::TOO_MANY_REQUESTS,
+        format!("请求过于频繁，请 {retry} 秒后重试"),
+    )
+    .into_response();
+    r.headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(retry));
+    r
+}
+/// Per-client token buckets in front of every API route and WebSocket handshake.
+async fn guard(State(app): State<Arc<App>>, mut req: Request, next: Next) -> Response {
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0.ip());
+    let client = client_key(app.client_ip(peer, req.headers()));
+    let path = req.uri().path();
+    let limits = app.limits;
+    let now = std::time::Instant::now();
+    let mut checks = vec![if path == "/ws" {
+        ("ws", limits.ws)
+    } else {
+        ("api", limits.api)
+    }];
+    if path == "/api/auth" || path == "/api/admin/login" {
+        checks.push(("auth", limits.auth));
+    }
+    for (kind, rate) in checks {
+        if let Err(retry) = app.limiter.check(&client, kind, rate, now) {
+            return too_many(retry);
+        }
+    }
+    req.extensions_mut().insert(Client(client));
+    next.run(req).await
 }
 async fn api_get(State(app): State<Arc<App>>, uri: Uri, headers: HeaderMap) -> Response {
     response(get_inner(&app, &uri, &headers).await)
@@ -192,6 +235,7 @@ async fn get_inner(app: &App, uri: &Uri, headers: &HeaderMap) -> ApiResult {
 }
 async fn api_post(
     State(app): State<Arc<App>>,
+    Extension(Client(client)): Extension<Client>,
     uri: Uri,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
@@ -204,9 +248,15 @@ async fn api_post(
         Ok(v) if v.is_object() => v,
         _ => return bad("请求JSON无效").into_response(),
     };
-    response(post_inner(&app, uri.path(), &headers, &body).await)
+    response(post_inner(&app, &client, uri.path(), &headers, &body).await)
 }
-async fn post_inner(app: &App, path: &str, headers: &HeaderMap, body: &Value) -> ApiResult {
+async fn post_inner(
+    app: &App,
+    client: &str,
+    path: &str,
+    headers: &HeaderMap,
+    body: &Value,
+) -> ApiResult {
     let now = storage::now_ms();
     if path == "/api/admin/login" {
         let token = app
@@ -252,7 +302,10 @@ async fn post_inner(app: &App, path: &str, headers: &HeaderMap, body: &Value) ->
         let name = text(body, "name")?.trim();
         let pwd = text(body, "pwd")?;
         let token = if body["action"] == "register" {
-            app.store.register(name, pwd).await?
+            storage::validate_credentials(name, pwd)?;
+            app.store
+                .register_from(name, pwd, client, &app.limits.register, now)
+                .await?
         } else {
             app.store.login(name, pwd).await?
         };
@@ -377,17 +430,25 @@ async fn post_inner(app: &App, path: &str, headers: &HeaderMap, body: &Value) ->
     Ok(json!({"ok":true}))
 }
 
-async fn ws_upgrade(State(app): State<Arc<App>>, uri: Uri, upgrade: WebSocketUpgrade) -> Response {
+async fn ws_upgrade(
+    State(app): State<Arc<App>>,
+    Extension(Client(client)): Extension<Client>,
+    uri: Uri,
+    upgrade: WebSocketUpgrade,
+) -> Response {
     let q = match params(&uri) {
         Ok(q) => q,
         Err(e) => return e.into_response(),
+    };
+    let Some(slot) = app.limiter.socket(&client, app.limits.ws_per_client) else {
+        return too_many(30);
     };
     let token = q.get("token").cloned().unwrap_or_default();
     match app.store.authenticate(&token).await {
         Ok(Some(name)) => upgrade
             .max_message_size(65536)
             .max_frame_size(65536)
-            .on_upgrade(move |socket| serve_ws(socket, app, name, token))
+            .on_upgrade(move |socket| serve_ws(socket, app, name, token, slot))
             .into_response(),
         _ => Failure(StatusCode::UNAUTHORIZED, "auth".into()).into_response(),
     }
@@ -400,7 +461,13 @@ async fn send(socket: &mut WebSocket, value: Value) -> bool {
     .await
     .is_ok_and(|r| r.is_ok())
 }
-async fn serve_ws(mut socket: WebSocket, app: Arc<App>, name: String, token: String) {
+async fn serve_ws(
+    mut socket: WebSocket,
+    app: Arc<App>,
+    name: String,
+    token: String,
+    _slot: SocketSlot,
+) {
     let mut events = app.events.subscribe();
     // Recheck after upgrade to close the deletion/handshake race.
     if app

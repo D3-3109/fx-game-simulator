@@ -2,6 +2,7 @@ use futures_util::{SinkExt, StreamExt};
 use fx_sim_rust::{
     api,
     app::App,
+    limits::{Limits, Quota, Rate},
     market::Market,
     runtime,
     storage::{Store, now_ms},
@@ -27,6 +28,9 @@ impl Drop for Harness {
 }
 impl Harness {
     async fn new() -> Self {
+        Self::limited(Limits::unlimited()).await
+    }
+    async fn limited(limits: Limits) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(&dir.path().join("test.db")).await.unwrap());
         let key = dir.path().join("admin.json");
@@ -52,13 +56,27 @@ impl Harness {
             .await
             .unwrap(),
         );
-        let app = Arc::new(App::new(store, market, key));
+        Self::with(store, market, key, limits, dir).await
+    }
+    async fn with(
+        store: Arc<Store>,
+        market: Arc<Market>,
+        key: std::path::PathBuf,
+        limits: Limits,
+        dir: tempfile::TempDir,
+    ) -> Self {
+        let app = Arc::new(App::new(store, market, key).with_limits(limits));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let static_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("static");
         let router = api::router(app.clone(), static_dir);
         let server = tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
         let tasks = runtime::start(app.clone());
         Self {
@@ -89,7 +107,7 @@ impl Harness {
         let (status, value) = self
             .request(
                 "/api/auth",
-                Some(json!({"action":"register","name":name,"pwd":"pw"})),
+                Some(json!({"action":"register","name":name,"pwd":"password1"})),
                 "",
             )
             .await;
@@ -695,4 +713,146 @@ async fn atomic_trade_failure_stays_visible_as_503_and_no_browser_stopout() {
         h.request("/api/history", None, &token).await.1["rows"][0]["kind"],
         "stopout"
     );
+}
+
+#[tokio::test]
+async fn per_ip_rate_limits_registration_quotas_and_credential_rules() {
+    let free = Rate {
+        burst: 1e9,
+        per_sec: 1e9,
+    };
+    let h = Harness::limited(Limits {
+        api: Rate {
+            burst: 40.0,
+            per_sec: 0.01,
+        },
+        auth: free,
+        ws: free,
+        ws_per_client: 2,
+        register: Quota {
+            per_client_hour: 2,
+            per_client_day: 5,
+            global_hour: 30,
+        },
+    })
+    .await;
+    let reg = |name: &str, pwd: &str| json!({"action":"register","name":name,"pwd":pwd});
+    for (name, pwd) in [
+        ("a", "password1"),
+        ("bad name", "password1"),
+        ("12345", "password1"),
+        ("player", "short1"),
+        ("player", "onlyletters"),
+        ("player", "11111111a"),
+        ("player1", "PLAYER1"),
+    ] {
+        let (status, v) = h.request("/api/auth", Some(reg(name, pwd)), "").await;
+        assert_eq!(status, 400, "{name}/{pwd}: {v}");
+    }
+    let (status, v) = h
+        .request("/api/auth", Some(reg("玩家一", "trade2026")), "")
+        .await;
+    assert_eq!(status, 200, "{v}");
+    let (status, v) = h
+        .request("/api/auth", Some(reg("PLAYER", "trade2026")), "")
+        .await;
+    assert_eq!(status, 200, "{v}");
+    // Same name in another case is taken; the third account this hour is refused even
+    // after deleting one, because quota rows outlive the account.
+    let (status, v) = h
+        .request("/api/auth", Some(reg("player", "trade2026")), "")
+        .await;
+    assert_eq!(
+        (status, v["err"].as_str()),
+        (400, Some("该网络注册过于频繁，请稍后再试"))
+    );
+    let admin = h.admin().await;
+    let (status, _) = h
+        .request(
+            "/api/admin/delete",
+            Some(json!({"name":"PLAYER","confirmation":"PLAYER"})),
+            &admin,
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (status, _) = h
+        .request("/api/auth", Some(reg("again", "trade2026")), "")
+        .await;
+    assert_eq!(status, 400);
+    // Existing accounts keep logging in regardless of the new password rules.
+    let (status, v) = h
+        .request(
+            "/api/auth",
+            Some(json!({"name":"玩家一","pwd":"trade2026"})),
+            "",
+        )
+        .await;
+    assert_eq!(status, 200, "{v}");
+    let token = v["token"].as_str().unwrap().to_owned();
+    // Two sockets per client; the third handshake is refused with 429.
+    let _one = h.ws(&token).await;
+    let _two = h.ws(&token).await;
+    let third = tokio_tungstenite::connect_async(format!(
+        "{}/ws?token={token}",
+        h.base.replace("http:", "ws:")
+    ))
+    .await;
+    assert!(third.is_err());
+    // Burn the remaining API burst; X-Forwarded-For from an untrusted peer is ignored.
+    let mut limited = None;
+    for _ in 0..60 {
+        let response = h
+            .client
+            .get(format!("{}/api/symbols", h.base))
+            .header("x-forwarded-for", "198.51.100.9")
+            .send()
+            .await
+            .unwrap();
+        if response.status() == 429 {
+            limited = Some(response);
+            break;
+        }
+    }
+    let limited = limited.expect("API burst never ran out");
+    assert!(
+        limited.headers()["retry-after"]
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            >= 1
+    );
+    let body: Value = limited.json().await.unwrap();
+    assert_eq!(body["ok"], false);
+    // Static assets bypass the limiter.
+    let page = h.client.get(format!("{}/", h.base)).send().await.unwrap();
+    assert_ne!(page.status(), 429);
+}
+
+#[test]
+fn forwarded_for_counts_only_through_trusted_proxies() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&dir.path().join("t.db")).await.unwrap());
+        let market = Arc::new(Market::offline(store.clone(), [].into()).await.unwrap());
+        let proxy: std::net::IpAddr = "10.0.0.2".parse().unwrap();
+        let app =
+            App::new(store, market, dir.path().join("k.json")).with_trusted_proxies(vec![proxy]);
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "6.6.6.6, 203.0.113.5, 10.0.0.2".parse().unwrap(),
+        );
+        let ip = |s: &str| Some(s.parse::<std::net::IpAddr>().unwrap());
+        // A spoofed left-most hop is ignored; the right-most untrusted hop is the client.
+        assert_eq!(app.client_ip(Some(proxy), &headers), ip("203.0.113.5"));
+        // Direct clients cannot claim another address.
+        assert_eq!(
+            app.client_ip(ip("198.51.100.1"), &headers),
+            ip("198.51.100.1")
+        );
+        let mapped = "::ffff:10.0.0.2".parse::<std::net::IpAddr>().ok();
+        assert_eq!(app.client_ip(mapped, &headers), ip("203.0.113.5"));
+    });
 }

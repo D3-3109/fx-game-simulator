@@ -16,6 +16,8 @@ services:
       # Quotes need an outbound proxy where biquote.io is not directly reachable.
       # Inside the container 127.0.0.1 is the container itself, so name the host.
       FX_PROXY: "${FX_PROXY:-}"
+      # Behind nginx/Caddy/etc., its address here makes per-IP limits use X-Forwarded-For.
+      FX_TRUSTED_PROXY: "${FX_TRUSTED_PROXY:-}"
     extra_hosts:
       # Required on Linux; Docker Desktop provides this name automatically.
       - "host.docker.internal:host-gateway"

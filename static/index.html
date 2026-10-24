@@ -9,7 +9,8 @@
  <h1>进入你的交易台</h1><p class="muted">真实行情，模拟资金。与其他交易者一起对战。</p>
  <form id="auth-form" onsubmit="event.preventDefault();doAuth('login')">
   <label for="f-name">用户名</label><input id="f-name" placeholder="输入用户名" maxlength="16" autocomplete="username" required>
-  <label for="f-pwd">密码</label><input id="f-pwd" type="password" placeholder="输入密码" autocomplete="current-password" required>
+  <label for="f-pwd">密码</label><input id="f-pwd" type="password" placeholder="输入密码" autocomplete="current-password" required aria-describedby="pwd-rule">
+  <p id="pwd-rule" class="auth-rule">注册：用户名2-16字（文字、数字、_或-）；密码8位以上，含字母和数字</p>
   <div id="autherr" role="alert"></div>
   <button id="auth-login" class="primary" type="submit">登录交易台</button>
   <button id="auth-register" type="button" onclick="doAuth('register')">注册 · 领取 $10,000.00 模拟资金</button>

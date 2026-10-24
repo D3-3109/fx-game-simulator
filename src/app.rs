@@ -1,4 +1,5 @@
 use crate::{
+    limits::{Limiter, Limits},
     market::Market,
     storage::{self, Store},
     symbols, trading,
@@ -32,6 +33,10 @@ pub struct App {
     presence: Arc<Mutex<BTreeMap<u64, String>>>,
     connection_seq: AtomicU64,
     pub shutting_down: AtomicBool,
+    pub limits: Limits,
+    pub limiter: Limiter,
+    /// Proxy hops whose `X-Forwarded-For` is trusted; empty means use the socket peer.
+    pub trusted_proxies: Vec<std::net::IpAddr>,
 }
 pub struct Presence {
     id: u64,
@@ -56,7 +61,43 @@ impl App {
             presence: Arc::new(Mutex::new(BTreeMap::new())),
             connection_seq: AtomicU64::new(1),
             shutting_down: AtomicBool::new(false),
+            limits: Limits::default(),
+            limiter: Limiter::default(),
+            trusted_proxies: Vec::new(),
         }
+    }
+    pub fn with_limits(mut self, limits: Limits) -> Self {
+        self.limits = limits;
+        self
+    }
+    pub fn with_trusted_proxies(mut self, proxies: Vec<std::net::IpAddr>) -> Self {
+        self.trusted_proxies = proxies;
+        self
+    }
+    /// Client address for limits. Forwarded headers count only when the direct peer is a
+    /// trusted proxy, and then the right-most hop not itself a trusted proxy is used,
+    /// since anything left of it is client-controlled.
+    pub fn client_ip(
+        &self,
+        peer: Option<std::net::IpAddr>,
+        headers: &axum::http::HeaderMap,
+    ) -> Option<std::net::IpAddr> {
+        let peer = peer.map(|ip| ip.to_canonical());
+        if !peer.is_some_and(|p| self.trusted_proxies.contains(&p)) {
+            return peer;
+        }
+        let hops: Vec<std::net::IpAddr> = headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .filter_map(|s| s.trim().parse::<std::net::IpAddr>().ok())
+            .map(|ip| ip.to_canonical())
+            .collect();
+        hops.into_iter()
+            .rev()
+            .find(|ip| !self.trusted_proxies.contains(ip))
+            .or(peer)
     }
     pub fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);

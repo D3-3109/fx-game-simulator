@@ -19,11 +19,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map_err(std::io::Error::other)?,
     );
-    let app = Arc::new(App::new(store, market, dir.join("admin.json")));
+    let app = Arc::new(
+        App::new(store, market, dir.join("admin.json"))
+            .with_limits(fx_sim_rust::limits::Limits::unlimited()),
+    );
     let _tasks = runtime::start(app.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     println!("http://{}", listener.local_addr()?);
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("static");
-    axum::serve(listener, api::router(app, root)).await?;
+    axum::serve(
+        listener,
+        api::router(app, root).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

@@ -58,6 +58,7 @@ pub struct Market {
     client: reqwest::Client,
     cache: RwLock<BTreeMap<String, Quote>>,
     sim: Mutex<SimFeed>,
+    nstar: Mutex<SimFeed>,
     offline: bool,
     quote_gate: Mutex<()>,
     biquote_retry_at: AtomicI64,
@@ -90,7 +91,8 @@ impl Market {
             builder = builder.proxy(reqwest::Proxy::all(proxy).map_err(|_| "代理设置无效")?);
         }
         let client = builder.build().map_err(|_| "无法创建行情客户端")?;
-        let sim = SimFeed::load(&store, now_ms()).await?;
+        let sim = SimFeed::load(&store, symbols::SIM, 1.1, now_ms()).await?;
+        let nstar = SimFeed::load(&store, symbols::NSTAR, 100.0, now_ms()).await?;
         let now = now_ms();
         Ok(Self {
             store,
@@ -107,6 +109,7 @@ impl Market {
                     .collect(),
             ),
             sim: Mutex::new(sim),
+            nstar: Mutex::new(nstar),
             offline,
             quote_gate: Mutex::new(()),
             biquote_retry_at: AtomicI64::new(0),
@@ -134,6 +137,8 @@ impl Market {
         }
         let result = if symbol == symbols::SIM {
             Ok(Quote::single(self.sim.lock().await.price, start))
+        } else if symbol == symbols::NSTAR {
+            Ok(Quote::single(self.nstar.lock().await.price, start))
         } else if symbols::FX.contains(&symbol) {
             self.biquote_quote(symbol).await
         } else if symbols::STOCK.contains(&symbol) {
@@ -298,8 +303,13 @@ impl Market {
         if !(1..=1000).contains(&limit) {
             return Err("K线数量无效".into());
         }
-        if symbol == symbols::SIM {
-            let sim = self.sim.lock().await;
+        if symbol == symbols::SIM || symbol == symbols::NSTAR {
+            let feed = if symbol == symbols::SIM {
+                &self.sim
+            } else {
+                &self.nstar
+            };
+            let sim = feed.lock().await;
             return Ok(
                 json!({"ok":true,"klines":sim.klines(sec,limit),"updated_at":sim.updated_at}),
             );
@@ -454,19 +464,26 @@ impl Market {
         Ok(packet)
     }
     pub async fn tick_sim(&self) -> Result<Value> {
-        let mut sim = self.sim.lock().await;
+        self.tick_feed(&self.sim).await
+    }
+    pub async fn tick_nstar(&self) -> Result<Value> {
+        self.tick_feed(&self.nstar).await
+    }
+    async fn tick_feed(&self, feed: &Mutex<SimFeed>) -> Result<Value> {
+        let mut sim = feed.lock().await;
         let mut next = sim.clone();
         let price = next.next_price();
+        let symbol = next.symbol;
         let now = now_ms();
         next.record(price, now);
         self.store
-            .save_bars(symbols::SIM, &next.pending())
+            .save_bars(symbol, &next.pending())
             .await
             .map_err(|_| "模拟行情保存失败")?;
         let packet = next.packet();
         *sim = next;
         drop(sim);
-        self.on_quote(symbols::SIM, price, now).await?;
+        self.on_quote(symbol, price, now).await?;
         Ok(packet)
     }
 }
@@ -580,6 +597,8 @@ fn weekly_bars(bars: Vec<[f64; 5]>, limit: usize) -> Vec<[f64; 5]> {
 
 #[derive(Clone)]
 struct SimFeed {
+    symbol: &'static str,
+    base: f64,
     price: f64,
     trend: f64,
     kind: usize,
@@ -588,9 +607,11 @@ struct SimFeed {
     bars: BTreeMap<i64, VecDeque<[f64; 5]>>,
 }
 impl SimFeed {
-    fn new(now: i64) -> Self {
+    fn new(symbol: &'static str, base: f64, now: i64) -> Self {
         Self {
-            price: 1.1,
+            symbol,
+            base,
+            price: base,
             trend: 0.0,
             kind: 0,
             left: 0,
@@ -600,18 +621,18 @@ impl SimFeed {
                 .map(|(_, s)| {
                     (
                         *s,
-                        VecDeque::from([[((now / 1000) / s * s) as f64, 1.1, 1.1, 1.1, 1.1]]),
+                        VecDeque::from([[((now / 1000) / s * s) as f64, base, base, base, base]]),
                     )
                 })
                 .collect(),
         }
     }
-    async fn load(store: &Store, now: i64) -> Result<Self> {
-        let mut sim = Self::new(now);
+    async fn load(store: &Store, symbol: &'static str, base: f64, now: i64) -> Result<Self> {
+        let mut sim = Self::new(symbol, base, now);
         let mut loaded = Vec::new();
         for (_, sec) in symbols::INTERVALS {
             let bars = store
-                .load_bars(symbols::SIM, *sec)
+                .load_bars(symbol, *sec)
                 .await
                 .map_err(|_| "模拟历史读取失败")?;
             if !bars.is_empty() {
@@ -628,7 +649,7 @@ impl SimFeed {
         }
         sim.record(sim.price, now);
         store
-            .save_bars(symbols::SIM, &sim.pending())
+            .save_bars(symbol, &sim.pending())
             .await
             .map_err(|_| "模拟历史保存失败")?;
         Ok(sim)
@@ -669,7 +690,7 @@ impl SimFeed {
     }
     fn packet(&self) -> Value {
         let mut packet =
-            Quote::single(self.price, self.updated_at).packet(symbols::SIM, self.updated_at);
+            Quote::single(self.price, self.updated_at).packet(self.symbol, self.updated_at);
         packet["time"] = json!(self.updated_at);
         packet["klines"] = json!(
             symbols::INTERVALS
@@ -710,7 +731,11 @@ impl SimFeed {
             4 => shock += 0.0006,
             _ => {}
         }
-        ((self.price + 0.003 * (1.1 - self.price) + shock + self.trend).max(0.5) * 1e5).round()
+        let scale = self.base / 1.1;
+        ((self.price + 0.003 * (self.base - self.price) + (shock + self.trend) * scale)
+            .max(0.5 * scale)
+            * 1e5)
+            .round()
             / 1e5
     }
 }

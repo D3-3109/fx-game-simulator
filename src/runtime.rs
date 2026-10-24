@@ -77,6 +77,16 @@ pub fn start(app: Arc<App>) -> JoinSet<()> {
         });
         let a = app.clone();
         tasks.spawn(async move {
+            loop {
+                match a.market.tick_nstar().await {
+                    Ok(packet) => a.broadcast(packet),
+                    Err(_) => eprintln!("[nstar] tick persistence/settlement failed; will retry"),
+                }
+                sleep(Duration::from_millis(200)).await;
+            }
+        });
+        let a = app.clone();
+        tasks.spawn(async move {
             fx_loop(a).await;
         });
         let a = app.clone();

@@ -177,7 +177,7 @@ async fn live_fx_cache_cannot_be_overwritten_by_cny_or_single_price_feed() {
 fn recorded_ticks_preserve_wicks_freeze_closed_candles_and_bound_retention() {
     for (_, sec) in symbols::INTERVALS {
         let t = 1800000000 / sec * sec;
-        let mut sim = SimFeed::new(t * 1000);
+        let mut sim = SimFeed::new("FXSIM", 1.1, t * 1000);
         assert_eq!(sim.klines(*sec, 500).len(), 1, "invented history");
         sim.record(0.9, t * 1000 + 200);
         sim.record(1.09, t * 1000 + 400);
@@ -206,7 +206,7 @@ async fn sqlite_sim_restart_retains_closed_extremes_and_does_not_fill_gap() {
     let path = dir.path().join("bars.db");
     let store = Store::open(&path).await.unwrap();
     let t = 1800000000000;
-    let mut sim = SimFeed::new(t);
+    let mut sim = SimFeed::new("FXSIM", 1.1, t);
     sim.record(0.9, t + 200);
     sim.record(1.09, t + 400);
     store.save_bars("FXSIM", &sim.pending()).await.unwrap();
@@ -215,7 +215,9 @@ async fn sqlite_sim_restart_retains_closed_extremes_and_does_not_fill_gap() {
     let old = sim.klines(60, 1000);
     store.close().await;
     let store = Store::open(&path).await.unwrap();
-    let restored = SimFeed::load(&store, t + 600000).await.unwrap();
+    let restored = SimFeed::load(&store, "FXSIM", 1.1, t + 600000)
+        .await
+        .unwrap();
     let bars = restored.klines(60, 1000);
     assert_eq!(bars.len(), 3);
     assert_eq!(bars[..2], old);

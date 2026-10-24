@@ -216,7 +216,7 @@ impl App {
             None => self.market.price(symbols::NSTAR).await.ok(),
         };
         Ok(
-            json!({"ok":true,"type":"state","name":name,"symbol":user.symbol,"price":prices[&user.symbol],"bid":bid,"ask":ask,"quote_valid":quote_valid,"quote_at":if self.market.is_offline(){None}else{Some(quote.at)},"balance":acc.balance,"loan":acc.loan,"debt":acc.debt(),"debt_since":acc.debt_since,"debt_limit":trading::DEBT_LIMIT,"equity":equity,"used":used,"free":equity-used,"margin_level":if used==0.0 {None} else {Some(equity/used)},"leverage":acc.leverage,"positions":positions,"spot":spot,"nstar_price":nstar,"spot_fee":trading::SPOT_FEE,"stopout_level":trading::STOPOUT,"currency":"USD","last_trade":user.last_trade}),
+            json!({"ok":true,"type":"state","name":name,"symbol":user.symbol,"price":prices[&user.symbol],"bid":bid,"ask":ask,"quote_valid":quote_valid,"quote_at":if self.market.is_offline(){None}else{Some(quote.at)},"balance":acc.balance,"loan":acc.loan,"debt":acc.debt(),"debt_since":acc.debt_since,"debt_limit":trading::DEBT_LIMIT,"equity":equity,"used":used,"free":equity-used,"margin_level":if used==0.0 {None} else {Some(equity/used)},"leverage":acc.leverage,"positions":positions,"spot":spot,"nstar_price":nstar,"spot_fee":trading::SPOT_FEE,"contract":trading::contract(&user.symbol),"symbol_leverage":trading::leverage_for(&user.symbol,acc.leverage),"funding_at":acc.funding_at,"stopout_level":trading::STOPOUT,"currency":"USD","last_trade":user.last_trade}),
         )
     }
     pub async fn leaderboard(&self) -> Result<Value, String> {

@@ -522,7 +522,7 @@ const candle = price => {
   Object.assign(context, {
     LightweightCharts:{CandlestickSeries:{type:'Candlestick'},version:()=> '5.2.1',createChart(el,options){
       assert.equal(options.height,400);
-      return {subscribeCrosshairMove(){},addSeries(definition,options){assert.equal(definition.type,'Candlestick');assert.equal(options.wickUpColor,'#26a69a');return series;},applyOptions(options){applied=options;}};
+      return {subscribeCrosshairMove(){},addSeries(definition,options){assert.equal(definition.type,'Candlestick');assert.equal(options.wickUpColor,'#25a750');return series;},applyOptions(options){applied=options;}};
     }},
     ResizeObserver:class {constructor(callback){this.callback=callback;}observe(el){observe=this.callback;assert.equal(el,elements.cv);}},
   });
@@ -601,5 +601,25 @@ const candle = price => {
   run("cur.sym='BTCUSDT';pricePrecisions.set(cur.sym,2);renderQuote(60000.25,cur.sym,60000.249900000004,60000.2501,true)");
   assert.equal(elements['buy-price'].textContent,'60000.2501');assert.equal(elements['sell-price'].textContent,'60000.2499');
   assert.equal(run("pricePrecisions.get('BTCUSDT')"),2,'synthetic spread polluted native chart precision');
-  console.log('PASS: chart scales/OHLC, stale-state guards, layout/loading, trading controls, v5 loading, split quotes/daily changes and out-of-flow toasts');
+  // Exchange UI: NSTAR/USDT naming, pinned precision, OKX-style positions, spot assets, book and tape.
+  assert.equal(run("pairName('NSTAR')"),'NSTAR/USDT');assert.equal(run("pairName('BTCUSDT')"),'BTC/USDT');
+  run("cur.sym='NSTAR';kLoaded=false;observePrices('NSTAR',[101.24453000000001])");
+  assert.equal(run("priceText(101.24453000000001,'NSTAR')"),'101.24','NSTAR fills leaked float noise');
+  context.exState=JSON.stringify({ok:true,type:'state',symbol:'NSTAR',price:100,bid:99.97,ask:100.03,quote_valid:true,balance:9000,equity:9100,used:20,
+    leverage:100,margin_level:4.5,contract:.01,symbol_leverage:100,nstar_price:100,spot_fee:.001,
+    spot:[{sym:'NSTAR',units:2,cost:95,price:100,value:199.6,pnl:9.6}],
+    positions:[{id:7,side:'long',lots:2000,sym:'NSTAR',entry:99,now:100.1,pnl:22,margin:20,units:20,leverage:100,roe:1.1,tp:120,sl:0,liq:95.5}]});
+  run('render(JSON.parse(exState))');
+  assert.match(elements.pos.innerHTML,/NSTAR\/USDT/);assert.match(elements.pos.innerHTML,/95\.50/);
+  assert.match(elements.pos.innerHTML,/110\.00%/,'ROE missing');assert.match(elements.pos.innerHTML,/openTpsl\(7\)/);
+  assert.match(elements.spotT.innerHTML,/NSTAR/);assert.equal(elements['spot-count'].textContent,1);
+  assert.equal(elements['quote-unit'].textContent,'USDT');
+  run("$('lots').value='1000';renderOrderEstimate()");
+  assert.equal(elements['order-notional'].textContent,'1,000 USDT');assert.match(elements['order-margin'].textContent,/^10 USDT · 100x$/);
+  run("renderBook(100)");
+  assert.match(elements['book-asks'].innerHTML,/100\.05/);assert.match(elements['book-bids'].innerHTML,/99\.95/);
+  run("renderTape([[1800000000000,100.5,3],[1800000000000,99.5,-2]])");
+  assert.match(elements['tape-rows'].innerHTML,/t-buy">100\.50/);assert.match(elements['tape-rows'].innerHTML,/t-sell">99\.50/);
+  run("renderTape([])");assert.match(elements['tape-rows'].innerHTML,/暂无成交/);
+  console.log('PASS: chart scales/OHLC, stale-state guards, layout/loading, trading controls, v5 loading, split quotes/daily changes, out-of-flow toasts and exchange panels');
 })().catch(error => { console.error(error); process.exitCode = 1; });

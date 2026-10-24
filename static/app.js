@@ -269,7 +269,7 @@ function syncOrderControls(){
  document.querySelectorAll('.close-position').forEach(button=>button.disabled=orderBusy);
  $('symbol-status').textContent=orderBusy?'订单提交中，请稍候…':tradableSymbols===null?'正在获取币种配置…':allowed?'':
   tradableSymbols.length?'该币对已禁用，已有持仓仍可平仓':'暂无启用的币对，已有持仓仍可平仓';
- if(allowed&&!orderBusy&&cur.sym==='NSTAR')$('symbol-status').textContent=nstarHalted?'NSTAR 熔断中，暂停交易':'NSTAR 杠杆上限 1:20 · 大单自带冲击成本，单账户上限 5,000 枚';
+ if(allowed&&!orderBusy&&cur.sym==='NSTAR')$('symbol-status').textContent=nstarHalted?'NSTAR 熔断中，暂停交易':'NSTAR 杠杆上限 1:100 · 超大单有冲击成本，单账户上限 20,000 枚';
 }
 function applySymbols(settings){
  if(settings.version<symbolsVersion)return;

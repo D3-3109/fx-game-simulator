@@ -151,7 +151,8 @@ impl App {
         let acc = &user.account;
         let used = acc.used_margin(&prices)?;
         let equity = acc.equity(&prices)?;
-        let positions=acc.positions.iter().map(|p|Ok(json!({"id":p.id,"side":p.side,"lots":p.lots,"sym":p.symbol,"entry":p.entry,"now":if trading::depth(&p.symbol)>0.0 || prices.bid_ask.contains_key(&p.symbol) {p.exit_price(&prices)?} else {trading::market_price(&prices,&p.symbol)?},"pnl":p.pnl(&prices)?,"margin":p.margin(&prices,acc.leverage)?}))).collect::<Result<Vec<_>,String>>()?;
+        let marks = acc.marks(&prices)?;
+        let positions=acc.positions.iter().zip(marks).map(|(p,(now,pnl))|Ok(json!({"id":p.id,"side":p.side,"lots":p.lots,"sym":p.symbol,"entry":p.entry,"now":now,"pnl":pnl,"margin":p.margin(&prices,acc.leverage)?}))).collect::<Result<Vec<_>,String>>()?;
         Ok(
             json!({"ok":true,"type":"state","name":name,"symbol":user.symbol,"price":prices[&user.symbol],"bid":bid,"ask":ask,"quote_valid":quote_valid,"quote_at":if self.market.is_offline(){None}else{Some(quote.at)},"balance":acc.balance,"loan":acc.loan,"debt":acc.debt(),"debt_since":acc.debt_since,"debt_limit":trading::DEBT_LIMIT,"equity":equity,"used":used,"free":equity-used,"margin_level":if used==0.0 {None} else {Some(equity/used)},"leverage":acc.leverage,"positions":positions,"stopout_level":trading::STOPOUT,"currency":"USD","last_trade":user.last_trade}),
         )

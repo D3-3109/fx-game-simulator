@@ -315,8 +315,8 @@ fn nstar_run(sim: &mut SimFeed, t: i64, from: i64, to: i64) {
 fn nstar_flow_moves_price_by_depth_then_mostly_reverts() {
     let t = 1800000000000;
     let mut sim = SimFeed::new("NSTAR", 100.0, t);
-    // 1,000 NSTAR (~$100k) is 5% of depth: about +5.1% immediately.
-    sim.flow(1000.0, 0.0);
+    // 5% of depth (5,000 NSTAR, ~$500k): about +5.1% immediately.
+    sim.flow(0.05 * crate::trading::depth("NSTAR"), 0.0);
     let moved = sim.book.log.exp();
     assert!((moved / 100.0 - 1.0 - 0.0513).abs() < 1e-3, "{moved}");
     assert!(sim.book.events.iter().any(|e| e["kind"] == "whale"));
@@ -335,14 +335,15 @@ fn nstar_flow_moves_price_by_depth_then_mostly_reverts() {
 fn nstar_price_is_bounded_by_fair_value_and_band() {
     let t = 1800000000000;
     let mut sim = SimFeed::new("NSTAR", 100.0, t);
+    let depth = crate::trading::depth("NSTAR");
     for _ in 0..200 {
-        sim.flow(5000.0, 0.0);
+        sim.flow(0.25 * depth, 0.0);
     }
     assert!(sim.book.fair <= (400.0f64).ln() + 1e-9);
     assert!(sim.book.log <= sim.book.fair + std::f64::consts::LN_2 + 1e-9);
     assert!(sim.book.log.exp() <= 800.0 + 1e-6);
     for _ in 0..400 {
-        sim.flow(-5000.0, 0.0);
+        sim.flow(-0.25 * depth, 0.0);
     }
     assert!(sim.book.log.exp() >= 12.5 - 1e-6);
 }
@@ -353,7 +354,7 @@ fn nstar_breaker_halts_publishes_stale_price_then_resumes_with_gap() {
     let mut sim = SimFeed::new("NSTAR", 100.0, t);
     nstar_run(&mut sim, t, 1, 10);
     let before = sim.price;
-    sim.flow(4000.0, 0.0); // ~+22%: well past the 10% breaker
+    sim.flow(0.2 * crate::trading::depth("NSTAR"), 0.0); // ~+22%: well past the 10% breaker
     nstar_run(&mut sim, t, 10, 11);
     assert_eq!(sim.price, before, "halt freezes the published price");
     assert!(!sim.quote().open);

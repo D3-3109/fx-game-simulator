@@ -413,16 +413,37 @@ impl Account {
             currency: "USD".into(),
         }
     }
+    /// Mark price and floating P&L per position. Positions in a book symbol are marked
+    /// together at the average price unwinding their net size would fetch, so stacking
+    /// orders cannot inflate each other's marks.
+    pub fn marks(&self, prices: &Prices) -> Result<Vec<(f64, f64)>> {
+        let mut net = BTreeMap::<&str, f64>::new();
+        for p in self.positions.iter().filter(|p| depth(&p.symbol) > 0.0) {
+            let lots = if p.side == "long" { p.lots } else { -p.lots };
+            *net.entry(p.symbol.as_str()).or_default() += lots;
+        }
+        let mut exits = BTreeMap::new();
+        for (symbol, lots) in net {
+            exits.insert(symbol, book_price(prices, symbol, lots.abs(), lots < 0.0)?);
+        }
+        self.positions
+            .iter()
+            .map(|p| match exits.get(p.symbol.as_str()) {
+                Some(&px) => Ok((px, p.pnl_at(px, prices)?)),
+                None => {
+                    let px = if prices.bid_ask.contains_key(&p.symbol) {
+                        execution_price(prices, &p.symbol, p.side == "short")?
+                    } else {
+                        market_price(prices, &p.symbol)?
+                    };
+                    Ok((px, p.pnl_at(px, prices)?))
+                }
+            })
+            .collect()
+    }
     pub fn equity(&self, prices: &Prices) -> Result<f64> {
         finite(
-            self.balance - self.loan
-                + self
-                    .positions
-                    .iter()
-                    .map(|p| p.pnl(prices))
-                    .collect::<Result<Vec<_>>>()?
-                    .iter()
-                    .sum::<f64>(),
+            self.balance - self.loan + self.marks(prices)?.iter().map(|(_, pnl)| pnl).sum::<f64>(),
         )
     }
     pub fn used_margin(&self, prices: &Prices) -> Result<f64> {
@@ -592,11 +613,7 @@ impl Account {
             if ml.is_none_or(|v| v >= STOPOUT) {
                 break;
             }
-            let pnls = next
-                .positions
-                .iter()
-                .map(|p| p.pnl(prices))
-                .collect::<Result<Vec<_>>>()?;
+            let pnls: Vec<f64> = next.marks(prices)?.into_iter().map(|m| m.1).collect();
             let worst = pnls
                 .iter()
                 .enumerate()
@@ -783,8 +800,7 @@ mod tests {
         let p = &a.positions[0];
         // 0.001 NSTAR barely touches the book: spread dominates.
         assert!((p.entry - 100.025).abs() < 1e-5, "{}", p.entry);
-        // Account is 1:100 but NSTAR is capped at 1:20.
-        assert!((p.margin(&q, a.leverage).unwrap() - 0.005).abs() < 1e-9);
+        assert!((p.margin(&q, a.leverage).unwrap() - 0.001).abs() < 1e-6);
         let up = quotes(&[("NSTAR", 101.0)]);
         assert!((p.pnl_at(101.0, &up).unwrap() - 0.000975).abs() < 1e-5);
     }
@@ -842,33 +858,77 @@ mod tests {
             ..Account::default()
         };
         a.open("long", MAX_LOTS, "NSTAR", &q, 1, 0).unwrap();
-        // Unwinding 1,000 NSTAR into a 20,000 book costs ~2.5%: the mark says so.
+        // Unwinding 1,000 NSTAR into a 100,000 book costs ~0.5%: the mark says so.
         let pnl = a.positions[0].pnl(&q).unwrap();
-        assert!(pnl < -2_000.0, "{pnl}");
-        // Account leverage 1:50000 still margins NSTAR at 1:20.
+        assert!(pnl < -400.0, "{pnl}");
+        // Account leverage 1:50000 still margins NSTAR at 1:100.
         let margin = a.positions[0].margin(&q, a.leverage).unwrap();
-        assert!((margin - MAX_LOTS * 0.01 * 100.0 / 20.0).abs() < 1e-6);
-        for id in 2..=5 {
+        assert!((margin - MAX_LOTS * 0.01 * 100.0 / 100.0).abs() < 1e-6);
+        for id in 2..=20 {
             a.open("long", MAX_LOTS, "NSTAR", &q, id, 0).unwrap();
         }
-        // Gross cap: 5,000 NSTAR per account, longs and shorts alike.
+        // Gross cap: 20,000 NSTAR per account, longs and shorts alike.
         assert!(a.open("short", 0.01, "NSTAR", &q, 6, 0).is_err());
+    }
+    #[test]
+    fn stacked_nstar_orders_are_marked_jointly_and_cannot_inflate_equity() {
+        let q = quotes(&[("NSTAR", 100.0)]);
+        let mut a = Account {
+            balance: 1e9,
+            ..Account::default()
+        };
+        let mut live = q.clone();
+        for id in 1..=14 {
+            let t = a.open("long", MAX_LOTS, "NSTAR", &live, id, 0).unwrap();
+            apply_fill(&mut live, &t).unwrap();
+        }
+        // Each order lifted the mid for the next; marked one by one they look like a
+        // big winner, but unwinding all 14,000 NSTAR together gives the gain back.
+        let paper: f64 = a.positions.iter().map(|p| p.pnl(&live).unwrap()).sum();
+        let joint = a.equity(&live).unwrap() - a.balance;
+        assert!(paper > 0.0, "{paper}");
+        assert!(joint < 0.0, "{joint}");
+        let mut b = a.clone();
+        let realised: f64 = b
+            .close(None, &live, 1)
+            .unwrap()
+            .iter()
+            .map(|t| t.pnl.unwrap())
+            .sum();
+        // Spread is charged per slice on close but once on the joint mark: the mark is
+        // the slightly more conservative of the two.
+        assert!(
+            joint <= realised && realised - joint < joint.abs() * 0.05,
+            "{realised} vs {joint}"
+        );
+        let mut thin = Account::default();
+        let mut live = q.clone();
+        while let Ok(t) = thin.open("long", MAX_LOTS, "NSTAR", &live, thin.next_id, 0) {
+            apply_fill(&mut live, &t).unwrap();
+        }
+        assert!(
+            thin.positions.len() < 10,
+            "$10k stacked {} orders",
+            thin.positions.len()
+        );
+        assert!(thin.equity(&live).unwrap() > 0.0);
     }
     #[test]
     fn nstar_order_must_survive_its_own_impact() {
         let q = quotes(&[("NSTAR", 100.0)]);
-        let mut a = Account::default();
-        // $10k at 1:20 nominally covers $200k (2,000 NSTAR), but the ~10% round-trip
-        // impact of that size would wipe the account, so the second half is refused.
-        a.open("long", 100_000.0, "NSTAR", &q, 1, 0).unwrap();
-        let mut live = q.clone();
-        apply_fill(
-            &mut live,
-            &a.trade("open", &a.positions[0], 0.0, None, None, 0),
-        )
-        .unwrap();
-        assert!(a.open("long", 100_000.0, "NSTAR", &live, 2, 0).is_err());
-        assert_eq!(a.positions.len(), 1);
+        // $1,050 passes the plain entry check (~$1,005 margin), but after its own fill the
+        // mark drops ~$52 and margin rises to ~$1,010 at the lifted mid: refused.
+        let mut thin = Account {
+            balance: 1_050.0,
+            ..Account::default()
+        };
+        assert!(thin.open("long", MAX_LOTS, "NSTAR", &q, 1, 0).is_err());
+        assert!(thin.positions.is_empty());
+        let mut ok = Account {
+            balance: 1_200.0,
+            ..Account::default()
+        };
+        assert!(ok.open("long", MAX_LOTS, "NSTAR", &q, 1, 0).is_ok());
     }
     #[test]
     fn nstar_cascade_stopout_pays_its_own_impact() {

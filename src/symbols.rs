@@ -88,13 +88,14 @@ const fn stock(symbol: &'static str) -> Spec {
 }
 const SPECS: &[Spec] = &[
     lot(SIM, TIGHT, None),
-    // 1 lot = 0.01 NSTAR. ~200 NSTAR (~$20k) moves the price ~1%; one account tops out
-    // at 5,000 NSTAR gross (~28% impact), and its fills pay for every step of that move.
+    // 1 lot = 0.01 NSTAR. ~1,000 NSTAR (~$100k) moves the price ~1%, so ordinary orders
+    // barely notice the book; one account tops out at 20,000 NSTAR gross (~22% impact),
+    // and its fills pay for every step of that move both ways.
     Spec {
         contract: 0.01,
-        max_leverage: 20,
-        max_open_lots: 500_000.0,
-        depth: 20_000.0,
+        max_leverage: 100,
+        max_open_lots: 2_000_000.0,
+        depth: 100_000.0,
         ..coin(NSTAR)
     },
     lot("BTCUSDT", TIGHT, None),

@@ -861,12 +861,12 @@ const CONVICTION: f64 = 0.2;
 const BREAKER_WINDOW: usize = 300;
 /// ln(1.10): a 10% move from any print in the last minute halts trading.
 const BREAKER_MOVE: f64 = 0.0953;
-const HALT_TICKS: u32 = 75;
+const HALT_TICKS: u32 = 50;
 const RUMOR_LEAD: u32 = 25;
 const RUMOR_ACCURACY: f64 = 0.65;
 const NEWS_MIN_GAP: u32 = 1500;
-/// Flow that moves price by 2.5% or more is announced.
-const BIG_FLOW: f64 = 0.025;
+/// Flow that moves price by 1.5% or more (~1,500 NSTAR) is announced.
+const BIG_FLOW: f64 = 0.015;
 
 #[derive(Clone)]
 struct Book {
@@ -984,7 +984,7 @@ impl Book {
         let pct = (self.log - from).exp_m1() * 100.0;
         self.event(
             "halt",
-            format!("NSTAR 一分钟内波动 {pct:+.1}%，触发熔断，暂停交易 15 秒"),
+            format!("NSTAR 一分钟内波动 {pct:+.1}%，触发熔断，暂停交易 10 秒"),
         );
         true
     }

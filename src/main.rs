@@ -45,7 +45,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(std::io::Error::other)?,
     );
     let app = Arc::new(
-        App::new(store.clone(), market, args.admin_key).with_trusted_proxies(args.trusted_proxies),
+        App::new(store.clone(), market, args.admin_key)
+            .with_trusted_proxies(args.trusted_proxies)
+            .with_limits(fx_sim_rust::limits::Limits::from_env().map_err(std::io::Error::other)?),
     );
     let mut tasks = runtime::start(app.clone());
     eprintln!("FX Rust listening on http://{}", listener.local_addr()?);

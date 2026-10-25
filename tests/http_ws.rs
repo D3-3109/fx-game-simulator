@@ -1003,6 +1003,53 @@ async fn resting_limit_orders_fill_into_a_push_before_it_is_printed() {
 }
 
 #[tokio::test]
+async fn order_and_position_ids_are_not_limited_by_leverage() {
+    let h = Harness::new().await;
+    let token = h.register("large_ids").await;
+    h.request("/api/symbol", Some(json!({"symbol":"NSTAR"})), &token)
+        .await;
+    for _ in 0..11 {
+        let (status, v) = h
+            .request("/api/trade", Some(json!({"side":"buy","lots":1.0})), &token)
+            .await;
+        assert_eq!(status, 200, "{v}");
+    }
+    let state = h.request("/api/state", None, &token).await.1;
+    let position = state["positions"].as_array().unwrap().last().unwrap();
+    assert_eq!(position["id"], 11);
+    let mid = state["price"].as_f64().unwrap();
+    let (status, v) = h
+        .request(
+            "/api/tpsl",
+            Some(json!({"id":11,"tp":mid*1.5,"sl":mid*0.5})),
+            &token,
+        )
+        .await;
+    assert_eq!(status, 200, "{v}");
+    for _ in 0..11 {
+        let (status, v) = h
+            .request(
+                "/api/order",
+                Some(json!({"kind":"limit","side":"buy","lots":1.0,"price":1.0})),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200, "{v}");
+    }
+    let (status, v) = h
+        .request("/api/cancel", Some(json!({"id":11})), &token)
+        .await;
+    assert_eq!(status, 200, "{v}");
+    assert!(
+        v["state"]["orders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|o| o["id"] != 11)
+    );
+}
+
+#[tokio::test]
 async fn nstar_spot_limit_and_stop_orders_use_the_shared_book() {
     let h = Harness::new().await;
     let token = h.register("spot_orders").await;

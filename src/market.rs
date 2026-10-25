@@ -8,7 +8,7 @@ use crate::{
     trading::{self, Prices},
 };
 use rand::Rng;
-use rand_distr::{Distribution, StandardNormal};
+use rand_distr::{Distribution, StandardNormal, StudentT};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -727,6 +727,13 @@ struct SimFeed {
     base: f64,
     price: f64,
     trend: f64,
+    /// Independent clocks for secular, daily and burst drift; local regimes use `trend` above.
+    weekly_trend: f64,
+    weekly_left: u32,
+    day_trend: f64,
+    day_left: u32,
+    pulse_trend: f64,
+    pulse_left: u32,
     /// Order-book state; only used when the symbol has depth (NSTAR).
     book: Book,
     kind: usize,
@@ -747,6 +754,12 @@ impl SimFeed {
             base,
             price: base,
             trend: 0.0,
+            weekly_trend: 0.0,
+            weekly_left: 0,
+            day_trend: 0.0,
+            day_left: 0,
+            pulse_trend: 0.0,
+            pulse_left: 0,
             book: Book::new(base, base),
             kind: 0,
             left: 0,
@@ -937,6 +950,63 @@ impl SimFeed {
         }
         self.left -= 1;
     }
+    /// A slow moving secular benchmark: weekly direction is not pulled back to the initial
+    /// $100. New weeks lean toward a reversal, while allowing multi-week continuations.
+    fn weekly_regime(&mut self, rng: &mut impl Rng) {
+        if self.weekly_left == 0 {
+            self.weekly_left = rng.random_range(WEEKLY_TICKS);
+            let previous = self.weekly_trend.signum();
+            let direction = if previous != 0.0 && rng.random::<f64>() < 0.65 {
+                -previous
+            } else if rng.random::<bool>() {
+                1.0
+            } else {
+                -1.0
+            };
+            self.weekly_trend = direction * rng.random_range(WEEKLY_DRIFT);
+        }
+        self.weekly_left -= 1;
+    }
+    /// Slower daily waves sit between the secular background and the local market regime.
+    fn day_regime(&mut self, rng: &mut impl Rng) {
+        if self.day_left == 0 {
+            self.day_left = rng.random_range(DAY_TICKS);
+            self.day_trend = if rng.random::<f64>() < 0.25 {
+                0.0
+            } else {
+                let direction = if rng.random::<bool>() { 1.0 } else { -1.0 };
+                direction * rng.random_range(DAY_DRIFT)
+            };
+        }
+        self.day_left -= 1;
+    }
+    /// Short bursts make the game fast without turning the whole week into a one-way rail.
+    /// They usually continue the active local/daily direction, but can reverse it.
+    fn pulse_regime(&mut self, rng: &mut impl Rng) {
+        if self.pulse_left == 0 {
+            self.pulse_left = rng.random_range(PULSE_TICKS);
+            self.pulse_trend = if rng.random::<f64>() < 0.55 {
+                0.0
+            } else {
+                let parent = if self.trend != 0.0 {
+                    self.trend
+                } else if self.day_trend != 0.0 {
+                    self.day_trend
+                } else {
+                    self.weekly_trend
+                };
+                let direction = if parent != 0.0 && rng.random::<f64>() < 0.65 {
+                    parent.signum()
+                } else if rng.random::<bool>() {
+                    1.0
+                } else {
+                    -1.0
+                };
+                direction * rng.random_range(PULSE_DRIFT)
+            };
+        }
+        self.pulse_left -= 1;
+    }
     fn next_price(&mut self) -> f64 {
         if trading::depth(self.symbol) > 0.0 {
             return self.next_book_price();
@@ -974,15 +1044,24 @@ impl SimFeed {
     }
     fn next_book_price_with(&mut self, rng: &mut impl Rng) -> f64 {
         self.regime(rng);
+        self.weekly_regime(rng);
+        self.day_regime(rng);
+        self.pulse_regime(rng);
+        let trend = self.trend + self.weekly_trend + self.day_trend + self.pulse_trend;
         let volatility = match self.kind {
             0 => RANGE_VOL,
             1 => VOLATILE_VOL,
             _ => TREND_VOL,
         };
-        let shock: f64 = StandardNormal.sample(rng);
+        // Standardised Student-t(4): occasional fat-tail candles without a directional skew.
+        let shock = StudentT::new(4.0).unwrap().sample(rng) / std::f64::consts::SQRT_2;
         let drift: f64 = StandardNormal.sample(rng);
         let depth = trading::depth(self.symbol);
         let width = trading::amm_width(self.symbol);
+        if self.kind == 0 {
+            // A burst is a real short trend, not noise for the range pull to erase.
+            self.range_center += self.pulse_trend;
+        }
         let book = &mut self.book;
         // Large liquidation queues cannot turn into an unlimited market-order waterfall.
         let release = if book.backlog.abs() * LIQ_RELEASE < 1.0 {
@@ -992,16 +1071,19 @@ impl SimFeed {
         };
         book.backlog -= release;
         book.flow(release, depth, width, true);
+        // Only the secular driver moves the long-term benchmark. Daily/local moves still
+        // mean-revert, producing advances and pullbacks inside a larger weekly trajectory.
+        book.base += self.weekly_trend;
         let dev = book.fair - book.base;
         let pull = (FAIR_REVERT * (1.0 + (dev / FAIR_SOFT).powi(2))).min(0.5);
         book.fair -= pull * dev;
         if self.kind == 0 {
             book.fair += RANGE_FAIR_REVERT * (self.range_center - book.fair);
         }
-        book.fair += self.trend + drift * FAIR_VOL * volatility;
+        book.fair += trend + drift * FAIR_VOL * volatility;
         book.news(rng);
         let revert = if self.kind == 0 { RANGE_REVERT } else { REVERT };
-        book.log += revert * (book.fair - book.log) + shock * TICK_VOL * volatility + self.trend;
+        book.log += revert * (book.fair - book.log) + shock * TICK_VOL * volatility + trend;
         book.anchor += ANCHOR_FOLLOW * (book.log - book.anchor);
         // Fair value is the internal index. The book premium is bounded and smoothed, so a
         // whale must sustain a real repricing rather than wick the mark through stops.
@@ -1021,14 +1103,21 @@ impl SimFeed {
     }
 }
 
-// At five ticks per second these are 10–30 min ranges, 5–15 min volatile periods and
-// 15–45 min directional moves. Directional drift is 0.24–0.54% per minute before noise.
-const RANGE_TICKS: std::ops::RangeInclusive<u32> = 3_000..=9_000;
-const VOLATILE_TICKS: std::ops::RangeInclusive<u32> = 1_500..=4_500;
-const TREND_TICKS: std::ops::RangeInclusive<u32> = 4_500..=13_500;
-const TREND_DRIFT: std::ops::RangeInclusive<f64> = 0.000008..=0.000018;
-const RANGE_VOL: f64 = 0.65;
-const VOLATILE_VOL: f64 = 2.2;
+// Five ticks per second. Local states provide 5–36 min play, daily waves last 2–6 h,
+// and the secular background lasts 3–7 days. Burst drift is deliberately game-speed:
+// a strong 5-minute move can endanger a fully margined 10x position.
+const RANGE_TICKS: std::ops::RangeInclusive<u32> = 1_500..=4_500;
+const VOLATILE_TICKS: std::ops::RangeInclusive<u32> = 600..=2_400;
+const TREND_TICKS: std::ops::RangeInclusive<u32> = 3_600..=10_800;
+const TREND_DRIFT: std::ops::RangeInclusive<f64> = 0.000012..=0.000028;
+const WEEKLY_TICKS: std::ops::RangeInclusive<u32> = 1_296_000..=3_024_000;
+const WEEKLY_DRIFT: std::ops::RangeInclusive<f64> = 0.000_000_015..=0.000_000_05;
+const DAY_TICKS: std::ops::RangeInclusive<u32> = 36_000..=108_000;
+const DAY_DRIFT: std::ops::RangeInclusive<f64> = 0.000001..=0.000003;
+const PULSE_TICKS: std::ops::RangeInclusive<u32> = 300..=900;
+const PULSE_DRIFT: std::ops::RangeInclusive<f64> = 0.00003..=0.00005;
+const RANGE_VOL: f64 = 0.7;
+const VOLATILE_VOL: f64 = 2.8;
 const TREND_VOL: f64 = 0.9;
 const RANGE_FAIR_REVERT: f64 = std::f64::consts::LN_2 / 1_500.0;
 const RANGE_REVERT: f64 = 0.0025;

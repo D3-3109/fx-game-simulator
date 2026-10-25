@@ -91,7 +91,7 @@ fn number(body: &Value, key: &str) -> Result<f64, Failure> {
 }
 fn integer(body: &Value, key: &str) -> Result<u64, Failure> {
     let n = number(body, key)?;
-    if n < 0.0 || n.fract() != 0.0 || n > trading::MAX_LEVERAGE as f64 {
+    if n < 0.0 || n.fract() != 0.0 || n > u64::MAX as f64 {
         return Err(bad(&format!("{key} 无效")));
     }
     Ok(n as u64)

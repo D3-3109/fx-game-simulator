@@ -342,6 +342,11 @@ fn nstar_regimes_create_persistent_trends_and_local_ranges() {
     range.left = 10_000;
     range.trend = 0.0;
     range.range_center = range.book.fair;
+    for sim in [&mut bull, &mut bear, &mut range] {
+        sim.weekly_left = 100_000;
+        sim.day_left = 100_000;
+        sim.pulse_left = 100_000;
+    }
     bull.book.news_in = 100_000;
     bear.book.news_in = 100_000;
     range.book.news_in = 100_000;
@@ -375,11 +380,149 @@ fn nstar_regime_durations_are_minutes_not_seconds() {
             other => panic!("invalid regime {other}"),
         };
         assert!(expected.contains(&(sim.left + 1)));
-        assert!(sim.left >= 1_499, "{} {}", sim.kind, sim.left);
         if matches!(sim.kind, 3 | 4) {
             assert!(sim.trend.abs() >= *TREND_DRIFT.start());
         }
     }
+}
+#[test]
+fn nstar_weekly_driver_moves_the_long_term_benchmark() {
+    let t = 1800000000000;
+    let mut sim = SimFeed::new("NSTAR", 100.0, t);
+    sim.kind = 0;
+    sim.left = 500_000;
+    sim.weekly_trend = 0.000_000_05;
+    sim.weekly_left = 500_000;
+    sim.day_left = 500_000;
+    sim.pulse_left = 500_000;
+    sim.book.news_in = 1_000_000;
+    let base = sim.book.base;
+    nstar_run_seeded(&mut sim, 41, 432_000);
+    let weekly_move = sim.book.base - base;
+    assert!((weekly_move - 0.0216).abs() < 1e-9, "{weekly_move}");
+    assert!(
+        sim.book.fair.exp() > 100.0,
+        "secular trend was pulled back to $100"
+    );
+}
+
+#[test]
+fn nstar_five_minute_burst_is_strong_but_not_deterministic() {
+    let t = 1800000000000;
+    let mut base = SimFeed::new("NSTAR", 100.0, t);
+    base.kind = 0;
+    base.left = 2_000;
+    base.weekly_left = 2_000;
+    base.day_left = 2_000;
+    base.pulse_trend = 0.00005;
+    base.pulse_left = 2_000;
+    base.book.news_in = 100_000;
+    let mut returns = (0..64)
+        .map(|seed| {
+            let mut sim = base.clone();
+            let start = sim.book.log;
+            nstar_run_seeded(&mut sim, 100 + seed, 1_500);
+            sim.book.log - start
+        })
+        .collect::<Vec<_>>();
+    returns.sort_by(f64::total_cmp);
+    let percentile = |p: usize| returns[p * (returns.len() - 1) / 100];
+    println!(
+        "5-minute bullish burst p10/median/p90: {:.3}% / {:.3}% / {:.3}%",
+        percentile(10) * 100.0,
+        percentile(50) * 100.0,
+        percentile(90) * 100.0
+    );
+    assert!(percentile(50) > 0.01, "median={}", percentile(50));
+    assert!(percentile(90) > 0.04, "p90={}", percentile(90));
+    assert!(
+        percentile(10) < percentile(50),
+        "all paths became identical"
+    );
+}
+
+#[test]
+fn nstar_mixed_market_has_quiet_paths_and_fast_five_minute_tails() {
+    let t = 1800000000000;
+    let base = SimFeed::new("NSTAR", 100.0, t);
+    let mut returns = (0..256)
+        .map(|seed| {
+            let mut sim = base.clone();
+            nstar_run_seeded(&mut sim, 1_000 + seed, 1_500);
+            sim.book.log - 100.0f64.ln()
+        })
+        .collect::<Vec<_>>();
+    returns.sort_by(f64::total_cmp);
+    let signed = |p: usize| returns[p * (returns.len() - 1) / 100];
+    let mut absolute = returns.iter().map(|r| r.abs()).collect::<Vec<_>>();
+    absolute.sort_by(f64::total_cmp);
+    let abs = |p: usize| absolute[p * (absolute.len() - 1) / 100];
+    let over_five = absolute.iter().filter(|r| **r >= 0.05).count() as f64 / absolute.len() as f64;
+    println!(
+        "mixed 5-minute signed p10/median/p90: {:.2}% / {:.2}% / {:.2}%",
+        signed(10) * 100.0,
+        signed(50) * 100.0,
+        signed(90) * 100.0
+    );
+    println!(
+        "mixed 5-minute |return| median/p90/p99, >=5%: {:.2}% / {:.2}% / {:.2}%, {:.1}%",
+        abs(50) * 100.0,
+        abs(90) * 100.0,
+        abs(99) * 100.0,
+        over_five * 100.0
+    );
+    assert!(abs(50) < 0.05, "every period became a burst: {}", abs(50));
+    assert!(abs(90) > 0.015, "no fast tails: {}", abs(90));
+    assert!(
+        over_five > 0.0 && over_five < 0.8,
+        "liquidation-sized moves: {over_five}"
+    );
+}
+
+#[test]
+fn nstar_five_minute_adverse_burst_can_liquidate_10x_but_not_1x() {
+    let t = 1800000000000;
+    let initial: Prices = [("NSTAR".to_string(), 100.0)].into();
+    let open = |leverage| {
+        let mut account = Account {
+            balance: 1_000.0,
+            leverage,
+            ..Account::default()
+        };
+        let lots = account.max_open_lots("long", "NSTAR", &initial);
+        account.open("long", lots, "NSTAR", &initial, 1, 0).unwrap();
+        account
+    };
+    let mut leveraged = open(10);
+    let mut unleveraged = open(1);
+    let mut sim = SimFeed::new("NSTAR", 100.0, t);
+    sim.kind = 0;
+    sim.left = 2_000;
+    sim.weekly_left = 2_000;
+    sim.day_left = 2_000;
+    sim.pulse_trend = -0.00005;
+    sim.pulse_left = 2_000;
+    sim.book.news_in = 100_000;
+    nstar_run_seeded(&mut sim, 57, 1_500);
+    let mut live: Prices = [("NSTAR".to_string(), sim.book.log.exp())].into();
+    live.anchor.insert("NSTAR".into(), sim.book.anchor);
+    live.mark.insert("NSTAR".into(), sim.book.mark.exp());
+    assert!(
+        sim.book.log.exp() < 95.0,
+        "scenario requires a >5% adverse move"
+    );
+    assert!(
+        !leveraged
+            .check_stopout_at(&live.marked(), &live, 1)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        unleveraged
+            .check_stopout_at(&live.marked(), &live, 1)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -556,11 +699,14 @@ fn nstar_price_has_no_hard_ceiling_or_floor_and_stays_finite() {
     s.book.fair = 400.0f64.ln();
     s.book.log = s.book.fair;
     s.book.anchor = s.book.fair;
-    nstar_run(&mut s, t, 1, 18_000);
+    s.weekly_left = 20_000;
+    s.day_left = 20_000;
+    s.pulse_left = 20_000;
+    nstar_run_seeded(&mut s, 99, 18_000);
     let fair = s.book.fair.exp();
-    assert!(fair > 90.0 && fair < 165.0, "{fair}");
+    assert!(fair > 80.0 && fair < 165.0, "{fair}");
     let price = s.book.log.exp();
-    assert!(price > 80.0 && price < 200.0, "{price}");
+    assert!(price > 60.0 && price < 200.0, "{price}");
 }
 
 #[test]

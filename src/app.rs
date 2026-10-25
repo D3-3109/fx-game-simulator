@@ -219,7 +219,7 @@ impl App {
         let mut spot = Vec::new();
         for (symbol, h) in &acc.spot {
             let mid = trading::market_price(&prices, symbol)?;
-            let value = trading::sweep(mid, -h.units, trading::depth(symbol))
+            let value = trading::book_fill(&prices, symbol, mid, -h.units)?.0
                 * h.units
                 * (1.0 - trading::SPOT_FEE);
             spot.push(

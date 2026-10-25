@@ -12,6 +12,9 @@ pub const LOAN_RATE: f64 = 0.10;
 pub const SPOT_FEE: f64 = 0.001;
 pub const SPOT_MIN: f64 = 0.0001;
 pub const SPOT_MAX: f64 = 10_000.0;
+/// Slowest the book anchor may be ignored: displacements beyond this many widths are
+/// solved on the clamped value so `sinh`/`exp` stay finite for absurd inputs.
+const AMM_MAX_C: f64 = 1e12;
 fn cents(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
 }
@@ -19,6 +22,8 @@ fn cents(value: f64) -> f64 {
 pub struct Prices {
     pub mid: BTreeMap<String, f64>,
     pub bid_ask: BTreeMap<String, (f64, f64)>,
+    /// Log-price anchor of each elastic book; absent means "centred on the current mid".
+    pub anchor: BTreeMap<String, f64>,
 }
 impl Prices {
     pub fn new() -> Self {
@@ -26,6 +31,7 @@ impl Prices {
     }
     pub fn remove(&mut self, symbol: &str) -> Option<f64> {
         self.bid_ask.remove(symbol);
+        self.anchor.remove(symbol);
         self.mid.remove(symbol)
     }
     pub fn insert(&mut self, symbol: String, price: f64) -> Option<f64> {
@@ -43,7 +49,7 @@ impl FromIterator<(String, f64)> for Prices {
     fn from_iter<T: IntoIterator<Item = (String, f64)>>(iter: T) -> Self {
         Self {
             mid: iter.into_iter().collect(),
-            bid_ask: BTreeMap::new(),
+            ..Self::default()
         }
     }
 }
@@ -129,15 +135,64 @@ pub fn leverage_for(symbol: &str, leverage: u64) -> u64 {
     }
 }
 
-/// Average price for sweeping `units` (positive buys) through a book whose log price moves
-/// `units / depth`. Prices depend only on cumulative flow, so a split order costs the same.
-pub fn sweep(mid: f64, units: f64, depth: f64) -> f64 {
-    let d = units / depth;
-    if d.abs() < 1e-12 {
-        mid
-    } else {
-        mid * d.exp_m1() / d
+/// Elastic AMM width of a book symbol (0: constant depth).
+pub fn amm_width(symbol: &str) -> f64 {
+    symbols::spec(symbol).map_or(0.0, |s| s.amm_width)
+}
+
+/// Book inventory curve: liquidity at displacement `x` (log price minus anchor) is
+/// `depth · (1 + x²/w²)`, so the units absorbed between the anchor and `x` are
+/// `depth · (x + x³ / 3w²)`. This returns the displacement after trading `units`
+/// (positive buys) from `x0`. The curve is a pure function of inventory, so a fixed anchor
+/// keeps every fill path-independent: split orders cost the same and a round trip lands
+/// back where it started.
+pub fn amm_shift(x0: f64, units: f64, depth: f64, width: f64) -> f64 {
+    if width <= 0.0 {
+        return x0 + units / depth;
     }
+    let c = (x0 + x0.powi(3) / (3.0 * width * width) + units / depth).clamp(-AMM_MAX_C, AMM_MAX_C);
+    // Unique real root of x³/3w² + x = c (trigonometric/hyperbolic Cardano, no cancellation).
+    let x = 2.0 * width * ((3.0 * c / (2.0 * width)).asinh() / 3.0).sinh();
+    // One Newton step polishes the last ulps.
+    let w2 = width * width;
+    x - (x + x.powi(3) / (3.0 * w2) - c) / (1.0 + x * x / w2)
+}
+
+/// Average fill price over mid (the price at `x0`) for moving the book from `x0` to `x1`.
+/// Closed form of ∫e^x(1 + x²/w²)dx over the units absorbed; equals (e^Δ − 1)/Δ on a flat book.
+pub fn amm_avg(x0: f64, x1: f64, width: f64) -> f64 {
+    let d = x1 - x0;
+    let growth = if d.abs() < 1e-12 { 1.0 } else { d.exp_m1() / d };
+    if width <= 0.0 {
+        return growth;
+    }
+    let w2 = width * width;
+    let num = growth * (1.0 + (x1 * x1 - 2.0 * x1 + 2.0) / w2) + (x1 + x0 - 2.0) / w2;
+    let den = 1.0 + (x1 * x1 + x1 * x0 + x0 * x0) / (3.0 * w2);
+    num / den
+}
+
+/// Current displacement of a book symbol from its anchor; 0 without an anchor.
+fn displacement(prices: &Prices, symbol: &str, mid: f64) -> f64 {
+    match prices.anchor.get(symbol) {
+        Some(a) if a.is_finite() && amm_width(symbol) > 0.0 => mid.ln() - a,
+        _ => 0.0,
+    }
+}
+
+/// Sweep `units` (positive buys) through a book symbol: (average fill, mid afterwards).
+pub fn book_fill(prices: &Prices, symbol: &str, mid: f64, units: f64) -> Result<(f64, f64)> {
+    let depth = depth(symbol);
+    if depth <= 0.0 {
+        return Err("该币种没有模拟盘口".into());
+    }
+    let width = amm_width(symbol);
+    let x0 = displacement(prices, symbol, mid);
+    let x1 = amm_shift(x0, units, depth, width);
+    Ok((
+        finite(mid * amm_avg(x0, x1, width))?,
+        finite(mid * (x1 - x0).exp())?,
+    ))
 }
 
 /// Move a book symbol's local mid by a fill, so later checks in the same operation see it.
@@ -155,9 +210,17 @@ pub fn apply_fill(prices: &mut Prices, trade: &Trade) -> Result<()> {
     }
     let units = trade.lots * contract(&trade.symbol) * if buy { 1.0 } else { -1.0 };
     let mid = market_price(prices, &trade.symbol)?;
-    prices
-        .mid
-        .insert(trade.symbol.clone(), finite(mid * (units / depth).exp())?);
+    // The curve must stay put for the rest of the operation: pin a missing anchor to the
+    // pre-fill mid, or every later fill would re-centre on the moved price and stacked
+    // orders could mark themselves up.
+    if amm_width(&trade.symbol) > 0.0 {
+        prices
+            .anchor
+            .entry(trade.symbol.clone())
+            .or_insert(mid.ln());
+    }
+    let (_, after) = book_fill(prices, &trade.symbol, mid, units)?;
+    prices.mid.insert(trade.symbol.clone(), after);
     Ok(())
 }
 
@@ -166,7 +229,7 @@ fn book_price(prices: &Prices, symbol: &str, lots: f64, buy: bool) -> Result<f64
     let mid = market_price(prices, symbol)?;
     let units = lots * contract(symbol) * if buy { 1.0 } else { -1.0 };
     let half = spread(symbol, mid) / 2.0;
-    let px = sweep(mid, units, depth(symbol)) + if buy { half } else { -half };
+    let px = book_fill(prices, symbol, mid, units)?.0 + if buy { half } else { -half };
     if !px.is_finite() || px <= 0.0 {
         return Err("成交价无效".into());
     }
@@ -652,7 +715,7 @@ impl Account {
         let mut total = 0.0;
         for (symbol, h) in self.spot.iter().filter(|(_, h)| h.units > 0.0) {
             let mid = market_price(prices, symbol)?;
-            let px = sweep(mid, -h.units, depth(symbol)) * (1.0 - SPOT_FEE);
+            let px = book_fill(prices, symbol, mid, -h.units)?.0 * (1.0 - SPOT_FEE);
             total += px * h.units;
         }
         finite(total)
@@ -668,8 +731,15 @@ impl Account {
             return Err(format!("现货数量需在 {SPOT_MIN} 至 {SPOT_MAX} 之间"));
         }
         self.validate()?;
+        let cap = symbols::spec(symbol).map_or(0.0, |s| s.max_spot_units);
+        let held = self.spot.get(symbol).map_or(0.0, |h| h.units);
+        if cap > 0.0 && units > 0.0 && held + units > cap + 1e-9 {
+            return Err(format!(
+                "{symbol} 现货单账户持有上限 {cap}，当前已持 {held:.4}"
+            ));
+        }
         let mid = market_price(prices, symbol)?;
-        let avg = sweep(mid, units, depth);
+        let (avg, _) = book_fill(prices, symbol, mid, units)?;
         let holding = self.spot.entry(symbol.into()).or_default();
         let (side, pnl) = if units > 0.0 {
             let cost = finite(avg * units * (1.0 + SPOT_FEE))?;
@@ -1201,6 +1271,113 @@ mod tests {
         assert_eq!(trades.len(), 3);
         // Each forced sale fills lower than the one before.
         assert!(trades[0].price > trades[1].price && trades[1].price > trades[2].price);
+    }
+    #[test]
+    fn amm_curve_inverts_its_inventory_and_matches_flat_book_without_width() {
+        let (depth, w) = (50_000.0, 0.08);
+        let inv = |x: f64| depth * (x + x.powi(3) / (3.0 * w * w));
+        for x0 in [-0.6, -0.1, 0.0, 0.03, 0.4] {
+            for units in [-1e6, -20_000.0, -1.0, 1e-6, 750.0, 20_000.0, 1e6] {
+                let x1 = amm_shift(x0, units, depth, w);
+                let err = (inv(x1) - inv(x0) - units).abs();
+                assert!(err <= 1e-6 * units.abs().max(1.0), "{x0} {units}: {err}");
+                if units.abs() < 1.0 {
+                    // x1 - x0 is ~1e-13 here: a numeric reference would only measure rounding.
+                    assert!((amm_avg(x0, x1, w) - 1.0).abs() < 1e-9);
+                    continue;
+                }
+                // Average fill equals the integral of price over inventory (Simpson).
+                let n = 2000;
+                let h = (x1 - x0) / n as f64;
+                let f = |x: f64| (x - x0).exp() * (1.0 + x * x / (w * w));
+                let mut sum = f(x0) + f(x1);
+                for i in 1..n {
+                    sum += f(x0 + i as f64 * h) * if i % 2 == 1 { 4.0 } else { 2.0 };
+                }
+                let avg = sum * h / 3.0 * depth / units;
+                let got = amm_avg(x0, x1, w);
+                assert!(
+                    (got - avg).abs() < 1e-6 * avg,
+                    "{x0} {units}: {got} vs {avg}"
+                );
+            }
+        }
+        // width 0 is exactly the old constant-depth sweep.
+        let d = 20_000.0 / depth;
+        assert_eq!(amm_shift(0.1, 20_000.0, depth, 0.0), 0.1 + d);
+        assert!((amm_avg(0.1, 0.1 + d, 0.0) - d.exp_m1() / d).abs() < 1e-15);
+        assert!((amm_avg(0.2, 0.2, w) - 1.0).abs() < 1e-12);
+    }
+    #[test]
+    fn amm_curve_damps_big_pushes_but_not_small_trades() {
+        let q = quotes(&[("NSTAR", 100.0)]);
+        let lift = |units: f64| book_fill(&q, "NSTAR", 100.0, units).unwrap().1 / 100.0 - 1.0;
+        // 1,000 NSTAR: ~2%, same as the flat book.
+        assert!((lift(1_000.0) - 0.02).abs() < 0.001, "{}", lift(1_000.0));
+        // 20,000 NSTAR: ~18% (flat book +49%); 100,000: ~37% (flat book 7x).
+        assert!(lift(20_000.0) < 0.19, "{}", lift(20_000.0));
+        assert!(lift(100_000.0) < 0.38, "{}", lift(100_000.0));
+        assert!(lift(-100_000.0) > -0.28, "{}", lift(-100_000.0));
+        // Already pushed 20% above the anchor, the next 1,000 NSTAR barely moves it.
+        let mut far = q.clone();
+        far.anchor.insert("NSTAR".into(), (100.0f64 / 1.2).ln());
+        let next = book_fill(&far, "NSTAR", 100.0, 1_000.0).unwrap().1 / 100.0 - 1.0;
+        assert!(next < 0.005, "{next}");
+    }
+    #[test]
+    fn amm_fills_stay_path_independent_off_anchor() {
+        let mut q = quotes(&[("NSTAR", 130.0)]);
+        q.anchor.insert("NSTAR".into(), 100.0f64.ln());
+        let mut one = Account {
+            balance: 1e9,
+            ..Account::default()
+        };
+        let big = one.open("long", 1_000_000.0, "NSTAR", &q, 1, 0);
+        assert!(big.is_err(), "per-order lot cap");
+        let big = one.open("long", 100_000.0, "NSTAR", &q, 1, 0).unwrap();
+        let mut many = Account {
+            balance: 1e9,
+            ..Account::default()
+        };
+        let mut live = q.clone();
+        let mut cost = 0.0;
+        for i in 0..20 {
+            let t = many
+                .open("long", 5_000.0, "NSTAR", &live, i + 1, 0)
+                .unwrap();
+            apply_fill(&mut live, &t).unwrap();
+            cost += t.price * 5_000.0;
+        }
+        let rel = (cost / 100_000.0 - big.price) / big.price;
+        assert!(
+            rel.abs() < 1e-3,
+            "split {} vs sweep {}",
+            cost / 1e5,
+            big.price
+        );
+        // Unwinding everything lands back on the starting mid: no free lunch from the curve.
+        let closed = many.close(None, &live, 1).unwrap();
+        for t in &closed {
+            apply_fill(&mut live, t).unwrap();
+        }
+        assert!((live["NSTAR"] - 130.0).abs() < 1e-6, "{}", live["NSTAR"]);
+        assert!(closed.iter().map(|t| t.pnl.unwrap()).sum::<f64>() < 0.0);
+    }
+    #[test]
+    fn nstar_spot_holding_is_capped_per_account() {
+        let q = quotes(&[("NSTAR", 100.0)]);
+        let mut a = Account {
+            balance: 1e9,
+            ..Account::default()
+        };
+        a.spot("NSTAR", 10_000.0, &q, 1).unwrap();
+        a.spot("NSTAR", 10_000.0, &q, 2).unwrap();
+        let before = a.clone();
+        assert!(a.spot("NSTAR", 0.01, &q, 3).is_err());
+        assert_eq!(a, before, "refused buy leaves the account untouched");
+        // Selling is always allowed, and frees room to buy again.
+        a.spot("NSTAR", -5_000.0, &q, 4).unwrap();
+        a.spot("NSTAR", 5_000.0, &q, 5).unwrap();
     }
     #[test]
     fn invalid_numbers_and_directions_do_not_mutate() {

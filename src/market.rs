@@ -29,6 +29,8 @@ pub struct Quote {
     pub received_at: i64,
     pub bid_ask: Option<(f64, f64)>,
     pub open: bool,
+    /// Log-price anchor of an elastic simulated book (NSTAR); None for external quotes.
+    pub anchor: Option<f64>,
 }
 impl Quote {
     fn single(price: f64, at: i64) -> Self {
@@ -38,6 +40,7 @@ impl Quote {
             received_at: now_ms(),
             bid_ask: None,
             open: true,
+            anchor: None,
         }
     }
     pub fn fresh(self, now: i64) -> bool {
@@ -170,6 +173,9 @@ impl Market {
         for symbol in trading::price_symbols(symbols)? {
             let q = self.quote(&symbol).await?;
             out.insert(symbol.clone(), valid(q.price)?);
+            if let Some(anchor) = q.anchor {
+                out.anchor.insert(symbol.clone(), anchor);
+            }
             if let Some(book) = q.bid_ask {
                 out.bid_ask.insert(symbol, book);
             }
@@ -429,6 +435,9 @@ impl Market {
                     continue;
                 }
                 prices.insert(s.clone(), q.price);
+                if let Some(anchor) = q.anchor {
+                    prices.anchor.insert(s.clone(), anchor);
+                }
                 if let Some(book) = q.bid_ask {
                     prices.bid_ask.insert(s.clone(), book);
                 }
@@ -475,7 +484,7 @@ impl Market {
     pub async fn tick_sim(&self) -> Result<Value> {
         Ok(self.tick_feed(&self.sim).await?.0)
     }
-    /// One NSTAR tick: the packet, plus market events (rumors, news, halts, whales) for everyone.
+    /// One NSTAR tick: the packet, plus market events (rumors, news, whales) for everyone.
     pub async fn tick_nstar(&self) -> Result<(Value, Vec<Value>)> {
         self.tick_feed(&self.nstar).await
     }
@@ -529,10 +538,12 @@ pub struct NstarDesk<'a> {
     feed: tokio::sync::MutexGuard<'a, SimFeed>,
 }
 impl NstarDesk<'_> {
-    /// Price NSTAR from the live book; refuses while the circuit breaker holds trading.
+    /// Price NSTAR from the live book: unrounded mid plus the AMM anchor fills are priced on.
     pub fn price(&self, prices: &mut Prices) -> Result<()> {
-        let mid = self.feed.live_mid().ok_or("NSTAR 熔断中，暂停交易")?;
-        prices.insert(symbols::NSTAR.into(), mid);
+        prices.insert(symbols::NSTAR.into(), self.feed.book.log.exp());
+        prices
+            .anchor
+            .insert(symbols::NSTAR.into(), self.feed.book.anchor);
         Ok(())
     }
     /// Move the book by the committed flow and publish the new price before unlocking.
@@ -616,6 +627,7 @@ pub fn biquote_quote(data: &Value, symbol: &str, now: i64) -> Result<Quote> {
         received_at: now,
         bid_ask: Some((bid, ask)),
         open: state == "open" && !stale,
+        anchor: None,
     })
 }
 
@@ -774,7 +786,7 @@ impl SimFeed {
     }
     fn quote(&self) -> Quote {
         Quote {
-            open: self.book.halt == 0,
+            anchor: (trading::depth(self.symbol) > 0.0).then_some(self.book.anchor),
             ..Quote::single(self.price, self.updated_at)
         }
     }
@@ -816,7 +828,8 @@ impl SimFeed {
             "open_24h": open, "high_24h": high, "low_24h": low,
             "volume_24h": volume, "turnover_24h": volume * self.price,
             "fair": self.book.fair.exp(), "funding_rate": self.book.funding_rate(),
-            "halted": self.book.halt > 0, "depth": trading::depth(self.symbol),
+            "depth": trading::depth(self.symbol),
+            "anchor": self.book.anchor.exp(), "amm_width": trading::amm_width(self.symbol),
             "tape": tape,
         })
     }
@@ -864,8 +877,8 @@ impl SimFeed {
             .round()
             / 1e5
     }
-    /// Log-price walk around a drifting fair value, with news shocks and a circuit breaker.
-    /// While halted the book keeps moving unpublished, so trading resumes with a gap.
+    /// Log-price walk around a drifting fair value, with news shocks. The AMM anchor trails
+    /// the book slowly, so liquidity re-centres on sustained moves but not on spikes.
     fn next_book_price(&mut self) -> f64 {
         let mut rng = rand::rng();
         self.regime(&mut rng);
@@ -885,23 +898,17 @@ impl SimFeed {
         book.news(&mut rng);
         book.log += REVERT * (book.fair - book.log) + shock + self.trend;
         book.clamp();
-        if book.breaker(self.price, &mut rng) {
-            self.price
-        } else {
-            book.published()
-        }
+        book.anchor += ANCHOR_FOLLOW * (book.log - book.anchor);
+        book.published()
     }
     /// Apply player and liquidation flow (signed units) to the book right away.
     fn flow(&mut self, units: f64, forced: f64) {
         let depth = trading::depth(self.symbol);
         if depth > 0.0 {
-            self.book.flow(units, depth, false);
-            self.book.flow(forced, depth, true);
+            let width = trading::amm_width(self.symbol);
+            self.book.flow(units, depth, width, false);
+            self.book.flow(forced, depth, width, true);
         }
-    }
-    /// Unrounded mid the next fill is priced from; None while the breaker holds trading.
-    fn live_mid(&self) -> Option<f64> {
-        (self.book.halt == 0).then(|| self.book.log.exp())
     }
 }
 
@@ -917,11 +924,8 @@ const REVERT: f64 = 0.0015;
 const STRETCH: f64 = std::f64::consts::LN_2;
 /// Share of flow impact that becomes fair value instead of reverting.
 const CONVICTION: f64 = 0.35;
-const BREAKER_WINDOW: usize = 300;
-/// ln(1.10): a 10% move from any print in the last minute halts trading.
-const BREAKER_MOVE: f64 = 0.0953;
-/// Halts last 2-3 s (10-15 ticks).
-const HALT_TICKS: std::ops::RangeInclusive<u32> = 10..=15;
+/// Per-tick pull of the AMM anchor toward the book: a gap halves in ~5 min (1,500 ticks).
+const ANCHOR_FOLLOW: f64 = std::f64::consts::LN_2 / 1500.0;
 const RUMOR_LEAD: u32 = 25;
 const RUMOR_ACCURACY: f64 = 0.65;
 const NEWS_MIN_GAP: u32 = 1500;
@@ -930,17 +934,17 @@ const TAPE_LEN: usize = 60;
 /// Funding charges this share of the hourly price-over-fair premium, capped per hour.
 const FUNDING_SHARE: f64 = 0.1;
 const FUNDING_CAP: f64 = 0.0075;
-/// Flow that moves price by 3% or more (~1,500 NSTAR) is announced.
+/// Flow that moves price by 3% or more (~1,500 NSTAR near the anchor) is announced.
 const BIG_FLOW: f64 = 0.03;
 
 #[derive(Clone)]
 struct Book {
-    /// True log price; while halted it keeps moving but is not published.
+    /// True log price.
     log: f64,
     fair: f64,
     base: f64,
-    halt: u32,
-    window: VecDeque<f64>,
+    /// Slow-moving log-price centre of the elastic AMM curve.
+    anchor: f64,
     news_in: u32,
     pending: Option<f64>,
     events: Vec<Value>,
@@ -957,8 +961,7 @@ impl Book {
             log,
             fair: log,
             base: lb,
-            halt: 0,
-            window: VecDeque::from([log]),
+            anchor: log,
             news_in: NEWS_MIN_GAP,
             pending: None,
             events: Vec::new(),
@@ -1024,42 +1027,6 @@ impl Book {
             self.news_in = NEWS_MIN_GAP + gap.min(mean * 6.0) as u32;
         }
     }
-    /// True while halted. Trips when price moves 10% from any print in the last minute.
-    fn breaker(&mut self, last: f64, rng: &mut impl Rng) -> bool {
-        if self.halt > 0 {
-            self.halt -= 1;
-            if self.halt > 0 {
-                return true;
-            }
-            self.window = VecDeque::from([self.log]);
-            let gap = (self.log.exp() / last - 1.0) * 100.0;
-            self.event("resume", format!("NSTAR 恢复交易，跳空 {gap:+.1}%"));
-            return false;
-        }
-        self.window.push_back(self.log);
-        if self.window.len() > BREAKER_WINDOW {
-            self.window.pop_front();
-        }
-        let (lo, hi) = self
-            .window
-            .iter()
-            .fold((f64::MAX, f64::MIN), |(lo, hi), x| (lo.min(*x), hi.max(*x)));
-        let from = if self.log - lo > BREAKER_MOVE {
-            lo
-        } else if hi - self.log > BREAKER_MOVE {
-            hi
-        } else {
-            return false;
-        };
-        self.halt = rng.random_range(HALT_TICKS);
-        let pct = (self.log - from).exp_m1() * 100.0;
-        let secs = self.halt as f64 * 0.2;
-        self.event(
-            "halt",
-            format!("NSTAR 一分钟内波动 {pct:+.1}%，触发熔断，暂停交易 {secs:.1} 秒"),
-        );
-        true
-    }
     fn print(&mut self, price: f64, units: f64) {
         let now = now_ms();
         self.tape.push_back([now as f64, price, units]);
@@ -1079,13 +1046,15 @@ impl Book {
     fn funding_rate(&self) -> f64 {
         ((self.log - self.fair) * FUNDING_SHARE).clamp(-FUNDING_CAP, FUNDING_CAP)
     }
-    /// Signed units bought (+) or sold (-) move the book immediately.
-    fn flow(&mut self, units: f64, depth: f64, forced: bool) {
+    /// Signed units bought (+) or sold (-) move the book immediately along the AMM curve.
+    fn flow(&mut self, units: f64, depth: f64, width: f64, forced: bool) {
         if units == 0.0 {
             return;
         }
-        let d = units / depth;
-        let avg = self.log.exp() * d.exp_m1() / d;
+        let x0 = self.log - self.anchor;
+        let x1 = trading::amm_shift(x0, units, depth, width);
+        let d = x1 - x0;
+        let avg = self.log.exp() * trading::amm_avg(x0, x1, width);
         self.log += d;
         self.fair += CONVICTION * d;
         self.clamp();

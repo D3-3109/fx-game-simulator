@@ -118,7 +118,7 @@ async fn nstar_desk<'a>(app: &'a App, symbols: &[&str]) -> Option<NstarDesk<'a>>
         None
     }
 }
-/// Apply committed NSTAR flow and publish the moved price and any whale/halt alerts.
+/// Apply committed NSTAR flow and publish the moved price and any whale alerts.
 async fn commit(app: &App, desk: Option<NstarDesk<'_>>) {
     let Some(desk) = desk else { return };
     match desk.commit().await {

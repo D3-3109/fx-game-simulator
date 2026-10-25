@@ -151,6 +151,7 @@ async fn fx_source_sides_match_state_fills_marks_closes_and_closed_market_reject
         received_at: now_ms(),
         bid_ask: Some((150.009, 150.021)),
         open: true,
+        anchor: None,
     };
     h.app.market.on_market_quote("USDJPY", q).await.unwrap();
     let state = h.request("/api/state", None, &token).await.1;

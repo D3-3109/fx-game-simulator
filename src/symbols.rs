@@ -39,8 +39,15 @@ pub struct Spec {
     pub max_leverage: u64,
     /// Gross open lots one account may hold in this symbol; 0 means only the per-order cap.
     pub max_open_lots: f64,
-    /// Units that move the price by one log unit (e≈2.72x); 0 means no simulated order book.
+    /// Units that move the price by one log unit (e≈2.72x) near the anchor; 0 means no
+    /// simulated order book.
     pub depth: f64,
+    /// Elastic AMM width (log units). Liquidity at displacement `x` from the book's slow
+    /// anchor is `depth · (1 + (x / width)²)`, so small trades feel the plain `depth` while
+    /// pushing the price far needs ever more size. 0 keeps the constant-depth book.
+    pub amm_width: f64,
+    /// Spot units one account may hold in this symbol; 0 means no holding cap.
+    pub max_spot_units: f64,
 }
 const TIGHT: f64 = 0.0002;
 const WIDE: f64 = 0.02;
@@ -56,6 +63,8 @@ const fn lot(symbol: &'static str, spread: f64, settle: Option<&'static str>) ->
         max_leverage: 0,
         max_open_lots: 0.0,
         depth: 0.0,
+        amm_width: 0.0,
+        max_spot_units: 0.0,
     }
 }
 const fn coin(symbol: &'static str) -> Spec {
@@ -70,6 +79,8 @@ const fn coin(symbol: &'static str) -> Spec {
         max_leverage: 0,
         max_open_lots: 0.0,
         depth: 0.0,
+        amm_width: 0.0,
+        max_spot_units: 0.0,
     }
 }
 const fn stock(symbol: &'static str) -> Spec {
@@ -84,18 +95,24 @@ const fn stock(symbol: &'static str) -> Spec {
         max_leverage: 0,
         max_open_lots: 0.0,
         depth: 0.0,
+        amm_width: 0.0,
+        max_spot_units: 0.0,
     }
 }
 const SPECS: &[Spec] = &[
     lot(SIM, TIGHT, None),
-    // 1 lot = 0.01 NSTAR. ~500 NSTAR (~$50k) moves the price ~1%; one account tops out at
-    // 20,000 NSTAR gross (~49% impact). Fills pay for every step of a move both ways, so a
-    // pump only pays off for whoever sells into someone else's buying.
+    // 1 lot = 0.01 NSTAR. ~500 NSTAR (~$50k) moves the price ~1% near the anchor. The
+    // elastic curve thickens away from it: 20,000 NSTAR lifts ~18% (49% on a flat book),
+    // 100,000 ~37% (flat: 7x). One account holds at most 20,000 NSTAR gross in perpetuals
+    // plus 20,000 spot. Fills pay for every step of a move both ways, so a pump only pays
+    // off for whoever sells into someone else's buying.
     Spec {
         contract: 0.01,
         max_leverage: 100,
         max_open_lots: 2_000_000.0,
         depth: 50_000.0,
+        amm_width: 0.08,
+        max_spot_units: 20_000.0,
         ..coin(NSTAR)
     },
     lot("BTCUSDT", TIGHT, None),

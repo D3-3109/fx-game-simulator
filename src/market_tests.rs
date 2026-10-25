@@ -322,10 +322,10 @@ fn nstar_run(sim: &mut SimFeed, t: i64, from: i64, to: i64) {
 fn nstar_flow_moves_price_by_depth_then_mostly_reverts() {
     let t = 1800000000000;
     let mut sim = SimFeed::new("NSTAR", 100.0, t);
-    // 5% of depth (5,000 NSTAR, ~$500k): about +5.1% immediately.
+    // 5% of depth (2,500 NSTAR, ~$250k): +5.1% on a flat book, ~+4.6% on the AMM curve.
     sim.flow(0.05 * crate::trading::depth("NSTAR"), 0.0);
     let moved = sim.book.log.exp();
-    assert!((moved / 100.0 - 1.0 - 0.0513).abs() < 1e-3, "{moved}");
+    assert!((moved / 100.0 - 1.0 - 0.0461).abs() < 1e-3, "{moved}");
     assert!(sim.book.events.iter().any(|e| e["kind"] == "whale"));
     // Within ~5 minutes most of the push is gone; only conviction (20%) and noise remain.
     let mut errs = Vec::new();
@@ -336,6 +336,31 @@ fn nstar_flow_moves_price_by_depth_then_mostly_reverts() {
     }
     let mean = errs.iter().sum::<f64>() / errs.len() as f64;
     assert!(mean.abs() < 0.02, "price should rejoin fair value: {mean}");
+}
+
+#[test]
+fn nstar_anchor_trails_slowly_and_big_flow_never_halts() {
+    let t = 1800000000000;
+    let mut sim = SimFeed::new("NSTAR", 100.0, t);
+    let start = sim.book.anchor;
+    // 40,000 NSTAR at once: ~+25% on the AMM curve (flat book: +122%, then the clamp).
+    sim.flow(40_000.0, 0.0);
+    let lifted = sim.book.log - start;
+    assert!(lifted < 0.23, "{lifted}");
+    assert_eq!(sim.book.anchor, start, "flow never drags the anchor");
+    // No circuit breaker: the next tick publishes the moved price and trading stays open.
+    nstar_run(&mut sim, t, 1, 2);
+    assert!(sim.price > 115.0, "{}", sim.price);
+    assert!(sim.quote().open);
+    assert!(sim.quote().anchor.is_some());
+    assert!(!sim.book.events.iter().any(|e| e["kind"] == "halt"));
+    // The anchor re-centres in minutes, not ticks.
+    let after_tick = sim.book.anchor - start;
+    assert!(after_tick > 0.0 && after_tick < 0.001, "{after_tick}");
+    let mut s = sim.clone();
+    nstar_run(&mut s, t, 2, 1500);
+    let caught = (s.book.anchor - start) / (sim.book.log - start);
+    assert!(caught > 0.05 && caught < 0.8, "{caught}");
 }
 
 #[test]
@@ -353,27 +378,6 @@ fn nstar_price_is_bounded_by_fair_value_and_band() {
         sim.flow(-0.25 * depth, 0.0);
     }
     assert!(sim.book.log.exp() >= 12.5 - 1e-6);
-}
-
-#[test]
-fn nstar_breaker_halts_publishes_stale_price_then_resumes_with_gap() {
-    let t = 1800000000000;
-    let mut sim = SimFeed::new("NSTAR", 100.0, t);
-    nstar_run(&mut sim, t, 1, 10);
-    let before = sim.price;
-    sim.flow(0.2 * crate::trading::depth("NSTAR"), 0.0); // ~+22%: well past the 10% breaker
-    nstar_run(&mut sim, t, 10, 11);
-    assert_eq!(sim.price, before, "halt freezes the published price");
-    assert!(!sim.quote().open);
-    assert!(sim.live_mid().is_none());
-    assert!(sim.book.events.iter().any(|e| e["kind"] == "halt"));
-    nstar_run(&mut sim, t, 11, 11 + *HALT_TICKS.end() as i64);
-    assert!(sim.quote().open);
-    assert!(sim.book.events.iter().any(|e| e["kind"] == "resume"));
-    assert!(
-        sim.price > before * 1.05,
-        "resume gaps toward the true price"
-    );
 }
 
 #[test]

@@ -281,7 +281,7 @@ function syncOrderControls(){
  document.querySelectorAll('.close-position').forEach(button=>button.disabled=orderBusy);
  $('symbol-status').textContent=orderBusy?'订单提交中，请稍候…':tradableSymbols===null?'正在获取币种配置…':allowed?'':
   tradableSymbols.length?'该币对已禁用，已有持仓仍可平仓':'暂无启用的币对，已有持仓仍可平仓';
- if(allowed&&!orderBusy&&cur.sym==='NSTAR')$('symbol-status').textContent=nstarHalted?'NSTAR 熔断中，暂停交易':'NSTAR 杠杆上限 1:100 · 超大单有冲击成本，单账户上限 20,000 枚';
+ if(allowed&&!orderBusy&&cur.sym==='NSTAR')$('symbol-status').textContent='NSTAR 杠杆上限 1:100 · 偏离锚价越远流动性越厚 · 单账户合约/现货上限各 20,000 枚';
 }
 function applySymbols(settings){
  if(settings.version<symbolsVersion)return;
@@ -314,14 +314,11 @@ function syncLotPresets(){
  document.querySelectorAll('[data-lots]').forEach(button=>button.setAttribute('aria-pressed',Number(button.dataset.lots)===Number($('lots').value)));
 }
 function setLots(value){const n=Number(value);$('lots').value=STOCKS.includes(cur.sym)||cur.sym==='NSTAR'&&n>=1?String(n):n.toFixed(2);syncLotPresets()}
-/* NSTAR 快讯: 传闻/消息/熔断/巨鲸，所有人可见，仅保留最近 4 条。 */
-let nstarHalted=false,nstarFeed=[];
+/* NSTAR 快讯: 传闻/消息/巨鲸，所有人可见，仅保留最近 4 条。 */
+let nstarFeed=[];
 function nstarEvent(e){
- if(e.kind==='halt')nstarHalted=true;
- if(e.kind==='resume')nstarHalted=false;
  nstarFeed=[...nstarFeed,e].slice(-4);
  $('nstar-feed').innerHTML=nstarFeed.map(x=>`<li data-kind="${escapeHtml(x.kind)}"><time>${escapeHtml(new Date(x.time).toLocaleTimeString())}</time>${escapeHtml(x.text)}</li>`).join('');
- if(cur.sym==='NSTAR'&&(e.kind==='halt'||e.kind==='resume'))msg(e.text);
  syncOrderControls();
 }
 $('lots').addEventListener('input',syncLotPresets);syncLotPresets();
@@ -656,17 +653,19 @@ async function saveTpsl(){
  const j=await api('tpsl',{id:tpslId,tp:Number($('tpsl-tp').value)||0,sl:Number($('tpsl-sl').value)||0});
  if(j.ok){closeTpsl();msg('止盈止损已更新');await settle(j)}
 }
-/* 盘口: NSTAR 的对数深度簿可精确推算每一档；其他币对按点差画示意盘口。 */
+/* 盘口: NSTAR 的弹性 AMM 曲线可精确推算每一档；其他币对按点差画示意盘口。 */
 function renderBook(mid){
  if(!Number.isFinite(mid)){$('book-asks').innerHTML=$('book-bids').innerHTML='';$('book-last').textContent='—';return}
  const star=cur.sym==='NSTAR',depth=market?.depth||50000,dp=pricePrecisions.get(cur.sym)??decimalPlaces(mid);
+ // 锚价偏离 x 处流动性 = depth·(1+x²/w²)，库存 U(x)=depth·(x+x³/3w²)，与后端 amm_shift 一致。
+ const w=market?.amm_width||0,x0=star&&w&&market?.anchor>0?Math.log(mid/market.anchor):0;
+ const inv=x=>depth*(x+(w?x**3/(3*w*w):0)),cumAt=p=>Math.abs(inv(x0+Math.log(p/mid))-inv(x0));
  const step=star?mid*.0005:Math.max(10**-dp,mid*.0001),rows=11,asks=[],bids=[];
- // 价格 p 档的累计数量 = depth·|ln(p/mid)|，与后端 sweep 定价一致。
  let sumA=0,sumB=0;
  for(let i=1;i<=rows;i++){
   const up=mid+step*i,dn=mid-step*i;
   sumA+=1+(i*7)%5;sumB+=1+(i*3)%5;
-  asks.push([up,star?depth*Math.log(up/mid):sumA]);bids.push([dn,star?depth*Math.log(mid/dn):sumB]);
+  asks.push([up,star?cumAt(up):sumA]);bids.push([dn,star?cumAt(dn):sumB]);
  }
  const max=Math.max(asks.at(-1)[1],bids.at(-1)[1]);
  const row=(cls,[p,cum],prev)=>`<div class="book-row ${cls}" style="--depth:${(cum/max*100).toFixed(1)}%" onclick="pickPrice(${p})">`+

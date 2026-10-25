@@ -150,6 +150,12 @@ input.slider:disabled{opacity:.4;cursor:not-allowed}
 .lev-ticks span{position:absolute;transform:translateX(-50%);font-size:11px;color:var(--soft);white-space:nowrap}
 .lev-ticks span:first-child{transform:none}.lev-ticks span:last-child{transform:translateX(-100%)}
 .tier-hint{font-size:11px;line-height:1.5}
+.type-tabs{display:flex;gap:14px;border-bottom:1px solid var(--line-strong)}
+.type-tabs button{background:transparent;border:0;border-bottom:2px solid transparent;border-radius:0;padding:4px 0 6px;font-size:12px;color:var(--muted)}
+.type-tabs button[aria-selected='true']{color:#fff;border-bottom-color:#fff}
+.tpsl-entry summary{cursor:pointer;font-size:12px;color:var(--muted);padding:2px 0}
+.tpsl-entry[open]{display:flex;flex-direction:column;gap:6px}
+.tpsl-entry[open] summary{margin-bottom:0}
 .order-meta{display:flex;justify-content:space-between;color:var(--muted);font-size:11px}
 .order-meta b{color:var(--soft);font-weight:500}
 .order-buttons{display:grid;grid-template-columns:1fr 1fr;gap:8px}

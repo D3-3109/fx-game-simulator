@@ -201,7 +201,8 @@ impl App {
             if !liq.contains_key(p.symbol.as_str()) {
                 liq.insert(
                     p.symbol.as_str(),
-                    acc.liquidation_price(&p.symbol, &prices)?,
+                    // Liquidation is decided at mark, so the shown level is a mark price.
+                    acc.liquidation_price(&p.symbol, &prices.marked())?,
                 );
             }
         }
@@ -269,7 +270,7 @@ impl App {
             "max_leverage": trading::MAX_LEVERAGE,
         });
         Ok(
-            json!({"ok":true,"type":"state","name":name,"symbol":user.symbol,"price":prices[&user.symbol],"bid":bid,"ask":ask,"quote_valid":quote_valid,"quote_at":if self.market.is_offline(){None}else{Some(quote.at)},"balance":acc.balance,"loan":acc.loan,"debt":acc.debt(),"debt_since":acc.debt_since,"debt_limit":trading::DEBT_LIMIT,"equity":equity,"used":used,"free":equity-used,"margin_level":if used==0.0 {None} else {Some(equity/used)},"leverage":acc.leverage,"positions":positions,"spot":spot,"nstar_price":nstar,"spot_fee":trading::SPOT_FEE,"contract":trading::contract(&user.symbol),"symbol_leverage":trading::leverage_for(&user.symbol,acc.leverage),"funding_at":acc.funding_at,"stopout_level":trading::STOPOUT,"currency":"USD","last_trade":user.last_trade,"limits":limits}),
+            json!({"ok":true,"type":"state","name":name,"symbol":user.symbol,"price":prices[&user.symbol],"bid":bid,"ask":ask,"quote_valid":quote_valid,"quote_at":if self.market.is_offline(){None}else{Some(quote.at)},"balance":acc.balance,"loan":acc.loan,"debt":acc.debt(),"debt_since":acc.debt_since,"debt_limit":trading::DEBT_LIMIT,"equity":equity,"used":used,"free":equity-used,"margin_level":if used==0.0 {None} else {Some(equity/used)},"leverage":acc.leverage,"positions":positions,"spot":spot,"nstar_price":nstar,"spot_fee":trading::SPOT_FEE,"contract":trading::contract(&user.symbol),"symbol_leverage":trading::leverage_for(&user.symbol,acc.leverage),"funding_at":acc.funding_at,"stopout_level":trading::STOPOUT,"currency":"USD","last_trade":user.last_trade,"limits":limits,"mark":prices.mark.get(&user.symbol),"orders":acc.orders}),
         )
     }
     pub async fn leaderboard(&self) -> Result<Value, String> {
@@ -320,7 +321,7 @@ impl App {
                 .transaction(&user.name, |a, _, _| {
                     let mut trades = a.settle_funding(&rates, &prices, now)?;
                     if !trades.is_empty() {
-                        trades.extend(a.check_stopout(&prices, now)?);
+                        trades.extend(a.check_stopout_at(&prices.marked(), &prices, now)?);
                     }
                     Ok(trades)
                 })

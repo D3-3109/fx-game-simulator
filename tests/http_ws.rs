@@ -152,6 +152,7 @@ async fn fx_source_sides_match_state_fills_marks_closes_and_closed_market_reject
         bid_ask: Some((150.009, 150.021)),
         open: true,
         anchor: None,
+        mark: None,
     };
     h.app.market.on_market_quote("USDJPY", q).await.unwrap();
     let state = h.request("/api/state", None, &token).await.1;
@@ -861,6 +862,130 @@ fn forwarded_for_counts_only_through_trusted_proxies() {
         let mapped = "::ffff:10.0.0.2".parse::<std::net::IpAddr>().ok();
         assert_eq!(app.client_ip(mapped, &headers), ip("203.0.113.5"));
     });
+}
+
+#[tokio::test]
+async fn resting_limit_orders_fill_into_a_push_before_it_is_printed() {
+    let h = Harness::new().await;
+    let maker = h.register("maker").await;
+    let taker = h.register("taker").await;
+    for token in [&maker, &taker] {
+        h.request("/api/symbol", Some(json!({"symbol":"NSTAR"})), token)
+            .await;
+    }
+    // Seed the offline NSTAR book.
+    let (_, v) = h
+        .request("/api/spot", Some(json!({"side":"buy","units":1})), &maker)
+        .await;
+    let mid = v["state"]["nstar_price"].as_f64().unwrap();
+    // Maker rests a sell limit 1% up (1,000 NSTAR) with TP/SL; it does not fill yet.
+    let (status, v) = h
+        .request(
+            "/api/order",
+            Some(
+                json!({"kind":"limit","side":"sell","lots":100_000,"price":mid*1.01,
+                "tp":mid*0.9,"sl":mid*1.2}),
+            ),
+            &maker,
+        )
+        .await;
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["state"]["orders"].as_array().unwrap().len(), 1, "{v}");
+    assert!(v["state"]["positions"].as_array().unwrap().is_empty());
+    // Bad orders are refused: a sell stop above the market, an unknown kind.
+    for body in [
+        json!({"kind":"stop","side":"sell","lots":100,"price":mid*1.05}),
+        json!({"kind":"iceberg","side":"buy","lots":100,"price":mid}),
+    ] {
+        let (status, v) = h.request("/api/order", Some(body), &maker).await;
+        assert_eq!(status, 400, "{v}");
+    }
+    // Taker lifts the book ~3% with 1,500 NSTAR at market, with its own TP/SL.
+    let (status, v) = h
+        .request(
+            "/api/trade",
+            Some(json!({"side":"buy","lots":150_000,"tp":mid*1.5,"sl":mid*0.8})),
+            &taker,
+        )
+        .await;
+    assert_eq!(status, 200, "{v}");
+    let p = &v["state"]["positions"][0];
+    assert_eq!(
+        (p["tp"].as_f64(), p["sl"].as_f64()),
+        (Some(mid * 1.5), Some(mid * 0.8))
+    );
+    // The maker filled inside the same request, at or above its limit, keeping its TP/SL.
+    let state = h.request("/api/state", None, &maker).await.1;
+    let filled = &state["positions"][0];
+    assert_eq!(filled["side"], "short", "{state}");
+    assert!(
+        filled["entry"].as_f64().unwrap() >= mid * 1.01 - 1e-9,
+        "{state}"
+    );
+    assert_eq!(filled["tp"].as_f64(), Some(mid * 0.9));
+    // It sold only until the bid was back at its limit; any remainder keeps resting.
+    let left = state["orders"]
+        .as_array()
+        .unwrap()
+        .first()
+        .map_or(0.0, |o| o["lots"].as_f64().unwrap());
+    // Several matching rounds may each open a slice.
+    let sold: f64 = state["positions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["lots"].as_f64().unwrap())
+        .sum();
+    assert!((sold + left - 100_000.0).abs() < 0.011, "{sold} + {left}");
+    let bid = state["bid"].as_f64().unwrap();
+    assert!(
+        left == 0.0 || bid <= mid * 1.01 + 1e-6,
+        "rests while bid {bid} is above it"
+    );
+    // ...so the +3% never printed: price and the 1s candle high stay near the limit.
+    let (_, k) = h
+        .request("/api/klines?symbol=NSTAR&interval=1s&limit=5", None, "")
+        .await;
+    let high = k["klines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b[2].as_f64().unwrap())
+        .fold(0.0, f64::max);
+    assert!(high < mid * 1.02, "wick printed: {high} vs mid {mid}");
+    // Cancelling: unknown ids fail, real ones are recorded.
+    let (status, _) = h
+        .request("/api/cancel", Some(json!({"id":999})), &maker)
+        .await;
+    assert_eq!(status, 400);
+    let (_, v) = h
+        .request(
+            "/api/order",
+            Some(json!({"kind":"limit","side":"buy","lots":100,"price":mid*0.5})),
+            &maker,
+        )
+        .await;
+    let orders = v["state"]["orders"].as_array().unwrap();
+    let id = orders.last().unwrap()["id"].as_u64().unwrap();
+    let (status, v) = h
+        .request("/api/cancel", Some(json!({"id":id})), &maker)
+        .await;
+    assert_eq!(status, 200, "{v}");
+    assert!(
+        !v["state"]["orders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["id"] == id)
+    );
+    let rows = h.request("/api/history", None, &maker).await.1;
+    assert!(
+        rows["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["kind"] == "cancel")
+    );
 }
 
 #[tokio::test]

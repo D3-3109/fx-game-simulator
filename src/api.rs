@@ -68,6 +68,20 @@ fn text<'a>(body: &'a Value, key: &str) -> Result<&'a str, Failure> {
         .as_str()
         .ok_or_else(|| bad(&format!("{key} 无效")))
 }
+/// Optional non-negative price field; absent, null or empty means 0 (unset).
+fn optional_price(body: &Value, key: &str) -> Result<f64, Failure> {
+    match &body[key] {
+        Value::Null => Ok(0.0),
+        Value::String(s) if s.trim().is_empty() => Ok(0.0),
+        _ => number(body, key).and_then(|v| {
+            if v >= 0.0 {
+                Ok(v)
+            } else {
+                Err(bad(&format!("{key} 无效")))
+            }
+        }),
+    }
+}
 fn number(body: &Value, key: &str) -> Result<f64, Failure> {
     body[key]
         .as_f64()
@@ -330,6 +344,7 @@ async fn post_inner(
                 _ => return Err(bad("交易方向无效")),
             };
             let lots = number(body, "lots")?;
+            let (tp, sl) = (optional_price(body, "tp")?, optional_price(body, "sl")?);
             let u = app.store.user(&name).await?;
             app.store.require_tradable(&u.symbol).await?;
             let symbols: Vec<&str> = std::iter::once(u.symbol.as_str())
@@ -349,6 +364,10 @@ async fn post_inner(
                     let trade = a.open(side, lots, symbol, &prices, id, now)?;
                     let mut after = prices.clone();
                     trading::apply_fill(&mut after, &trade)?;
+                    if tp > 0.0 || sl > 0.0 {
+                        // Rejecting a bad TP/SL rolls the whole order back.
+                        a.set_triggers(id, tp, sl, &after)?;
+                    }
                     let mut trades = vec![trade];
                     trades.extend(a.check_stopout(&after, now)?);
                     Ok(trades)
@@ -356,6 +375,57 @@ async fn post_inner(
                 .await;
             commit(app, desk).await;
             result?;
+        }
+        "/api/order" => {
+            let side = match text(body, "side")? {
+                "buy" | "long" => "long",
+                "sell" | "short" => "short",
+                _ => return Err(bad("交易方向无效")),
+            };
+            let kind = text(body, "kind")?.to_owned();
+            let lots = number(body, "lots")?;
+            let price = number(body, "price")?;
+            let limit = optional_price(body, "limit")?;
+            let (tp, sl) = (optional_price(body, "tp")?, optional_price(body, "sl")?);
+            let u = app.store.user(&name).await?;
+            app.store.require_tradable(&u.symbol).await?;
+            let symbols: Vec<&str> = std::iter::once(u.symbol.as_str())
+                .chain(u.account.symbols())
+                .collect();
+            let mut prices = app
+                .market
+                .trading_prices(symbols.iter().copied().filter(|s| *s != symbols::NSTAR))
+                .await?;
+            let desk = nstar_desk(app, &symbols).await;
+            if let Some(desk) = &desk {
+                desk.price(&mut prices)?;
+            }
+            let result = app
+                .store
+                .transaction(&name, |a, symbol, id| {
+                    a.place_order(
+                        &kind, side, lots, symbol, price, limit, tp, sl, &prices, now,
+                    )?;
+                    // A limit already through the market fills right away, as far as it can.
+                    let mut trades = a.check_orders(&prices, id, now)?;
+                    let mut after = prices.clone();
+                    for t in &trades {
+                        trading::apply_fill(&mut after, t)?;
+                    }
+                    trades.extend(a.check_stopout(&after, now)?);
+                    Ok(trades)
+                })
+                .await;
+            commit(app, desk).await;
+            result?;
+        }
+        "/api/cancel" => {
+            let id = integer(body, "id")?;
+            app.store
+                .transaction(&name, |a, _, _| {
+                    Ok(vec![a.cancel_order(id, "cancel", now)?])
+                })
+                .await?;
         }
         "/api/spot" => {
             let side = text(body, "side")?;

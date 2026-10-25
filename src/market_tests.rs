@@ -364,6 +364,34 @@ fn nstar_anchor_trails_slowly_and_big_flow_never_halts() {
 }
 
 #[test]
+fn nstar_mark_lags_spikes_and_liquidations_unwind_gradually() {
+    let t = 1800000000000;
+    let mut sim = SimFeed::new("NSTAR", 100.0, t);
+    // A +25% spike that is reversed within a second barely moves the mark.
+    sim.flow(40_000.0, 0.0);
+    nstar_run(&mut sim, t, 1, 5);
+    sim.flow(-40_000.0, 0.0);
+    nstar_run(&mut sim, t, 5, 6);
+    let mark = sim.book.mark.exp();
+    assert!((mark / 100.0 - 1.0).abs() < 0.01, "{mark}");
+    assert!(sim.quote().mark.is_some());
+    // Liquidated units are queued, announced, then released over tens of seconds.
+    let mut sim = SimFeed::new("NSTAR", 100.0, t);
+    let before = sim.book.log;
+    sim.flow(0.0, -60_000.0);
+    assert_eq!(sim.book.log, before, "nothing hits the book at once");
+    assert!(sim.book.events.iter().any(|e| e["kind"] == "whale"));
+    nstar_run(&mut sim, t, 1, 2);
+    let first = sim.book.backlog;
+    assert!(first < -58_000.0 && first > -60_000.0, "{first}");
+    nstar_run(&mut sim, t, 2, 51);
+    let half = sim.book.backlog;
+    assert!(half < -25_000.0 && half > -35_000.0, "{half}");
+    nstar_run(&mut sim, t, 51, 600);
+    assert!(sim.book.backlog.abs() < 1.0, "{}", sim.book.backlog);
+}
+
+#[test]
 fn nstar_price_has_no_hard_ceiling_or_floor_and_stays_finite() {
     let t = 1800000000000;
     let mut sim = SimFeed::new("NSTAR", 100.0, t);

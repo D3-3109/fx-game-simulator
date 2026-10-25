@@ -12,6 +12,8 @@ pub const LOAN_RATE: f64 = 0.10;
 pub const SPOT_FEE: f64 = 0.001;
 pub const SPOT_MIN: f64 = 0.0001;
 pub const SPOT_MAX: f64 = 100_000.0;
+/// Pending limit/stop orders one account may keep.
+pub const MAX_ORDERS: usize = 20;
 /// Slowest the book anchor may be ignored: displacements beyond this many widths are
 /// solved on the clamped value so `sinh`/`exp` stay finite for absurd inputs.
 const AMM_MAX_C: f64 = 1e12;
@@ -24,6 +26,8 @@ pub struct Prices {
     pub bid_ask: BTreeMap<String, (f64, f64)>,
     /// Log-price anchor of each elastic book; absent means "centred on the current mid".
     pub anchor: BTreeMap<String, f64>,
+    /// Smoothed mark price of simulated books; liquidations trigger on it, fills never do.
+    pub mark: BTreeMap<String, f64>,
 }
 impl Prices {
     pub fn new() -> Self {
@@ -32,11 +36,23 @@ impl Prices {
     pub fn remove(&mut self, symbol: &str) -> Option<f64> {
         self.bid_ask.remove(symbol);
         self.anchor.remove(symbol);
+        self.mark.remove(symbol);
         self.mid.remove(symbol)
     }
     pub fn insert(&mut self, symbol: String, price: f64) -> Option<f64> {
         self.bid_ask.remove(&symbol);
         self.mid.insert(symbol, price)
+    }
+    /// Copy priced at mark where a symbol has one: what liquidation checks look at, so a
+    /// spike lasting seconds cannot liquidate anyone.
+    pub fn marked(&self) -> Prices {
+        let mut out = self.clone();
+        for (symbol, mark) in &self.mark {
+            if mark.is_finite() && *mark > 0.0 {
+                out.mid.insert(symbol.clone(), *mark);
+            }
+        }
+        out
     }
 }
 impl std::ops::Deref for Prices {
@@ -240,7 +256,11 @@ pub fn apply_fill(prices: &mut Prices, trade: &Trade) -> Result<()> {
         (trade.kind.as_str(), trade.side.as_str()),
         ("open", "long") | ("close" | "stopout" | "tp" | "sl", "short") | ("spot", "buy")
     );
-    if trade.kind == "funding" {
+    if !matches!(
+        trade.kind.as_str(),
+        "open" | "close" | "stopout" | "tp" | "sl" | "spot"
+    ) {
+        // Funding, cancelled orders and other records never touch the book.
         return Ok(());
     }
     let units = trade.lots * contract(&trade.symbol) * if buy { 1.0 } else { -1.0 };
@@ -257,6 +277,54 @@ pub fn apply_fill(prices: &mut Prices, trade: &Trade) -> Result<()> {
     let (_, after) = book_fill(prices, &trade.symbol, mid, units)?;
     prices.mid.insert(trade.symbol.clone(), after);
     Ok(())
+}
+
+/// Lots a limit order could fill right now with every unit at or better than `limit`:
+/// on a book symbol, the size that walks the marginal price (spread included) to the limit;
+/// on a quoted symbol, everything once the bid/ask is through the limit.
+pub fn limit_fillable_lots(prices: &Prices, symbol: &str, buy: bool, limit: f64) -> Result<f64> {
+    if depth(symbol) <= 0.0 {
+        let px = execution_price(prices, symbol, buy)?;
+        let through = if buy { px <= limit } else { px >= limit };
+        return Ok(if through { f64::INFINITY } else { 0.0 });
+    }
+    let mid = market_price(prices, symbol)?;
+    // Mid at which the ask (bid) itself equals the limit; a percentage spread widens with
+    // the price, so solve for it rather than subtracting today's half spread.
+    let pct = symbols::spec(symbol).map_or(0.0, |s| s.pct);
+    let target = if pct > 0.0 {
+        limit
+            / if buy {
+                1.0 + pct / 2.0
+            } else {
+                1.0 - pct / 2.0
+            }
+    } else {
+        let half = spread(symbol, mid) / 2.0;
+        if buy { limit - half } else { limit + half }
+    };
+    if target <= 0.0 || (buy && target <= mid) || (!buy && target >= mid) {
+        return Ok(0.0);
+    }
+    let (depth, width) = (depth(symbol), amm_width(symbol));
+    let x0 = displacement(prices, symbol, mid);
+    let x1 = x0 + (target / mid).ln();
+    let cubic = if width > 0.0 {
+        (x1.powi(3) - x0.powi(3)) / (3.0 * width * width)
+    } else {
+        0.0
+    };
+    Ok((depth * (x1 - x0 + cubic)).abs() / contract(symbol))
+}
+
+/// Round lots down to what the symbol accepts as an order size.
+fn snap_lots(symbol: &str, lots: f64) -> f64 {
+    let step = if symbols::spec(symbol).is_some_and(|s| s.whole_lots) {
+        1.0
+    } else {
+        0.01
+    };
+    (lots / step + 1e-9).floor() * step
 }
 
 /// Fill price for trading `lots` of a book symbol, including its spread.
@@ -389,6 +457,37 @@ pub struct Account {
     /// Last funding settlement time; 0 until the first perpetual position.
     #[serde(default)]
     pub funding_at: i64,
+    /// Pending limit and stop orders, oldest first.
+    #[serde(default)]
+    pub orders: Vec<Order>,
+    /// Last order id handed out by this account.
+    #[serde(default)]
+    pub order_seq: u64,
+}
+
+/// A pending perpetual order. `limit` fills only at `price` or better; `stop` waits until
+/// the mid crosses `price`, then opens at market or, with `limit > 0`, becomes a limit order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Order {
+    pub id: u64,
+    pub symbol: String,
+    /// "long" or "short".
+    pub side: String,
+    /// "limit" or "stop".
+    pub kind: String,
+    /// Lots still to fill.
+    pub lots: f64,
+    /// Limit price, or the stop's trigger price.
+    pub price: f64,
+    /// Stop-limit price applied once a stop triggers; 0 means market.
+    #[serde(default)]
+    pub limit: f64,
+    /// Take-profit / stop-loss given to positions this order opens; 0 means none.
+    #[serde(default)]
+    pub tp: f64,
+    #[serde(default)]
+    pub sl: f64,
+    pub created: i64,
 }
 
 pub const DEBT_LIMIT: f64 = 100_000.0;
@@ -406,6 +505,8 @@ impl Default for Account {
             debt_since: 0,
             spot: BTreeMap::new(),
             funding_at: 0,
+            orders: vec![],
+            order_seq: 0,
         }
     }
 }
@@ -454,6 +555,19 @@ impl Account {
             if depth(symbol) <= 0.0 || !h.units.is_finite() || h.units < 0.0 || !h.cost.is_finite()
             {
                 return Err("现货记录无效".into());
+            }
+        }
+        for o in &self.orders {
+            if !matches!(o.side.as_str(), "long" | "short")
+                || !matches!(o.kind.as_str(), "limit" | "stop")
+                || !lots_valid(&o.symbol, o.lots)
+                || !o.price.is_finite()
+                || o.price <= 0.0
+                || ![o.limit, o.tp, o.sl]
+                    .iter()
+                    .all(|v| v.is_finite() && *v >= 0.0)
+            {
+                return Err("委托记录无效".into());
             }
         }
         Ok(())
@@ -885,6 +999,201 @@ impl Account {
         p.sl = sl;
         Ok(())
     }
+    /// Queue a limit or stop order after checking it could be afforded at its own price.
+    /// Returns its id; a marketable limit fills on the next `check_orders`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn place_order(
+        &mut self,
+        kind: &str,
+        side: &str,
+        lots: f64,
+        symbol: &str,
+        price: f64,
+        limit: f64,
+        tp: f64,
+        sl: f64,
+        prices: &Prices,
+        now: i64,
+    ) -> Result<u64> {
+        if !matches!(side, "long" | "short") {
+            return Err("交易方向无效".into());
+        }
+        if !matches!(kind, "limit" | "stop") {
+            return Err("委托类型无效".into());
+        }
+        if !lots_valid(symbol, lots) {
+            return Err("委托数量无效".into());
+        }
+        for v in [price, limit, tp, sl] {
+            if !v.is_finite() || v < 0.0 {
+                return Err("委托价格无效".into());
+            }
+        }
+        if price <= 0.0 {
+            return Err("委托价格必须大于 0".into());
+        }
+        if self.orders.len() >= MAX_ORDERS {
+            return Err(format!("最多同时挂 {MAX_ORDERS} 笔委托"));
+        }
+        self.validate()?;
+        let long = side == "long";
+        let mid = market_price(prices, symbol)?;
+        if kind == "stop" && (if long { price <= mid } else { price >= mid }) {
+            return Err(format!(
+                "{}触发价需{}当前价 {mid:.4}",
+                if long {
+                    "买入条件单"
+                } else {
+                    "卖出条件单"
+                },
+                if long { "高于" } else { "低于" }
+            ));
+        }
+        // Where the order expects to fill: TP/SL must sit on the profitable/losing side of it.
+        let fill = if kind == "stop" && limit > 0.0 {
+            limit
+        } else {
+            price
+        };
+        if tp > 0.0 && (tp > fill) != long {
+            return Err(format!(
+                "止盈价需{}委托价",
+                if long { "高于" } else { "低于" }
+            ));
+        }
+        if sl > 0.0 && (sl < fill) != long {
+            return Err(format!(
+                "止损价需{}委托价",
+                if long { "低于" } else { "高于" }
+            ));
+        }
+        // Margin must cover the order as if the book were at its price right now.
+        let mut at = prices.clone();
+        at.insert(symbol.into(), fill);
+        let mut trial = self.clone();
+        trial.orders.clear();
+        trial.open(side, lots, symbol, &at, u64::MAX - 1, now)?;
+        self.order_seq += 1;
+        self.orders.push(Order {
+            id: self.order_seq,
+            symbol: symbol.into(),
+            side: side.into(),
+            kind: kind.into(),
+            lots,
+            price,
+            limit,
+            tp,
+            sl,
+            created: now,
+        });
+        Ok(self.order_seq)
+    }
+    /// Remove a pending order, recording it as `cancel` (by the trader) or `void` (by the
+    /// engine, e.g. no margin left when the price came).
+    pub fn cancel_order(&mut self, id: u64, kind: &str, now: i64) -> Result<Trade> {
+        let index = self
+            .orders
+            .iter()
+            .position(|o| o.id == id)
+            .ok_or_else(|| format!("无 # {id} 委托"))?;
+        let o = self.orders.remove(index);
+        Ok(Trade {
+            time: now,
+            kind: kind.into(),
+            position_id: o.id,
+            symbol: o.symbol,
+            side: o.side,
+            lots: o.lots,
+            entry: 0.0,
+            price: o.price,
+            pnl: None,
+            balance: self.balance,
+            margin_level: None,
+            currency: "USD".into(),
+        })
+    }
+    /// Fill whatever pending orders the market allows, oldest first: stops whose trigger
+    /// the mid has crossed, and limits for as much size as stays at or better than their
+    /// price (partial fills keep the rest pending). An order the account can no longer
+    /// afford at all is cancelled. `id` is the first free position id.
+    pub fn check_orders(&mut self, prices: &Prices, id: u64, now: i64) -> Result<Vec<Trade>> {
+        let mut next = self.clone();
+        let mut prices = prices.clone();
+        let mut trades = Vec::new();
+        let mut nid = id.max(next.next_id);
+        for order_id in self.orders.iter().map(|o| o.id).collect::<Vec<_>>() {
+            let Some(index) = next.orders.iter().position(|o| o.id == order_id) else {
+                continue;
+            };
+            let o = next.orders[index].clone();
+            let Ok(mid) = market_price(&prices, &o.symbol) else {
+                continue;
+            };
+            let long = o.side == "long";
+            let mut limit = (o.kind == "limit").then_some(o.price);
+            if o.kind == "stop" {
+                if if long { mid < o.price } else { mid > o.price } {
+                    continue;
+                }
+                if o.limit > 0.0 {
+                    // Triggered stop-limit: from now on it is an ordinary limit order.
+                    let pending = &mut next.orders[index];
+                    pending.kind = "limit".into();
+                    pending.price = o.limit;
+                    pending.limit = 0.0;
+                    limit = Some(o.limit);
+                }
+            }
+            let wanted = match limit {
+                Some(px) => snap_lots(
+                    &o.symbol,
+                    o.lots
+                        .min(limit_fillable_lots(&prices, &o.symbol, long, px)?),
+                ),
+                None => o.lots,
+            };
+            let min = symbols::spec(&o.symbol).map_or(0.01, |s| s.min_lots);
+            if wanted < min {
+                continue;
+            }
+            // Fill the largest affordable part; an order that cannot fill at all is dropped.
+            let step = if symbols::spec(&o.symbol).is_some_and(|s| s.whole_lots) {
+                1.0
+            } else {
+                0.01
+            };
+            let ok = |lots: f64| {
+                next.clone()
+                    .open(&o.side, lots, &o.symbol, &prices, nid, now)
+                    .is_ok()
+            };
+            let lots = largest(min, wanted, step, ok);
+            if lots < min {
+                trades.push(next.cancel_order(o.id, "void", now)?);
+                continue;
+            }
+            let trade = next.open(&o.side, lots, &o.symbol, &prices, nid, now)?;
+            apply_fill(&mut prices, &trade)?;
+            if o.tp > 0.0 || o.sl > 0.0 {
+                // Keep whichever of TP/SL is still on the right side of the moved price.
+                if next.set_triggers(nid, o.tp, o.sl, &prices).is_err() {
+                    let _ = next.set_triggers(nid, o.tp, 0.0, &prices);
+                    let _ = next.set_triggers(nid, 0.0, o.sl, &prices);
+                }
+            }
+            nid = next.next_id.max(nid + 1);
+            trades.push(trade);
+            let left = snap_lots(&o.symbol, o.lots - lots);
+            let pending = &mut next.orders[index];
+            if left < min {
+                next.orders.remove(index);
+            } else {
+                pending.lots = left;
+            }
+        }
+        *self = next;
+        Ok(trades)
+    }
     /// Close every position whose take-profit or stop-loss the mid has crossed.
     pub fn check_triggers(&mut self, prices: &Prices, now: i64) -> Result<Vec<Trade>> {
         let hit: Vec<(u64, &'static str)> = self
@@ -1012,12 +1321,22 @@ impl Account {
         Ok(trades)
     }
     pub fn check_stopout(&mut self, prices: &Prices, now: i64) -> Result<Vec<Trade>> {
+        self.check_stopout_at(prices, prices, now)
+    }
+    /// Stop out while the margin level at `trigger` prices (normally mark prices) is below
+    /// the stop-out level; each forced close fills at the live `prices`.
+    pub fn check_stopout_at(
+        &mut self,
+        trigger: &Prices,
+        prices: &Prices,
+        now: i64,
+    ) -> Result<Vec<Trade>> {
         let mut next = self.clone();
         let mut prices = prices.clone();
         let prices = &mut prices;
         let mut trades = Vec::new();
         while !next.positions.is_empty() {
-            let ml = next.margin_level(prices)?;
+            let ml = next.margin_level(trigger)?;
             if ml.is_none_or(|v| v >= STOPOUT) {
                 break;
             }
@@ -1543,6 +1862,237 @@ mod tests {
         // Selling is always allowed, and frees room to buy again.
         a.spot("NSTAR", -5_000.0, &q, 4).unwrap();
         a.spot("NSTAR", 5_000.0, &q, 5).unwrap();
+    }
+    fn rich() -> Account {
+        Account {
+            balance: 1e9,
+            ..Account::default()
+        }
+    }
+    #[test]
+    fn limit_order_waits_then_fills_no_worse_than_its_price() {
+        let mut a = rich();
+        let q = quotes(&[("NSTAR", 120.0)]);
+        a.place_order(
+            "limit", "long", 500_000.0, "NSTAR", 115.0, 0.0, 0.0, 0.0, &q, 0,
+        )
+        .unwrap();
+        assert!(
+            a.check_orders(&q, 1, 1).unwrap().is_empty(),
+            "120 is above the limit"
+        );
+        assert_eq!(a.orders.len(), 1);
+        // The book dips to 112: the order buys only while the marginal ask stays <= 115.
+        let dip = quotes(&[("NSTAR", 112.0)]);
+        let fills = a.check_orders(&dip, 1, 2).unwrap();
+        assert_eq!(fills.len(), 1);
+        let t = &fills[0];
+        assert_eq!(t.kind, "open");
+        assert!(t.price <= 115.0 && t.price > 112.0, "{}", t.price);
+        let mut after = dip.clone();
+        apply_fill(&mut after, t).unwrap();
+        let ask = execution_price(&after, "NSTAR", true).unwrap();
+        assert!(ask <= 115.0 + 1e-6, "marginal ask {ask}");
+        // 5,000 NSTAR is more than the dip allows: the rest stays pending.
+        assert!(t.lots < 500_000.0);
+        assert!((a.orders[0].lots + t.lots - 500_000.0).abs() < 0.011);
+        // The book drops further: the remainder fills.
+        let crash = quotes(&[("NSTAR", 90.0)]);
+        let fills = a.check_orders(&crash, 10, 3).unwrap();
+        assert_eq!(fills.len(), 1);
+        assert!(fills[0].price <= 115.0);
+        assert!(a.orders.is_empty());
+        let held: f64 = a.positions.iter().map(|p| p.lots).sum();
+        assert!((held - 500_000.0).abs() < 0.011, "{held}");
+    }
+    #[test]
+    fn marketable_limit_fills_what_it_can_at_once_and_sells_mirror_buys() {
+        let mut a = rich();
+        let q = quotes(&[("NSTAR", 100.0)]);
+        // Sell limit at 98 with the book at 100: sells right away, down to a 98 bid.
+        a.place_order(
+            "limit",
+            "short",
+            10_000_000.0,
+            "NSTAR",
+            98.0,
+            0.0,
+            0.0,
+            0.0,
+            &q,
+            0,
+        )
+        .unwrap();
+        let fills = a.check_orders(&q, 1, 1).unwrap();
+        assert_eq!(fills.len(), 1);
+        assert!(
+            fills[0].price >= 98.0 && fills[0].price < 100.0,
+            "{}",
+            fills[0].price
+        );
+        let mut after = q.clone();
+        apply_fill(&mut after, &fills[0]).unwrap();
+        assert!(execution_price(&after, "NSTAR", false).unwrap() >= 98.0 - 1e-6);
+        assert_eq!(a.orders.len(), 1, "remainder rests");
+    }
+    #[test]
+    fn stop_orders_trigger_on_the_mid_and_stop_limits_become_limits() {
+        let q = quotes(&[("NSTAR", 100.0)]);
+        let mut a = rich();
+        assert!(
+            a.place_order("stop", "long", 1_000.0, "NSTAR", 99.0, 0.0, 0.0, 0.0, &q, 0)
+                .is_err(),
+            "a buy stop must sit above the market"
+        );
+        a.place_order(
+            "stop", "long", 1_000.0, "NSTAR", 105.0, 0.0, 120.0, 95.0, &q, 0,
+        )
+        .unwrap();
+        assert!(
+            a.check_orders(&quotes(&[("NSTAR", 104.0)]), 1, 1)
+                .unwrap()
+                .is_empty()
+        );
+        let fills = a.check_orders(&quotes(&[("NSTAR", 106.0)]), 1, 2).unwrap();
+        assert_eq!(fills.len(), 1);
+        let p = &a.positions[0];
+        assert_eq!((p.side.as_str(), p.tp, p.sl), ("long", 120.0, 95.0));
+        // Stop-limit: triggers at 105 but will not pay more than 105.5.
+        let mut b = rich();
+        b.place_order(
+            "stop",
+            "long",
+            10_000_000.0,
+            "NSTAR",
+            105.0,
+            105.5,
+            0.0,
+            0.0,
+            &q,
+            0,
+        )
+        .unwrap();
+        let gap = quotes(&[("NSTAR", 110.0)]);
+        assert!(
+            b.check_orders(&gap, 1, 1).unwrap().is_empty(),
+            "gapped past the limit"
+        );
+        assert_eq!(
+            (b.orders[0].kind.as_str(), b.orders[0].price),
+            ("limit", 105.5)
+        );
+        let back = quotes(&[("NSTAR", 105.0)]);
+        let fills = b.check_orders(&back, 1, 2).unwrap();
+        assert!(fills[0].price <= 105.5, "{}", fills[0].price);
+    }
+    #[test]
+    fn orders_validate_and_lose_their_place_when_unaffordable() {
+        let q = quotes(&[("NSTAR", 100.0)]);
+        let mut a = Account::default();
+        assert!(
+            a.place_order(
+                "limit", "long", 100_000.0, "NSTAR", 90.0, 0.0, 85.0, 0.0, &q, 0
+            )
+            .is_err(),
+            "long TP below the price"
+        );
+        assert!(
+            a.place_order(
+                "limit", "long", 100_000.0, "NSTAR", 90.0, 0.0, 0.0, 95.0, &q, 0
+            )
+            .is_err(),
+            "long SL above the price"
+        );
+        assert!(
+            a.place_order(
+                "limit",
+                "long",
+                5_000_000.0,
+                "NSTAR",
+                90.0,
+                0.0,
+                0.0,
+                0.0,
+                &q,
+                0
+            )
+            .is_err(),
+            "$10k cannot margin 50,000 NSTAR"
+        );
+        assert!(
+            a.place_order("market", "long", 1.0, "NSTAR", 90.0, 0.0, 0.0, 0.0, &q, 0)
+                .is_err()
+        );
+        let id = a
+            .place_order(
+                "limit", "long", 500_000.0, "NSTAR", 90.0, 0.0, 0.0, 0.0, &q, 0,
+            )
+            .unwrap();
+        // The money is gone by the time the price arrives: the order is voided, not filled.
+        a.balance = 0.0;
+        let out = a.check_orders(&quotes(&[("NSTAR", 85.0)]), 1, 1).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].kind.as_str(), out[0].position_id), ("void", id));
+        assert!(a.orders.is_empty() && a.positions.is_empty());
+        // Cancelling and the pending-order cap.
+        let mut b = rich();
+        for _ in 0..MAX_ORDERS {
+            b.place_order("limit", "long", 100.0, "NSTAR", 90.0, 0.0, 0.0, 0.0, &q, 0)
+                .unwrap();
+        }
+        assert!(
+            b.place_order("limit", "long", 100.0, "NSTAR", 90.0, 0.0, 0.0, 0.0, &q, 0)
+                .is_err()
+        );
+        let t = b.cancel_order(3, "cancel", 5).unwrap();
+        assert_eq!(
+            (t.kind.as_str(), b.orders.len()),
+            ("cancel", MAX_ORDERS - 1)
+        );
+        assert!(b.cancel_order(3, "cancel", 5).is_err());
+        let mut after = q.clone();
+        apply_fill(&mut after, &t).unwrap();
+        assert_eq!(after["NSTAR"], 100.0, "records never move the book");
+        b.validate().unwrap();
+    }
+    #[test]
+    fn quoted_symbols_fill_limits_whole_once_the_quote_is_through() {
+        let mut q = quotes(&[("EURUSD", 1.1)]);
+        q.bid_ask.insert("EURUSD".into(), (1.0999, 1.1001));
+        let mut a = rich();
+        a.place_order("limit", "long", 2.0, "EURUSD", 1.0950, 0.0, 0.0, 0.0, &q, 0)
+            .unwrap();
+        assert!(a.check_orders(&q, 1, 1).unwrap().is_empty());
+        let mut low = quotes(&[("EURUSD", 1.0948)]);
+        low.bid_ask.insert("EURUSD".into(), (1.0947, 1.0949));
+        let fills = a.check_orders(&low, 1, 2).unwrap();
+        assert_eq!((fills[0].lots, fills[0].price), (2.0, 1.0949));
+        assert!(a.orders.is_empty());
+    }
+    #[test]
+    fn liquidations_trigger_on_mark_not_on_a_spike() {
+        let q = quotes(&[("NSTAR", 100.0)]);
+        let mut a = Account::default();
+        // 1,000 NSTAR short at 100x on $10k.
+        a.open("short", 100_000.0, "NSTAR", &q, 1, 0).unwrap();
+        // A spike to 110 on the book while the mark is still 100.5: nobody is liquidated.
+        let mut spike = quotes(&[("NSTAR", 110.0)]);
+        spike.mark.insert("NSTAR".into(), 100.5);
+        assert!(a.margin_level(&spike).unwrap().unwrap() < STOPOUT);
+        let mut held = a.clone();
+        assert!(
+            held.check_stopout_at(&spike.marked(), &spike, 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(held.positions.len(), 1);
+        // Once the mark itself crosses, the stop-out fills at the live book price.
+        spike.mark.insert("NSTAR".into(), 109.0);
+        let trades = held.check_stopout_at(&spike.marked(), &spike, 2).unwrap();
+        assert_eq!(trades.len(), 1);
+        assert!(trades[0].price > 110.0, "{}", trades[0].price);
+        // Without a mark, the old behaviour stands.
+        assert_eq!(quotes(&[("NSTAR", 1.0)]).marked()["NSTAR"], 1.0);
     }
     #[test]
     fn invalid_numbers_and_directions_do_not_mutate() {

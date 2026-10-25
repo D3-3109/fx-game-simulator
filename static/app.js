@@ -25,8 +25,8 @@ const priceText=(value,symbol=cur.sym)=>Number.isFinite(value)?value.toFixed(pri
 let TOKEN=localStorage.fx_token||'',ME='',cur={sym:'USDJPY',itv:'15m'};
 let chart=null,series=null,lastBar=null,priceLines=[],curPos=[],symSynced=false,lastSym=null,lastItv=null;
 let levDirty=false,levSaving=false,accountLeverage=100,orderBusy=false,authBusy=false;
-let quoteSymbol='',quoteLast=null,quoteReady=false,quoteTimer=null;
-let mode='perp',spotSide='buy',lastState=null,market=null,tpslId=0,lotsFor='';
+let quoteSymbol='',quoteLast=null,quoteReady=false,quoteTimer=null,quoteBid=NaN,quoteAsk=NaN;
+let mode='perp',spotSide='buy',lastState=null,market=null,tpslId=0,lotsFor='',otype='market';
 const quoteReferences=new Map();
 function renderQuote(price,symbol,bid,ask,valid=true,at){
  if(symbol!==cur.sym)return;
@@ -35,6 +35,7 @@ function renderQuote(price,symbol,bid,ask,valid=true,at){
  const sideText=value=>fx||symbol in FIXED_PRECISION?priceText(value,symbol):value.toFixed(Math.max(pricePrecisions.get(symbol)??0,4));
  clearTimeout(quoteTimer);
  quoteReady=valid&&Number.isFinite(bid)&&Number.isFinite(ask)&&bid>0&&ask>=bid&&(!Number.isFinite(at)||Date.now()-at<=30000);
+ quoteBid=bid;quoteAsk=ask;
  $('buy-price').textContent=quoteReady?sideText(ask):'—';
  $('sell-price').textContent=quoteReady?sideText(bid):'—';
  if(quoteReady&&Number.isFinite(at))quoteTimer=setTimeout(()=>{
@@ -311,6 +312,22 @@ let messageTimer=null;
 function msg(t){clearTimeout(messageTimer);$('msg').textContent=t;messageTimer=setTimeout(()=>$('msg').textContent='',6000)}
 /* 数量滑块: 100% = 服务器按真实保证金/档位/冲击成本算出的最大可开（多空取小）。 */
 const fmtLots=n=>STOCKS.includes(cur.sym)||cur.sym==='NSTAR'&&n>=1?String(+n.toFixed(2)):n.toFixed(2);
+/* NSTAR 预估成交：与后端 amm_shift/amm_avg 同一公式。冲击超过 5% 标红提醒，建议改用限价单。 */
+const IMPACT_WARN=.05;
+function ammShift(x0,u,D,W){if(!W)return x0+u/D;const c=x0+x0**3/(3*W*W)+u/D;return 2*W*Math.sinh(Math.asinh(3*c/(2*W))/3)}
+function ammAvg(x0,x1,W){const d=x1-x0,g=Math.abs(d)<1e-12?1:Math.expm1(d)/d;if(!W)return g;const w2=W*W;
+ return (g*(1+(x1*x1-2*x1+2)/w2)+(x1+x0-2)/w2)/(1+(x1*x1+x1*x0+x0*x0)/(3*w2))}
+// 预估 NSTAR 吃单均价（不含手续费）；units 为正买负卖。其他币对按当前买卖价。
+function bookFill(units){
+ const mid=nstarMid(),m=market;if(!(mid>0)||!m?.depth)return NaN;
+ const W=m.amm_width||0,x0=W&&m.anchor>0?Math.log(mid/m.anchor):0;
+ return mid*ammAvg(x0,ammShift(x0,units,m.depth,W),W);
+}
+function perpFill(side,lots){
+ const c=lastState?.contract??1,u=lots*c*(side==='buy'?1:-1);
+ if(cur.sym!=='NSTAR')return side==='buy'?quoteAsk:quoteBid;
+ const f=bookFill(u),half=(nstarMid()||0)*.0005/2;return f+(side==='buy'?half:-half);
+}
 function maxLots(){const s=lastState,m=s?.limits?.max_lots;return m&&s.symbol===cur.sym?m:null}
 function setSlider(el,pct,enabled){el.value=Math.round(pct);el.style.setProperty('--fill',`${Math.min(100,Math.max(0,pct))}%`);el.disabled=!enabled}
 function syncLotPresets(){
@@ -319,6 +336,13 @@ function syncLotPresets(){
  const node=$('order-max');
  node.textContent=!m?'—':star?`${units(m.buy*c,2)} / ${units(m.sell*c,2)} NSTAR`:`${fmtLots(m.buy)} / ${fmtLots(m.sell)} ${STOCKS.includes(cur.sym)?'股':'手'}`;
  node.className=m&&n>Math.max(m.buy,m.sell)?'red':'';
+ const fill=$('order-fill');
+ if(n>0&&quoteReady){
+  const star=cur.sym==='NSTAR',fb=perpFill('buy',n),fs=perpFill('sell',n),imp=Math.max(fb/quoteAsk-1,1-fs/quoteBid);
+  fill.textContent=!Number.isFinite(fb+fs)?'—':star?`${units(fb,2)} / ${units(fs,2)} · ±${(imp*100).toFixed(1)}%`:`${units(fb,5)} / ${units(fs,5)}`;
+  fill.className=star&&imp>IMPACT_WARN?'red':'';
+  if(otype!=='market'){fill.textContent=otype==='limit'?'按委托价或更优成交':'触发后按市价 / 委托价';fill.className=''}
+ }else{fill.textContent='—';fill.className=''}
 }
 function setLots(value){$('lots').value=fmtLots(Number(value));syncLotPresets();renderOrderEstimate()}
 function setLotsPct(pct){
@@ -341,10 +365,43 @@ async function trade(side){
  if(!quoteReady){msg('报价不可用，请等待更新');return}
  if(!$('lots').reportValidity())return;
  orderBusy=true;syncOrderControls();
- try{const j=await api('trade',{side,lots:Number($('lots').value)});
-  if(j.ok){msg(`${cur.sym} ${side==='buy'?'买入':'卖出'}已成交`);await settle(j)}
+ const lots=Number($('lots').value),tp=Number($('entry-tp').value)||0,sl=Number($('entry-sl').value)||0;
+ const price=Number($('order-price').value)||0,trigger=Number($('order-trigger').value)||0;
+ const word=side==='buy'?'买入':'卖出';
+ try{
+  if(otype==='limit'&&!(price>0))throw '请填写委托价';
+  if(otype==='stop'&&!(trigger>0))throw '请填写触发价';
+  const j=otype==='market'?await api('trade',{side,lots,tp,sl})
+   :await api('order',{kind:otype,side,lots,price:otype==='limit'?price:trigger,limit:otype==='stop'?price:0,tp,sl});
+  if(j.ok){msg(otype==='market'?`${cur.sym} ${word}已成交`:`${cur.sym} ${otype==='limit'?'限价':'条件'}${word}委托已提交，可在「委托」中查看`);await settle(j)}
  }catch(e){msg('下单失败：'+e)}
  finally{orderBusy=false;syncOrderControls()}
+}
+/* 委托类型: 市价 / 限价（只按委托价或更优成交，可部分成交、余量继续挂单）/ 条件单（价格穿过触发价后，按委托价挂限价；委托价留空=市价）。 */
+function setOrderType(t){
+ otype=t;document.querySelectorAll('[data-otype]').forEach(b=>b.setAttribute('aria-selected',b.dataset.otype===t));
+ $('trigger-field').hidden=t!=='stop';$('price-field').hidden=t==='market';
+ $('order-price').placeholder=t==='stop'?'留空 = 触发后市价':'';
+ $('order-kind-label').textContent=(t==='market'?'市价':t==='limit'?'限价':'条件单')+' · USDT 结算';
+ if(t==='limit'&&!$('order-price').value&&Number.isFinite(quoteLast))$('order-price').value=priceText(quoteLast,cur.sym);
+ renderOrderEstimate();
+}
+document.querySelectorAll('[data-otype]').forEach(b=>b.addEventListener('click',()=>setOrderType(b.dataset.otype)));
+function renderOrders(s){
+ const rows=s.orders||[];$('order-count').textContent=rows.length;
+ $('ordersT').querySelector('tbody').innerHTML=rows.map(o=>{
+  const kind=o.kind==='limit'?'限价':o.limit>0?'条件限价':'条件市价',side=o.side==='long'?'买入开多':'卖出开空';
+  const px=o.kind==='stop'?`${priceText(o.price,o.symbol)} → ${o.limit>0?priceText(o.limit,o.symbol):'市价'}`:priceText(o.price,o.symbol);
+  return `<tr><td>${escapeHtml(new Date(o.created).toLocaleString())}</td><td><b>${escapeHtml(pairName(o.symbol))}</b></td><td>${kind}</td>`+
+   `<td class="${o.side==='long'?'green':'red'}">${side}</td><td class="ctr">${o.symbol==='NSTAR'?units(o.lots*.01,2)+' NSTAR':o.lots}</td><td>${px}</td>`+
+   `<td>${o.tp>0?priceText(o.tp,o.symbol):'—'} / ${o.sl>0?priceText(o.sl,o.symbol):'—'}</td>`+
+   `<td><button type="button" class="close-position" onclick="cancelOrder(${Number(o.id)})">撤单</button></td></tr>`}).join('')||
+  '<tr><td colspan="8" class="empty">暂无委托，可在下单区选择「限价」或「条件单」</td></tr>';
+}
+async function cancelOrder(id){
+ if(orderBusy||!id)return;orderBusy=true;syncOrderControls();
+ try{const j=await api('cancel',{id});if(j.ok){msg('委托已撤销');await settle(j)}}
+ catch(e){msg('撤单失败：'+e)}finally{orderBusy=false;syncOrderControls()}
 }
 async function closePos(id){
  if(orderBusy||!id)return;
@@ -502,7 +559,7 @@ function render(s){
   `<td><span class="tpsl">${p.tp?priceText(p.tp,sym):'—'} / ${p.sl?priceText(p.sl,sym):'—'}</span> <button type="button" aria-label="设置 #${p.id} 止盈止损" onclick="openTpsl(${p.id})">设置</button></td>`+
   `<td><button class="close-position" aria-label="平仓 ${escapeHtml(sym)} 持仓 #${p.id}" onclick="closePos(${p.id})">平仓</button></td></tr>`;
  }).join('')||'<tr><td colspan="10" class="empty">暂无持仓，去下单吧</td></tr>';
- lastState=s;renderAssets(s);renderOrderEstimate();renderSpotForm();
+ lastState=s;renderAssets(s);renderOrders(s);renderOrderEstimate();renderSpotForm();
  syncOrderControls();panelStatus('positions');observeTrade(s.last_trade);
  if(s.symbol===cur.sym){renderQuote(s.price,s.symbol,s.bid,s.ask,s.quote_valid,s.quote_at);updateLast(s.price)}
 }
@@ -527,7 +584,7 @@ async function loadHistory(){
   const r=await fetch('/api/history',{headers:authH(),signal:AbortSignal.timeout(20000)});
   const j=await r.json();if(!j.ok)throw j.err||'成交记录不可用';if(my!==historySeq)return;
   $('historyT').querySelector('tbody').innerHTML=j.rows.map(t=>
-   `<tr><td>${escapeHtml(new Date(t.time).toLocaleString())}</td><td class="${t.kind==='stopout'?'red':''}">${({open:'开仓',close:'平仓',stopout:'强平',tp:'止盈',sl:'止损',spot:t.side==='buy'?'现货买入':'现货卖出',funding:'资金费',reset:'重置',borrow:'借款',repay:'还款'})[t.kind]??t.kind}${t.currency==='LEGACY'?' · 旧口径':''}</td>`+
+   `<tr><td>${escapeHtml(new Date(t.time).toLocaleString())}</td><td class="${t.kind==='stopout'?'red':''}">${({open:'开仓',close:'平仓',stopout:'强平',tp:'止盈',sl:'止损',cancel:'撤单',void:'委托失效',spot:t.side==='buy'?'现货买入':'现货卖出',funding:'资金费',reset:'重置',borrow:'借款',repay:'还款'})[t.kind]??t.kind}${t.currency==='LEGACY'?' · 旧口径':''}</td>`+
    `<td>${t.position_id||'—'}</td><td>${escapeHtml(pairName(t.symbol))}</td><td>${({long:'多',short:'空',buy:'买',sell:'卖'})[t.side]??'—'}</td>`+
    `<td>${t.kind==='spot'?units(t.lots*.01)+' NSTAR':t.lots}</td><td>${t.entry>0?priceText(t.entry,t.symbol):'—'}</td><td>${priceText(t.price,t.symbol)}</td><td class="${t.pnl==null?'':t.pnl>=0?'green':'red'}">${t.pnl==null?'-':t.currency==='LEGACY'&&!/USD(T)?$/.test(t.symbol)&&t.symbol!=='FXSIM'?'旧口径 '+amountFormat.format(t.pnl):money(t.pnl)}</td><td>${money(t.balance)}</td></tr>`).join('')||'<tr><td colspan="10" class="empty">暂无成交记录</td></tr>';
   historyLoaded=true;panelStatus('history');
@@ -632,14 +689,19 @@ function nstarMid(){return cur.sym==='NSTAR'&&Number.isFinite(quoteLast)?quoteLa
 function heldNstar(){return (lastState?.spot||[]).find(h=>h.sym==='NSTAR')?.units??0}
 function renderSpotForm(){
  const px=nstarMid(),n=Number($('spot-units').value);
- $('spot-total').textContent=Number.isFinite(px)&&n>0?`≈ ${units(px*n*(1+(spotSide==='buy'?1:-1)*(lastState?.spot_fee??.001)),2)} USDT`:'—';
+ const avg=n>0?bookFill(spotSide==='buy'?n:-n):NaN,est=Number.isFinite(avg)?avg:px;
+ $('spot-total').textContent=Number.isFinite(est)&&n>0?`≈ ${units(est*n*(1+(spotSide==='buy'?1:-1)*(lastState?.spot_fee??.001)),2)} USDT`:'—';
  $('spot-avail').textContent=lastState?spotSide==='buy'?`${units(lastState.balance,2)} USDT · 最多 ${units(spotMax(),2)} NSTAR`:`${units(heldNstar())} NSTAR`:'—';
  const max=spotMax();setSlider($('spot-slider'),max>0&&n>0?n/max*100:0,max>0);
+ const f=n>0?bookFill(spotSide==='buy'?n:-n):NaN,imp=f/px-1,node=$('spot-fill');
+ node.textContent=Number.isFinite(f)?`${units(f,4)}（${imp>=0?'+':''}${(imp*100).toFixed(2)}%）`:'—';
+ node.className=Number.isFinite(imp)&&Math.abs(imp)>IMPACT_WARN?'red':'';
 }
 function spotMax(){
- if(!lastState)return 0;if(spotSide==='sell')return heldNstar();
- const exact=lastState.limits?.spot_max_buy,px=nstarMid();
- return Number.isFinite(exact)?exact:Number.isFinite(px)&&px>0?lastState.balance/(px*1.003):0;
+ if(!lastState)return 0;
+ const exact=lastState.limits?.spot_max_buy,px=nstarMid(),sign=spotSide==='buy'?1:-1;
+ const raw=spotSide==='sell'?heldNstar():Number.isFinite(exact)?exact:Number.isFinite(px)&&px>0?lastState.balance/(px*1.003):0;
+ return raw;
 }
 function spotPercent(f){
  if(!lastState)return;
@@ -730,7 +792,7 @@ function renderMarket(m){
  document.querySelectorAll('[data-nstar]').forEach(el=>el.hidden=!star);
  if(!m)return;
  if(star){
-  $('stat-mark').textContent=units(quoteLast,4);$('stat-fair').textContent=units(m.fair,4);
+  $('stat-mark').textContent=units(m.mark??quoteLast,4);$('stat-fair').textContent=units(m.fair,4);
   $('stat-high').textContent=units(m.high_24h,4);$('stat-low').textContent=units(m.low_24h,4);
   $('stat-vol').textContent=compact(m.volume_24h);$('stat-turnover').textContent=compact(m.turnover_24h);
   const f=$('stat-funding');f.textContent=`${(m.funding_rate*100).toFixed(4)}%`;f.className=m.funding_rate>=0?'green':'red';

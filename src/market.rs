@@ -31,6 +31,8 @@ pub struct Quote {
     pub open: bool,
     /// Log-price anchor of an elastic simulated book (NSTAR); None for external quotes.
     pub anchor: Option<f64>,
+    /// Smoothed mark price of a simulated book, used for liquidations; None otherwise.
+    pub mark: Option<f64>,
 }
 impl Quote {
     fn single(price: f64, at: i64) -> Self {
@@ -41,6 +43,7 @@ impl Quote {
             bid_ask: None,
             open: true,
             anchor: None,
+            mark: None,
         }
     }
     pub fn fresh(self, now: i64) -> bool {
@@ -175,6 +178,9 @@ impl Market {
             out.insert(symbol.clone(), valid(q.price)?);
             if let Some(anchor) = q.anchor {
                 out.anchor.insert(symbol.clone(), anchor);
+            }
+            if let Some(mark) = q.mark {
+                out.mark.insert(symbol.clone(), mark);
             }
             if let Some(book) = q.bid_ask {
                 out.bid_ask.insert(symbol, book);
@@ -418,51 +424,71 @@ impl Market {
         now: i64,
     ) -> Result<()> {
         let users = self.store.users().await.map_err(|_| "风险账户读取失败")?;
-        for user in users {
-            if user.account.positions.is_empty() {
+        let mut live = Prices::new();
+        for (s, q) in quotes.iter().filter(|(_, q)| q.fresh(now)) {
+            if !self.offline && symbols::FX.contains(&s.as_str()) && q.bid_ask.is_none() {
                 continue;
             }
-            let needed = match trading::price_symbols(user.account.symbols()) {
+            live.insert(s.clone(), q.price);
+            if let Some(anchor) = q.anchor {
+                live.anchor.insert(s.clone(), anchor);
+            }
+            if let Some(mark) = q.mark {
+                live.mark.insert(s.clone(), mark);
+            }
+            if let Some(book) = q.bid_ask {
+                live.bid_ask.insert(s.clone(), book);
+            }
+        }
+        for user in users {
+            let acc = &user.account;
+            if acc.positions.is_empty() && acc.orders.is_empty() {
+                continue;
+            }
+            let needed = match trading::price_symbols(acc.symbols()) {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            if !needed.contains(symbol) {
+            if !needed.contains(symbol) && !acc.orders.iter().any(|o| o.symbol == symbol) {
                 continue;
             }
-            let mut prices = Prices::new();
-            for (s, q) in quotes.iter().filter(|(_, q)| q.fresh(now)) {
-                if !self.offline && symbols::FX.contains(&s.as_str()) && q.bid_ask.is_none() {
-                    continue;
-                }
-                prices.insert(s.clone(), q.price);
-                if let Some(anchor) = q.anchor {
-                    prices.anchor.insert(s.clone(), anchor);
-                }
-                if let Some(book) = q.bid_ask {
-                    prices.bid_ask.insert(s.clone(), book);
-                }
-            }
-            if needed.iter().any(|s| !prices.contains_key(s)) {
+            if needed.iter().any(|s| !live.contains_key(s)) {
                 continue;
             }
-            // Re-load current holdings under Store's mutation lock; stale account snapshots cannot double-settle.
-            if let Err(e) = self
+            // Re-load current holdings under Store's mutation lock; stale account snapshots
+            // cannot double-settle. Fills move `live` so the next account sees the moved book.
+            let mut moved = None;
+            let result = self
                 .store
-                .transaction(&user.name, |a, _, _| {
-                    let mut trades = a.check_triggers(&prices, now)?;
-                    let mut after = prices.clone();
+                .transaction(&user.name, |a, _, id| {
+                    let mut trades = a.check_triggers(&live, now)?;
+                    let mut after = live.clone();
                     for t in &trades {
                         trading::apply_fill(&mut after, t)?;
                     }
-                    trades.extend(a.check_stopout(&after, now)?);
+                    let fills = a.check_orders(&after, id, now)?;
+                    for t in &fills {
+                        trading::apply_fill(&mut after, t)?;
+                    }
+                    trades.extend(fills);
+                    // Liquidations look at the smoothed mark, never at a momentary spike.
+                    let stops = a.check_stopout_at(&after.marked(), &after, now)?;
+                    for t in &stops {
+                        trading::apply_fill(&mut after, t)?;
+                    }
+                    trades.extend(stops);
+                    moved = Some(after);
                     Ok(trades)
                 })
-                .await
-            {
-                match e {
-                    crate::storage::Error::Invalid(_) => {}
-                    _ => return Err("强平保存失败，账户未改动".into()),
+                .await;
+            match result {
+                Ok(()) => {
+                    if let Some(after) = moved {
+                        live = after;
+                    }
                 }
+                Err(crate::storage::Error::Invalid(_)) => {}
+                Err(_) => return Err("强平保存失败，账户未改动".into()),
             }
         }
         Ok(())
@@ -544,6 +570,9 @@ impl NstarDesk<'_> {
         prices
             .anchor
             .insert(symbols::NSTAR.into(), self.feed.book.anchor);
+        prices
+            .mark
+            .insert(symbols::NSTAR.into(), self.feed.book.mark.exp());
         Ok(())
     }
     /// Move the book by the committed flow and publish the new price before unlocking.
@@ -551,6 +580,18 @@ impl NstarDesk<'_> {
         let Self { market, mut feed } = self;
         let (player, forced) = market.store.take_nstar_flow();
         feed.flow(player, forced);
+        // Resting limit/stop orders answer the moved book before anything is printed, so a
+        // push that resting liquidity absorbs never shows up as a wick on the chart.
+        for _ in 0..MATCH_ROUNDS {
+            market
+                .on_market_quote(symbols::NSTAR, feed.live_quote(now_ms()))
+                .await?;
+            let (player, forced) = market.store.take_nstar_flow();
+            if player == 0.0 && forced == 0.0 {
+                break;
+            }
+            feed.flow(player, forced);
+        }
         let price = feed.book.published();
         feed.record(price, now_ms());
         if market
@@ -628,6 +669,7 @@ pub fn biquote_quote(data: &Value, symbol: &str, now: i64) -> Result<Quote> {
         bid_ask: Some((bid, ask)),
         open: state == "open" && !stale,
         anchor: None,
+        mark: None,
     })
 }
 
@@ -784,9 +826,18 @@ impl SimFeed {
             .map(|b| [b[0] * 1000.0, b[1], b[2], b[3], b[4]])
             .collect()
     }
+    /// Quote at the book's current (possibly not yet printed) price, for order matching.
+    fn live_quote(&self, at: i64) -> Quote {
+        Quote {
+            anchor: Some(self.book.anchor),
+            mark: Some(self.book.mark.exp()),
+            ..Quote::single(self.book.published(), at)
+        }
+    }
     fn quote(&self) -> Quote {
         Quote {
             anchor: (trading::depth(self.symbol) > 0.0).then_some(self.book.anchor),
+            mark: (trading::depth(self.symbol) > 0.0).then(|| self.book.mark.exp()),
             ..Quote::single(self.price, self.updated_at)
         }
     }
@@ -830,6 +881,7 @@ impl SimFeed {
             "fair": self.book.fair.exp(), "funding_rate": self.book.funding_rate(),
             "depth": trading::depth(self.symbol),
             "anchor": self.book.anchor.exp(), "amm_width": trading::amm_width(self.symbol),
+            "mark": self.book.mark.exp(), "liq_backlog": self.book.backlog,
             "tape": tape,
         })
     }
@@ -893,7 +945,17 @@ impl SimFeed {
             _ => {}
         }
         let drift: f64 = StandardNormal.sample(&mut rng);
+        let depth = trading::depth(self.symbol);
+        let width = trading::amm_width(self.symbol);
         let book = &mut self.book;
+        // Liquidated positions reach the book gradually, not as one cascade-sized print.
+        let release = if book.backlog.abs() * LIQ_RELEASE < 1.0 {
+            book.backlog
+        } else {
+            book.backlog * LIQ_RELEASE
+        };
+        book.backlog -= release;
+        book.flow(release, depth, width, true);
         let dev = book.fair - book.base;
         let pull = (FAIR_REVERT * (1.0 + (dev / FAIR_SOFT).powi(2))).min(0.5);
         book.fair -= pull * dev;
@@ -901,6 +963,7 @@ impl SimFeed {
         book.news(&mut rng);
         book.log += REVERT * (book.fair - book.log) + shock + self.trend;
         book.anchor += ANCHOR_FOLLOW * (book.log - book.anchor);
+        book.mark += MARK_FOLLOW * (book.log - book.mark);
         book.published()
     }
     /// Apply player and liquidation flow (signed units) to the book right away.
@@ -909,7 +972,7 @@ impl SimFeed {
         if depth > 0.0 {
             let width = trading::amm_width(self.symbol);
             self.book.flow(units, depth, width, false);
-            self.book.flow(forced, depth, width, true);
+            self.book.liquidations(forced, depth, width);
         }
     }
 }
@@ -928,6 +991,13 @@ const REVERT: f64 = 0.0015;
 const CONVICTION: f64 = 0.35;
 /// Per-tick pull of the AMM anchor toward the book: a gap halves in ~5 min (1,500 ticks).
 const ANCHOR_FOLLOW: f64 = std::f64::consts::LN_2 / 1500.0;
+/// Mark price trails the book with a ~30 s half-life (150 ticks): a few seconds of spike
+/// moves it a few percent at most, a move that holds is reflected within a minute.
+const MARK_FOLLOW: f64 = std::f64::consts::LN_2 / 150.0;
+/// Rounds of resting-order matching an order commit runs before printing its price.
+const MATCH_ROUNDS: usize = 4;
+/// Share of the liquidation backlog released into the book per tick: ~10 s half-life.
+const LIQ_RELEASE: f64 = 0.0138;
 const RUMOR_LEAD: u32 = 25;
 const RUMOR_ACCURACY: f64 = 0.65;
 const NEWS_MIN_GAP: u32 = 1500;
@@ -947,6 +1017,10 @@ struct Book {
     base: f64,
     /// Slow-moving log-price centre of the elastic AMM curve.
     anchor: f64,
+    /// Smoothed log mark price that liquidations trigger on.
+    mark: f64,
+    /// Signed liquidation units still waiting to be unwound into the book.
+    backlog: f64,
     news_in: u32,
     pending: Option<f64>,
     events: Vec<Value>,
@@ -964,6 +1038,8 @@ impl Book {
             fair: log,
             base: lb,
             anchor: log,
+            mark: log,
+            backlog: 0.0,
             news_in: NEWS_MIN_GAP,
             pending: None,
             events: Vec::new(),
@@ -1040,8 +1116,25 @@ impl Book {
     fn funding_rate(&self) -> f64 {
         ((self.log - self.fair) * FUNDING_SHARE).clamp(-FUNDING_CAP, FUNDING_CAP)
     }
+    /// Queue liquidated units for gradual release, announcing a big wave once on arrival.
+    fn liquidations(&mut self, units: f64, depth: f64, width: f64) {
+        if units == 0.0 {
+            return;
+        }
+        self.backlog += units;
+        let x0 = self.log - self.anchor;
+        let d = trading::amm_shift(x0, units, depth, width) - x0;
+        if d.abs() >= BIG_FLOW {
+            let side = if units > 0.0 { "买入" } else { "卖出" };
+            let size = units.abs();
+            self.event(
+                "whale",
+                format!("强平潮：{size:.0} NSTAR 将被强制{side}，约半分钟内逐步释放到盘口"),
+            );
+        }
+    }
     /// Signed units bought (+) or sold (-) move the book immediately along the AMM curve.
-    fn flow(&mut self, units: f64, depth: f64, width: f64, forced: bool) {
+    fn flow(&mut self, units: f64, depth: f64, width: f64, released: bool) {
         if units == 0.0 {
             return;
         }
@@ -1052,16 +1145,15 @@ impl Book {
         self.log += d;
         self.fair += CONVICTION * d;
         self.print(avg, units);
-        if d.abs() >= BIG_FLOW {
+        // Released liquidations were announced when they were queued.
+        if d.abs() >= BIG_FLOW && !released {
             let side = if units > 0.0 { "买入" } else { "卖出" };
             let pct = d.exp_m1() * 100.0;
             let size = units.abs();
-            let text = if forced {
-                format!("强平潮：{size:.0} NSTAR 被强制{side}，价格 {pct:+.1}%")
-            } else {
-                format!("巨鲸出没：有人一口气{side} {size:.0} NSTAR，价格 {pct:+.1}%")
-            };
-            self.event("whale", text);
+            self.event(
+                "whale",
+                format!("巨鲸出没：有人一口气{side} {size:.0} NSTAR，价格 {pct:+.1}%"),
+            );
         }
     }
 }

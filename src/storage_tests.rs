@@ -236,6 +236,10 @@ async fn python_era_schema_accounts_tokens_and_legacy_currency_survive_restart()
     let s = Store::open(&path).await.unwrap();
     let u = s.user("旧用户").await.unwrap();
     assert_eq!(u.account.positions[0].symbol, "USDJPY");
+    assert_eq!(
+        u.account.leverage, 10,
+        "legacy leverage migrates to the new ceiling"
+    );
     let old: String = sqlx::query_scalar("SELECT token FROM users WHERE name='旧用户'")
         .fetch_one(&s.pool)
         .await

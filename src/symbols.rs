@@ -115,26 +115,18 @@ const SPECS: &[Spec] = &[
     lot(SIM, TIGHT, None),
     // 1 lot = 0.01 NSTAR. ~500 NSTAR (~$50k) moves the price ~1% near the anchor. The
     // elastic curve thickens away from it: 20,000 NSTAR lifts ~18% (49% on a flat book),
-    // 100,000 ~37% (flat: 7x). Perpetual size is limited by leverage tiers rather than a
-    // wall: the first 10,000 NSTAR gross get 100x, the next slices 50x/20x/10x, up to a
-    // 100,000 NSTAR safety ceiling (effective ~15x when full); spot also tops out at
-    // 100,000. One order may use the whole ceiling, since splitting costs the same. Fills
-    // pay for every step of a move both ways, so a pump only pays off for whoever sells
-    // into someone else's buying.
+    // 100,000 ~37% (flat: 7x). There is no total holding cap: progressively lower leverage
+    // and full collateral beyond 100,000 NSTAR make size expensive instead of forbidden.
+    // One order has a numeric safety bound, but accounts may accumulate any total size.
     Spec {
         contract: 0.01,
-        max_leverage: 100,
-        max_open_lots: 10_000_000.0,
+        max_leverage: 10,
+        max_open_lots: 0.0,
         max_order_lots: 10_000_000.0,
-        leverage_tiers: &[
-            (10_000.0, 100),
-            (25_000.0, 50),
-            (50_000.0, 20),
-            (100_000.0, 10),
-        ],
+        leverage_tiers: &[(10_000.0, 10), (25_000.0, 5), (50_000.0, 2), (100_000.0, 1)],
         depth: 50_000.0,
         amm_width: 0.08,
-        max_spot_units: 100_000.0,
+        max_spot_units: 0.0,
         ..coin(NSTAR)
     },
     lot("BTCUSDT", TIGHT, None),

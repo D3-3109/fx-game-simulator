@@ -718,7 +718,10 @@ async fn load_user(conn: &mut SqliteConnection, name: &str) -> Result<User> {
         .fetch_optional(&mut *conn)
         .await?
         .ok_or_else(|| invalid("账号不存在"))?;
-    let account: Account = serde_json::from_str(row.get("account"))?;
+    let mut account: Account = serde_json::from_str(row.get("account"))?;
+    // Leverage reductions are safe migrations: existing positions stay open, while future
+    // margin checks and API edits immediately use the new ceiling.
+    account.leverage = account.leverage.clamp(1, trading::MAX_LEVERAGE);
     account.validate()?;
     let last_trade = history(conn, name, 1).await?.into_iter().next();
     Ok(User {

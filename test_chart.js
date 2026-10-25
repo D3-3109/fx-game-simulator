@@ -321,30 +321,32 @@ const candle = price => {
   context.fetch=normalFetch;
 
   // Leverage edit is a draft: live state must not reset input, even while save is pending.
-  context.levState={...JSON.parse(context.statePacket),leverage:100,positions:[]};
+  context.levState={...JSON.parse(context.statePacket),leverage:5,positions:[]};
   run('levDirty=false;render(levState)');
-  assert.equal(elements.lev.value,100);
-  run("$('lev').value='500';levDirty=true;render(levState)");
-  assert.equal(elements.lev.value,'500','live state overwrote unsaved higher leverage');
+  assert.equal(elements.lev.value,5);
+  run("$('lev').value='10';levDirty=true;render(levState)");
+  assert.equal(elements.lev.value,'10','live state overwrote unsaved leverage');
   let finishLev;
   context.fetch=(url,options)=>{
-    assert.equal(url,'/api/leverage');assert.equal(JSON.parse(options.body).leverage,500);
+    assert.equal(url,'/api/leverage');assert.equal(JSON.parse(options.body).leverage,10);
     return new Promise(resolve=>{finishLev=resolve;});
   };
   const saving=run('setLev()');
   assert.equal(elements.lev.disabled,true);assert.equal(elements['lev-apply'].disabled,true);
-  run('render(levState)');assert.equal(elements.lev.value,'500','state overwrote in-flight save');
-  context.levState.leverage=500;
+  run('render(levState)');assert.equal(elements.lev.value,'10','state overwrote in-flight save');
+  context.levState.leverage=10;
   context.fetch=async()=>({json:async()=>context.levState});
   finishLev({status:200,json:async()=>({ok:true})});await saving;
-  assert.equal(run('accountLeverage'),500);assert.equal(run('levDirty'),false);
-  assert.equal(elements.lev.disabled,false);assert.match(elements['lev-hint'].textContent,/500/);
+  assert.equal(run('accountLeverage'),10);assert.equal(run('levDirty'),false);
+  assert.equal(elements.lev.disabled,false);assert.match(elements['lev-hint'].textContent,/10/);
   context.fetch=async()=>({status:400,json:async()=>({ok:false,err:'先平仓'})});
-  run("$('lev').value='1000';levDirty=true");await run('setLev()');
-  assert.equal(elements.lev.value,500,'rejected leverage still appeared applied');
+  run("$('lev').value='9';levDirty=true");await run('setLev()');
+  assert.equal(elements.lev.value,10,'rejected leverage still appeared applied');
   const blocked=[];context.fetch=async url=>{blocked.push(url);throw Error('must not request');};
   run("$('lev').value='1.5';levDirty=true");await run('setLev()');
   assert.equal(blocked.length,0);
+  run("$('lev').value='11';levDirty=true");await run('setLev()');
+  assert.equal(blocked.length,0,'leverage above 10 reached the server');
   context.levState.positions=[{id:1,side:'long',lots:.1,sym:'FXSIM',entry:1.1,now:1.1,pnl:0,margin:11}];
   run('render(levState)');assert.equal(elements.lev.disabled,true);assert.equal(elements['lev-apply'].disabled,true);
   await run('setLev()');assert.equal(blocked.length,0,'in-position leverage changed');
@@ -606,16 +608,16 @@ const candle = price => {
   run("cur.sym='NSTAR';kLoaded=false;observePrices('NSTAR',[101.24453000000001])");
   assert.equal(run("priceText(101.24453000000001,'NSTAR')"),'101.24','NSTAR fills leaked float noise');
   context.exState=JSON.stringify({ok:true,type:'state',symbol:'NSTAR',price:100,bid:99.97,ask:100.03,quote_valid:true,balance:9000,equity:9100,used:20,
-    leverage:100,margin_level:4.5,contract:.01,symbol_leverage:100,nstar_price:100,spot_fee:.001,
+    leverage:10,margin_level:4.5,contract:.01,symbol_leverage:10,nstar_price:100,spot_fee:.001,
     spot:[{sym:'NSTAR',units:2,cost:95,price:100,value:199.6,pnl:9.6}],
-    positions:[{id:7,side:'long',lots:2000,sym:'NSTAR',entry:99,now:100.1,pnl:22,margin:20,units:20,leverage:100,roe:1.1,tp:120,sl:0,liq:95.5}]});
+    positions:[{id:7,side:'long',lots:2000,sym:'NSTAR',entry:99,now:100.1,pnl:22,margin:20,units:20,leverage:10,roe:1.1,tp:120,sl:0,liq:95.5}]});
   run('render(JSON.parse(exState))');
   assert.match(elements.pos.innerHTML,/NSTAR\/USDT/);assert.match(elements.pos.innerHTML,/95\.50/);
   assert.match(elements.pos.innerHTML,/110\.00%/,'ROE missing');assert.match(elements.pos.innerHTML,/openTpsl\(7\)/);
   assert.match(elements.spotT.innerHTML,/NSTAR/);assert.equal(elements['spot-count'].textContent,1);
   assert.equal(elements['quote-unit'].textContent,'USDT');
   run("$('lots').value='1000';renderOrderEstimate()");
-  assert.equal(elements['order-notional'].textContent,'1,000 USDT');assert.match(elements['order-margin'].textContent,/^10 USDT · 100x$/);
+  assert.equal(elements['order-notional'].textContent,'1,000 USDT');assert.match(elements['order-margin'].textContent,/^100 USDT · 10x$/);
   run("renderBook(100)");
   assert.match(elements['book-asks'].innerHTML,/100\.05/);assert.match(elements['book-bids'].innerHTML,/99\.95/);
   run("renderTape([[1800000000000,100.5,3],[1800000000000,99.5,-2]])");
@@ -633,6 +635,17 @@ const candle = price => {
   context.fetch=async url=>{requests.push(url);return {status:200,json:async()=>({ok:true})};};
   const noState=requests.length;await run("trade('buy')");
   assert.deepEqual(requests.slice(noState),['/api/trade','/api/state'],'missing state must fall back to GET');
+  // Spot condition orders use /api/order with units and an explicit market, not perpetual lots.
+  let spotBody;
+  context.fetch=async(url,options)=>{requests.push(url);spotBody=JSON.parse(options.body);return {status:200,json:async()=>({ok:true,state:JSON.parse(context.exState)})};};
+  run("orderBusy=false;cur.sym='NSTAR';quoteReady=true;setSpotSide('sell');setSpotType('stop');$('spot-units').value='1.25';$('spot-trigger').value='95';$('spot-price').value='94'");
+  assert.equal(elements['spot-trigger-field'].hidden,false);assert.equal(elements['spot-price-field'].hidden,false);
+  await run('spotTrade()');
+  assert.equal(requests.at(-1),'/api/order');
+  assert.deepEqual({...spotBody},{market:'spot',kind:'stop',side:'sell',units:1.25,price:95,limit:94});
+  run("renderOrders({orders:[{id:2,kind:'limit',side:'sell',spot:true,symbol:'NSTAR',lots:125,price:94,limit:0,tp:0,sl:0,created:1800000000000}]})");
+  assert.match(elements.ordersT.innerHTML,/限价 · 现货/);assert.doesNotMatch(elements.ordersT.innerHTML,/卖出开空/);
+  run("setSpotType('market')");assert.equal(elements['spot-trigger-field'].hidden,true);assert.equal(elements['spot-price-field'].hidden,true);
   // A brand-new account's first trade still reloads history (cursor aligned on empty state).
   run('tradeCursor=false;seenTrade=0;historyLoaded=true;observeTrade(undefined)');
   const hist=requests.length;run("observeTrade({id:1,kind:'open'})");

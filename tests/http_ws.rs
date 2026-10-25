@@ -169,7 +169,7 @@ async fn fx_source_sides_match_state_fills_marks_closes_and_closed_market_reject
         near(&state["positions"][0]["entry"], entry);
         near(&state["positions"][0]["now"], exit);
         let pnl = state["positions"][0]["pnl"].as_f64().unwrap();
-        near(&state["positions"][0]["margin"], 10.0);
+        near(&state["positions"][0]["margin"], 100.0);
         let (status, reply) = h.request("/api/close", Some(json!({})), &token).await;
         assert_eq!(status, 200, "{reply}");
         let history = h.request("/api/history", None, &token).await.1;
@@ -262,7 +262,7 @@ async fn http_account_trading_cross_pair_currency_and_auth_contract() {
         200
     );
     let state = h.request("/api/state", None, &token).await.1;
-    near(&state["used"], 100.0);
+    near(&state["used"], 1_000.0);
     near(&state["positions"][0]["pnl"], -100.0 / 150.0);
     let id = state["positions"][0]["id"].clone();
     assert_eq!(
@@ -296,7 +296,7 @@ async fn http_account_trading_cross_pair_currency_and_auth_contract() {
         json!([])
     );
     assert_eq!(
-        h.request("/api/leverage", Some(json!({"leverage":200})), &token)
+        h.request("/api/leverage", Some(json!({"leverage":10})), &token)
             .await
             .0,
         200
@@ -869,6 +869,20 @@ async fn resting_limit_orders_fill_into_a_push_before_it_is_printed() {
     let h = Harness::new().await;
     let maker = h.register("maker").await;
     let taker = h.register("taker").await;
+    let admin = h.admin().await;
+    for (name, request_id) in [
+        ("maker", "00000000000000000000000000000001"),
+        ("taker", "00000000000000000000000000000002"),
+    ] {
+        let (status, v) = h
+            .request(
+                "/api/admin/deposit",
+                Some(json!({"name":name,"amount":100_000.0,"request_id":request_id})),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 200, "{v}");
+    }
     for token in [&maker, &taker] {
         h.request("/api/symbol", Some(json!({"symbol":"NSTAR"})), token)
             .await;
@@ -989,6 +1003,79 @@ async fn resting_limit_orders_fill_into_a_push_before_it_is_printed() {
 }
 
 #[tokio::test]
+async fn nstar_spot_limit_and_stop_orders_use_the_shared_book() {
+    let h = Harness::new().await;
+    let token = h.register("spot_orders").await;
+    h.request("/api/symbol", Some(json!({"symbol":"NSTAR"})), &token)
+        .await;
+    let market = h.request("/api/market", None, "").await.1;
+    let mid = market["fair"].as_f64().unwrap();
+    let (status, v) = h
+        .request(
+            "/api/order",
+            Some(json!({"market":"spot","kind":"limit","side":"buy","units":2.0,"price":mid*0.9})),
+            &token,
+        )
+        .await;
+    assert_eq!(status, 200, "{v}");
+    assert!(v["state"]["orders"].is_array(), "{v}");
+    assert_eq!(v["state"]["orders"].as_array().unwrap().len(), 1, "{v}");
+    assert_eq!(v["state"]["orders"][0]["spot"], true);
+    assert!(v["state"]["positions"].as_array().unwrap().is_empty());
+
+    let quote = |price, now| fx_sim_rust::market::Quote {
+        price,
+        at: now,
+        received_at: now,
+        bid_ask: None,
+        open: true,
+        anchor: Some(price.ln()),
+        mark: Some(price),
+    };
+    h.app
+        .market
+        .on_market_quote("NSTAR", quote(mid * 0.89, now_ms()))
+        .await
+        .unwrap();
+    let state = h.request("/api/state", None, &token).await.1;
+    assert!(
+        (state["spot"][0]["units"].as_f64().unwrap() - 2.0).abs() < 1e-9,
+        "{state}"
+    );
+    assert!(state["orders"].as_array().unwrap().is_empty());
+    assert!(state["positions"].as_array().unwrap().is_empty());
+
+    let (status, v) = h.request("/api/order", Some(json!({"market":"spot","kind":"stop","side":"sell","units":1.0,"price":mid*0.95,"limit":mid*0.935})), &token).await;
+    assert_eq!(status, 200, "{v}");
+    h.app
+        .market
+        .on_market_quote("NSTAR", quote(mid * 0.96, now_ms()))
+        .await
+        .unwrap();
+    let state = h.request("/api/state", None, &token).await.1;
+    assert_eq!(state["orders"].as_array().unwrap().len(), 1);
+    h.app
+        .market
+        .on_market_quote("NSTAR", quote(mid * 0.939, now_ms()))
+        .await
+        .unwrap();
+    let state = h.request("/api/state", None, &token).await.1;
+    assert!(
+        (state["spot"][0]["units"].as_f64().unwrap() - 1.0).abs() < 1e-9,
+        "{state}"
+    );
+    assert!(state["orders"].as_array().unwrap().is_empty());
+    let history = h.request("/api/history", None, &token).await.1;
+    assert!(
+        history["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["kind"] == "spot" && r["side"] == "sell")
+    );
+}
+
+#[tokio::test]
 async fn nstar_spot_wallet_tpsl_and_public_market_panel() {
     let h = Harness::new().await;
     let token = h.register("spotter").await;
@@ -1053,7 +1140,7 @@ async fn nstar_spot_wallet_tpsl_and_public_market_panel() {
     let p = &state["positions"][0];
     let (id, mid) = (p["id"].as_u64().unwrap(), state["price"].as_f64().unwrap());
     assert!(p["liq"].is_null() || p["liq"].as_f64().unwrap() < mid);
-    assert_eq!(p["leverage"], 100);
+    assert_eq!(p["leverage"], 10);
     let (status, v) = h
         .request(
             "/api/tpsl",

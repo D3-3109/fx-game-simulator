@@ -731,6 +731,8 @@ struct SimFeed {
     book: Book,
     kind: usize,
     left: u32,
+    /// Local fair-value centre while NSTAR is ranging; trends move this centre on entry.
+    range_center: f64,
     updated_at: i64,
     bars: BTreeMap<i64, VecDeque<[f64; 5]>>,
     /// Intervals whose candle closed since the last packet.
@@ -748,6 +750,7 @@ impl SimFeed {
             book: Book::new(base, base),
             kind: 0,
             left: 0,
+            range_center: base.ln(),
             updated_at: now,
             bars: symbols::INTERVALS
                 .iter()
@@ -886,6 +889,11 @@ impl SimFeed {
         })
     }
     fn regime(&mut self, rng: &mut impl Rng) {
+        if trading::depth(self.symbol) > 0.0 {
+            self.book_regime(rng);
+            return;
+        }
+        // FXSIM keeps its original short-cycle walk.
         if self.left == 0 {
             let r = rng.random::<f64>() * 10.0;
             let mut sum = 0.0;
@@ -897,6 +905,35 @@ impl SimFeed {
                 }
             }
             self.left = [20, 6, 40, 15, 15][self.kind];
+        }
+        self.left -= 1;
+    }
+    /// NSTAR regimes last minutes, not seconds. Ranging has a stable local centre; bull and
+    /// bear states carry both price and fair value so trends are not immediately reverted.
+    fn book_regime(&mut self, rng: &mut impl Rng) {
+        if self.left == 0 {
+            let r = rng.random::<f64>() * 100.0;
+            let mut sum = 0.0;
+            for (i, w) in [35.0, 15.0, 0.0, 25.0, 25.0].iter().enumerate() {
+                sum += w;
+                if r <= sum {
+                    self.kind = i;
+                    break;
+                }
+            }
+            self.left = match self.kind {
+                0 => rng.random_range(RANGE_TICKS),
+                1 => rng.random_range(VOLATILE_TICKS),
+                3 | 4 => rng.random_range(TREND_TICKS),
+                _ => unreachable!("zero-weight regime selected"),
+            };
+            let strength = rng.random_range(TREND_DRIFT);
+            self.trend = match self.kind {
+                3 => -strength,
+                4 => strength,
+                _ => 0.0,
+            };
+            self.range_center = self.book.fair;
         }
         self.left -= 1;
     }
@@ -933,37 +970,44 @@ impl SimFeed {
     /// the book slowly, so liquidity re-centres on sustained moves but not on spikes.
     fn next_book_price(&mut self) -> f64 {
         let mut rng = rand::rng();
-        self.regime(&mut rng);
-        self.trend *= 0.95;
-        let mut shock: f64 = StandardNormal.sample(&mut rng);
-        shock *= TICK_VOL;
-        match self.kind {
-            1 => shock *= 6.0,
-            2 => self.trend += if rng.random::<bool>() { 0.3 } else { -0.3 } * TICK_VOL,
-            3 => shock -= 1.5 * TICK_VOL,
-            4 => shock += 1.5 * TICK_VOL,
-            _ => {}
-        }
-        let drift: f64 = StandardNormal.sample(&mut rng);
+        self.next_book_price_with(&mut rng)
+    }
+    fn next_book_price_with(&mut self, rng: &mut impl Rng) -> f64 {
+        self.regime(rng);
+        let volatility = match self.kind {
+            0 => RANGE_VOL,
+            1 => VOLATILE_VOL,
+            _ => TREND_VOL,
+        };
+        let shock: f64 = StandardNormal.sample(rng);
+        let drift: f64 = StandardNormal.sample(rng);
         let depth = trading::depth(self.symbol);
         let width = trading::amm_width(self.symbol);
         let book = &mut self.book;
-        // Liquidated positions reach the book gradually, not as one cascade-sized print.
+        // Large liquidation queues cannot turn into an unlimited market-order waterfall.
         let release = if book.backlog.abs() * LIQ_RELEASE < 1.0 {
             book.backlog
         } else {
-            book.backlog * LIQ_RELEASE
+            (book.backlog * LIQ_RELEASE).clamp(-LIQ_RELEASE_CAP, LIQ_RELEASE_CAP)
         };
         book.backlog -= release;
         book.flow(release, depth, width, true);
         let dev = book.fair - book.base;
         let pull = (FAIR_REVERT * (1.0 + (dev / FAIR_SOFT).powi(2))).min(0.5);
         book.fair -= pull * dev;
-        book.fair += drift * FAIR_VOL;
-        book.news(&mut rng);
-        book.log += REVERT * (book.fair - book.log) + shock + self.trend;
+        if self.kind == 0 {
+            book.fair += RANGE_FAIR_REVERT * (self.range_center - book.fair);
+        }
+        book.fair += self.trend + drift * FAIR_VOL * volatility;
+        book.news(rng);
+        let revert = if self.kind == 0 { RANGE_REVERT } else { REVERT };
+        book.log += revert * (book.fair - book.log) + shock * TICK_VOL * volatility + self.trend;
         book.anchor += ANCHOR_FOLLOW * (book.log - book.anchor);
-        book.mark += MARK_FOLLOW * (book.log - book.mark);
+        // Fair value is the internal index. The book premium is bounded and smoothed, so a
+        // whale must sustain a real repricing rather than wick the mark through stops.
+        let premium = (book.log - book.fair).clamp(-MARK_MAX_PREMIUM, MARK_MAX_PREMIUM);
+        let mark_target = book.fair + premium;
+        book.mark += MARK_FOLLOW * (mark_target - book.mark);
         book.published()
     }
     /// Apply player and liquidation flow (signed units) to the book right away.
@@ -977,6 +1021,17 @@ impl SimFeed {
     }
 }
 
+// At five ticks per second these are 10–30 min ranges, 5–15 min volatile periods and
+// 15–45 min directional moves. Directional drift is 0.24–0.54% per minute before noise.
+const RANGE_TICKS: std::ops::RangeInclusive<u32> = 3_000..=9_000;
+const VOLATILE_TICKS: std::ops::RangeInclusive<u32> = 1_500..=4_500;
+const TREND_TICKS: std::ops::RangeInclusive<u32> = 4_500..=13_500;
+const TREND_DRIFT: std::ops::RangeInclusive<f64> = 0.000008..=0.000018;
+const RANGE_VOL: f64 = 0.65;
+const VOLATILE_VOL: f64 = 2.2;
+const TREND_VOL: f64 = 0.9;
+const RANGE_FAIR_REVERT: f64 = std::f64::consts::LN_2 / 1_500.0;
+const RANGE_REVERT: f64 = 0.0025;
 const TICK_VOL: f64 = 0.0003;
 const FAIR_VOL: f64 = 0.00012;
 /// Fair value drifts back toward base with a ~1 h half-life near it...
@@ -991,13 +1046,16 @@ const REVERT: f64 = 0.0015;
 const CONVICTION: f64 = 0.35;
 /// Per-tick pull of the AMM anchor toward the book: a gap halves in ~5 min (1,500 ticks).
 const ANCHOR_FOLLOW: f64 = std::f64::consts::LN_2 / 1500.0;
-/// Mark price trails the book with a ~30 s half-life (150 ticks): a few seconds of spike
-/// moves it a few percent at most, a move that holds is reflected within a minute.
-const MARK_FOLLOW: f64 = std::f64::consts::LN_2 / 150.0;
+/// Mark price trails a fair-value-anchored target with a ~60 s half-life (300 ticks).
+const MARK_FOLLOW: f64 = std::f64::consts::LN_2 / 300.0;
+/// A last-price premium can only move the liquidation mark this far from fair value.
+const MARK_MAX_PREMIUM: f64 = 0.05;
 /// Rounds of resting-order matching an order commit runs before printing its price.
 const MATCH_ROUNDS: usize = 4;
 /// Share of the liquidation backlog released into the book per tick: ~10 s half-life.
 const LIQ_RELEASE: f64 = 0.0138;
+/// Absolute forced-flow release cap per tick; exponential release still handles small queues.
+const LIQ_RELEASE_CAP: f64 = 10.0;
 const RUMOR_LEAD: u32 = 25;
 const RUMOR_ACCURACY: f64 = 0.65;
 const NEWS_MIN_GAP: u32 = 1500;
@@ -1143,7 +1201,11 @@ impl Book {
         let d = x1 - x0;
         let avg = self.log.exp() * trading::amm_avg(x0, x1, width);
         self.log += d;
-        self.fair += CONVICTION * d;
+        // Forced flow has a temporary execution impact, not a vote on fundamental value.
+        // Otherwise each liquidation lowers/raises fair value and helps trigger the next one.
+        if !released {
+            self.fair += CONVICTION * d;
+        }
         self.print(avg, units);
         // Released liquidations were announced when they were queued.
         if d.abs() >= BIG_FLOW && !released {

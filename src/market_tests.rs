@@ -1,5 +1,5 @@
 use super::*;
-use crate::trading::Position;
+use crate::trading::{Account, Position};
 
 #[test]
 fn biquote_latest_is_order_independent_and_active_close_changes_intraminute() {
@@ -317,6 +317,141 @@ fn nstar_run(sim: &mut SimFeed, t: i64, from: i64, to: i64) {
         sim.record(price, t + step * 200);
     }
 }
+fn nstar_run_seeded(sim: &mut SimFeed, seed: u64, ticks: usize) {
+    use rand::{SeedableRng, rngs::StdRng};
+    let mut rng = StdRng::seed_from_u64(seed);
+    for _ in 0..ticks {
+        sim.next_book_price_with(&mut rng);
+    }
+}
+
+#[test]
+fn nstar_regimes_create_persistent_trends_and_local_ranges() {
+    let t = 1800000000000;
+    let base = SimFeed::new("NSTAR", 100.0, t);
+    let mut bull = base.clone();
+    bull.kind = 4;
+    bull.left = 10_000;
+    bull.trend = 0.000014;
+    let mut bear = base.clone();
+    bear.kind = 3;
+    bear.left = 10_000;
+    bear.trend = -0.000014;
+    let mut range = base;
+    range.kind = 0;
+    range.left = 10_000;
+    range.trend = 0.0;
+    range.range_center = range.book.fair;
+    bull.book.news_in = 100_000;
+    bear.book.news_in = 100_000;
+    range.book.news_in = 100_000;
+    nstar_run_seeded(&mut bull, 7, 1_500);
+    nstar_run_seeded(&mut bear, 7, 1_500);
+    nstar_run_seeded(&mut range, 7, 1_500);
+    let up = bull.book.log - 100.0f64.ln();
+    let down = bear.book.log - 100.0f64.ln();
+    let sideways = range.book.log - 100.0f64.ln();
+    assert!(up > 0.005, "five-minute bull move: {up}");
+    assert!(down < -0.005, "five-minute bear move: {down}");
+    assert!(
+        sideways.abs() < 0.02,
+        "range did not stay local: {sideways}"
+    );
+    assert!((range.book.fair - range.range_center).abs() < 0.02);
+}
+
+#[test]
+fn nstar_regime_durations_are_minutes_not_seconds() {
+    use rand::{SeedableRng, rngs::StdRng};
+    let t = 1800000000000;
+    let mut rng = StdRng::seed_from_u64(19);
+    for _ in 0..100 {
+        let mut sim = SimFeed::new("NSTAR", 100.0, t);
+        sim.book_regime(&mut rng);
+        let expected = match sim.kind {
+            0 => RANGE_TICKS,
+            1 => VOLATILE_TICKS,
+            3 | 4 => TREND_TICKS,
+            other => panic!("invalid regime {other}"),
+        };
+        assert!(expected.contains(&(sim.left + 1)));
+        assert!(sim.left >= 1_499, "{} {}", sim.kind, sim.left);
+        if matches!(sim.kind, 3 | 4) {
+            assert!(sim.trend.abs() >= *TREND_DRIFT.start());
+        }
+    }
+}
+
+#[test]
+fn nstar_forced_flow_cannot_rewrite_fair_value_or_jump_mark() {
+    let t = 1800000000000;
+    let mut sim = SimFeed::new("NSTAR", 100.0, t);
+    let fair = sim.book.fair;
+    sim.book.flow(-1_000.0, 50_000.0, 0.08, true);
+    assert_eq!(sim.book.fair, fair);
+    sim.book.flow(1_000.0, 50_000.0, 0.08, false);
+    assert!(sim.book.fair > fair, "voluntary conviction must persist");
+
+    let mut sim = SimFeed::new("NSTAR", 100.0, t);
+    sim.flow(40_000.0, 0.0);
+    nstar_run_seeded(&mut sim, 23, 300);
+    let premium = sim.book.mark - sim.book.fair;
+    assert!(premium <= MARK_MAX_PREMIUM + 1e-12, "{premium}");
+    assert!(
+        sim.book.log - sim.book.mark > 0.03,
+        "mark followed the raid"
+    );
+}
+#[test]
+fn nstar_whale_wick_does_not_cascade_an_otherwise_solvent_account() {
+    let t = 1800000000000;
+    let initial: Prices = [("NSTAR".to_string(), 100.0)].into();
+    let mut victim = Account {
+        balance: 2_000.0,
+        ..Account::default()
+    };
+    victim
+        .open("short", 10_000.0, "NSTAR", &initial, 1, 0)
+        .unwrap();
+    let mut sim = SimFeed::new("NSTAR", 100.0, t);
+    sim.flow(40_000.0, 0.0);
+    nstar_run_seeded(&mut sim, 31, 5);
+    let mut live: Prices = [("NSTAR".to_string(), sim.book.log.exp())].into();
+    live.anchor.insert("NSTAR".into(), sim.book.anchor);
+    live.mark.insert("NSTAR".into(), sim.book.mark.exp());
+    assert!(live["NSTAR"] > 115.0, "test requires a real book spike");
+    assert!(
+        !victim.clone().check_stopout(&live, 1).unwrap().is_empty(),
+        "raw price would liquidate"
+    );
+    assert!(
+        victim
+            .check_stopout_at(&live.marked(), &live, 1)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        victim.positions.len(),
+        1,
+        "fair-anchored mark prevented the cascade"
+    );
+}
+
+#[test]
+fn nstar_large_liquidation_queue_has_a_release_cap() {
+    let t = 1800000000000;
+    let mut sim = SimFeed::new("NSTAR", 100.0, t);
+    sim.kind = 0;
+    sim.left = 10_000;
+    sim.flow(0.0, -60_000.0);
+    let mut control = SimFeed::new("NSTAR", 100.0, t);
+    control.kind = 0;
+    control.left = 10_000;
+    nstar_run_seeded(&mut sim, 29, 1);
+    nstar_run_seeded(&mut control, 29, 1);
+    assert!((sim.book.backlog + 60_000.0 - LIQ_RELEASE_CAP).abs() < 1e-9);
+    assert_eq!(sim.book.fair, control.book.fair, "forced flow moved fair");
+}
 
 #[test]
 fn nstar_flow_moves_price_by_depth_then_mostly_reverts() {
@@ -327,7 +462,7 @@ fn nstar_flow_moves_price_by_depth_then_mostly_reverts() {
     let moved = sim.book.log.exp();
     assert!((moved / 100.0 - 1.0 - 0.0461).abs() < 1e-3, "{moved}");
     assert!(sim.book.events.iter().any(|e| e["kind"] == "whale"));
-    // Within ~5 minutes most of the push is gone; only conviction (20%) and noise remain.
+    // Within ~5 minutes price rejoins fair; 35% of player impact became conviction.
     let mut errs = Vec::new();
     for _ in 0..40 {
         let mut s = sim.clone();
@@ -378,15 +513,14 @@ fn nstar_mark_lags_spikes_and_liquidations_unwind_gradually() {
     // Liquidated units are queued, announced, then released over tens of seconds.
     let mut sim = SimFeed::new("NSTAR", 100.0, t);
     let before = sim.book.log;
-    sim.flow(0.0, -60_000.0);
+    sim.flow(0.0, -200.0);
     assert_eq!(sim.book.log, before, "nothing hits the book at once");
-    assert!(sim.book.events.iter().any(|e| e["kind"] == "whale"));
     nstar_run(&mut sim, t, 1, 2);
     let first = sim.book.backlog;
-    assert!(first < -58_000.0 && first > -60_000.0, "{first}");
+    assert!(first < -196.0 && first > -200.0, "{first}");
     nstar_run(&mut sim, t, 2, 51);
     let half = sim.book.backlog;
-    assert!(half < -25_000.0 && half > -35_000.0, "{half}");
+    assert!(half < -80.0 && half > -120.0, "{half}");
     nstar_run(&mut sim, t, 51, 600);
     assert!(sim.book.backlog.abs() < 1.0, "{}", sim.book.backlog);
 }

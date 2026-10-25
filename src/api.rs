@@ -377,13 +377,20 @@ async fn post_inner(
             result?;
         }
         "/api/order" => {
-            let side = match text(body, "side")? {
-                "buy" | "long" => "long",
-                "sell" | "short" => "short",
-                _ => return Err(bad("交易方向无效")),
+            let spot = body["market"].as_str() == Some("spot");
+            let side = match (text(body, "side")?, spot) {
+                ("buy", true) => "buy",
+                ("sell", true) => "sell",
+                ("buy" | "long", false) => "long",
+                ("sell" | "short", false) => "short",
+                _ => return Err(bad("交易方向或市场无效")),
             };
             let kind = text(body, "kind")?.to_owned();
-            let lots = number(body, "lots")?;
+            let lots = if spot {
+                number(body, "units")? / trading::contract(symbols::NSTAR)
+            } else {
+                number(body, "lots")?
+            };
             let price = number(body, "price")?;
             let limit = optional_price(body, "limit")?;
             let (tp, sl) = (optional_price(body, "tp")?, optional_price(body, "sl")?);

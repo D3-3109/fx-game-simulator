@@ -24,9 +24,9 @@ const pairName=s=>s==='NSTAR'?'NSTAR/USDT':s==='FXSIM'?'FXSIM/USD':/USDT$/.test(
 const priceText=(value,symbol=cur.sym)=>Number.isFinite(value)?value.toFixed(pricePrecisions.get(symbol)??decimalPlaces(value)):'—';
 let TOKEN=localStorage.fx_token||'',ME='',cur={sym:'USDJPY',itv:'15m'};
 let chart=null,series=null,lastBar=null,priceLines=[],curPos=[],symSynced=false,lastSym=null,lastItv=null;
-let levDirty=false,levSaving=false,accountLeverage=100,orderBusy=false,authBusy=false;
+let levDirty=false,levSaving=false,accountLeverage=10,orderBusy=false,authBusy=false;
 let quoteSymbol='',quoteLast=null,quoteReady=false,quoteTimer=null,quoteBid=NaN,quoteAsk=NaN;
-let mode='perp',spotSide='buy',lastState=null,market=null,tpslId=0,lotsFor='',otype='market';
+let mode='perp',spotSide='buy',spotType='market',lastState=null,market=null,tpslId=0,lotsFor='',otype='market';
 const quoteReferences=new Map();
 function renderQuote(price,symbol,bid,ask,valid=true,at){
  if(symbol!==cur.sym)return;
@@ -276,12 +276,13 @@ function syncOrderControls(){
  if(lotsFor!==cur.sym){lotsFor=cur.sym;$('lots').value=star?'1000':whole?'1':'0.10'}
  syncLotPresets();renderOrderEstimate();
  $('trade-buy').disabled=$('trade-sell').disabled=orderBusy||symbolSaving||!allowed||!quoteReady;
+ $('spot-submit').disabled=orderBusy||symbolSaving||!allowed||!quoteReady;
  $('close-all').disabled=orderBusy||curPos.length===0;
  $('close-all').textContent=orderBusy?'正在处理…':'全部平仓';
  document.querySelectorAll('.close-position').forEach(button=>button.disabled=orderBusy);
  $('symbol-status').textContent=orderBusy?'订单提交中，请稍候…':tradableSymbols===null?'正在获取币种配置…':allowed?'':
   tradableSymbols.length?'该币对已禁用，已有持仓仍可平仓':'暂无启用的币对，已有持仓仍可平仓';
- if(allowed&&!orderBusy&&cur.sym==='NSTAR')$('symbol-status').textContent='NSTAR 最高 1:100，仓位越大杠杆档位越低 · 偏离锚价越远流动性越厚';
+ if(allowed&&!orderBusy&&cur.sym==='NSTAR')$('symbol-status').textContent='NSTAR 最高 1:10，仓位越大杠杆越低 · 总持仓不限 · 偏离锚价越远流动性越厚';
 }
 function applySymbols(settings){
  if(settings.version<symbolsVersion)return;
@@ -390,10 +391,10 @@ document.querySelectorAll('[data-otype]').forEach(b=>b.addEventListener('click',
 function renderOrders(s){
  const rows=s.orders||[];$('order-count').textContent=rows.length;
  $('ordersT').querySelector('tbody').innerHTML=rows.map(o=>{
-  const kind=o.kind==='limit'?'限价':o.limit>0?'条件限价':'条件市价',side=o.side==='long'?'买入开多':'卖出开空';
+  const kind=(o.kind==='limit'?'限价':o.limit>0?'条件限价':'条件市价')+(o.spot?' · 现货':' · 永续'),side=o.spot?(o.side==='buy'?'买入':'卖出'):(o.side==='long'?'买入开多':'卖出开空');
   const px=o.kind==='stop'?`${priceText(o.price,o.symbol)} → ${o.limit>0?priceText(o.limit,o.symbol):'市价'}`:priceText(o.price,o.symbol);
   return `<tr><td>${escapeHtml(new Date(o.created).toLocaleString())}</td><td><b>${escapeHtml(pairName(o.symbol))}</b></td><td>${kind}</td>`+
-   `<td class="${o.side==='long'?'green':'red'}">${side}</td><td class="ctr">${o.symbol==='NSTAR'?units(o.lots*.01,2)+' NSTAR':o.lots}</td><td>${px}</td>`+
+   `<td class="${['long','buy'].includes(o.side)?'green':'red'}">${side}</td><td class="ctr">${o.symbol==='NSTAR'?units(o.lots*.01,2)+' NSTAR':o.lots}</td><td>${px}</td>`+
    `<td>${o.tp>0?priceText(o.tp,o.symbol):'—'} / ${o.sl>0?priceText(o.sl,o.symbol):'—'}</td>`+
    `<td><button type="button" class="close-position" onclick="cancelOrder(${Number(o.id)})">撤单</button></td></tr>`}).join('')||
   '<tr><td colspan="8" class="empty">暂无委托，可在下单区选择「限价」或「条件单」</td></tr>';
@@ -416,7 +417,7 @@ async function loanAction(path,amountId,done){
 function borrowMoney(){return loanAction('borrow','borrow-amount','借款已到账')}
 function repayMoney(){return loanAction('repay','repay-amount','还款已完成')}
 async function resetAccount(){
- if(!confirm('确定重置账号吗？余额回到 10000，杠杆回到 100，持仓和贷款全部清空，交易记录保留。'))return;
+ if(!confirm('确定重置账号吗？余额回到 10000，杠杆回到 10，持仓和贷款全部清空，交易记录保留。'))return;
  const j=await api('reset',{});
  if(j.ok){msg('账号已重置');await settle(j)}
 }
@@ -441,7 +442,7 @@ async function submitClose(body){
  finally{orderBusy=false;syncOrderControls()}
 }
 /* 杠杆滑块: 对数刻度的常用档位，数字框仍可输入任意整数。 */
-const LEV_STOPS=[1,2,3,5,10,20,25,50,75,100,150,200,300,500,1000,2000,3000,5000,10000,20000,50000];
+const LEV_STOPS=[1,2,3,4,5,6,7,8,9,10];
 function syncLevSlider(){
  const v=Number($('lev').value),sl=$('lev-slider');if(!(v>=1))return;
  let best=0;LEV_STOPS.forEach((x,i)=>{if(Math.abs(Math.log(x/v))<Math.abs(Math.log(LEV_STOPS[best]/v)))best=i});
@@ -452,7 +453,7 @@ async function setLev(){
  if(levSaving)return;
  const input=$('lev'),value=Number(input.value);
  if(curPos.length){msg('先平仓再修改杠杆');input.value=accountLeverage;levDirty=false;return}
- if(!Number.isSafeInteger(value)||value<1){msg('杠杆必须为正整数');return}
+ if(!Number.isSafeInteger(value)||value<1||value>10){msg('杠杆须为 1–10 的整数');return}
  levSaving=true;input.disabled=$('lev-apply').disabled=true;
  $('lev-apply').textContent='保存中…';
  try{
@@ -677,7 +678,7 @@ function setMode(next){
  $('spot-form').hidden=mode!=='spot';
  // 现货只有 NSTAR：沿用币对下拉框的切换流程（保存选择、重载行情与图表）。
  if(mode==='spot'&&cur.sym!=='NSTAR'&&!symbolSaving){symSel.value='NSTAR';symSel.onchange()}
- renderSpotForm();
+ setSpotType(spotType);
 }
 function setSpotSide(side){
  spotSide=side;
@@ -685,16 +686,25 @@ function setSpotSide(side){
  const b=$('spot-submit');b.className='spot-submit '+side;b.textContent=(side==='buy'?'买入':'卖出')+' NSTAR';
  renderSpotForm();
 }
+function setSpotType(t){
+ spotType=t;document.querySelectorAll('[data-spot-otype]').forEach(b=>b.setAttribute('aria-selected',b.dataset.spotOtype===t));
+ $('spot-trigger-field').hidden=t!=='stop';$('spot-price-field').hidden=t==='market';
+ $('spot-price').placeholder=t==='stop'?'留空 = 触发后市价':'';
+ if(t==='limit'&&!$('spot-price').value&&Number.isFinite(nstarMid()))$('spot-price').value=priceText(nstarMid(),'NSTAR');
+ renderSpotForm();
+}
+document.querySelectorAll('[data-spot-otype]').forEach(b=>b.addEventListener('click',()=>setSpotType(b.dataset.spotOtype)));
 function nstarMid(){return cur.sym==='NSTAR'&&Number.isFinite(quoteLast)?quoteLast:lastState?.nstar_price??NaN}
 function heldNstar(){return (lastState?.spot||[]).find(h=>h.sym==='NSTAR')?.units??0}
 function renderSpotForm(){
- const px=nstarMid(),n=Number($('spot-units').value);
- const avg=n>0?bookFill(spotSide==='buy'?n:-n):NaN,est=Number.isFinite(avg)?avg:px;
+ const px=nstarMid(),n=Number($('spot-units').value),price=Number($('spot-price').value)||0,trigger=Number($('spot-trigger').value)||0;
+ const reference=spotType==='market'?NaN:spotType==='limit'?price:(price||trigger);
+ const avg=n>0?(Number.isFinite(reference)?reference:bookFill(spotSide==='buy'?n:-n)):NaN,est=Number.isFinite(avg)?avg:px;
  $('spot-total').textContent=Number.isFinite(est)&&n>0?`≈ ${units(est*n*(1+(spotSide==='buy'?1:-1)*(lastState?.spot_fee??.001)),2)} USDT`:'—';
  $('spot-avail').textContent=lastState?spotSide==='buy'?`${units(lastState.balance,2)} USDT · 最多 ${units(spotMax(),2)} NSTAR`:`${units(heldNstar())} NSTAR`:'—';
  const max=spotMax();setSlider($('spot-slider'),max>0&&n>0?n/max*100:0,max>0);
- const f=n>0?bookFill(spotSide==='buy'?n:-n):NaN,imp=f/px-1,node=$('spot-fill');
- node.textContent=Number.isFinite(f)?`${units(f,4)}（${imp>=0?'+':''}${(imp*100).toFixed(2)}%）`:'—';
+ const f=n>0&&spotType==='market'?bookFill(spotSide==='buy'?n:-n):NaN,imp=f/px-1,node=$('spot-fill');
+ node.textContent=spotType!=='market'?(spotType==='limit'?'按委托价或更优成交':'触发后按市价 / 委托价'):Number.isFinite(f)?`${units(f,4)}（${imp>=0?'+':''}${(imp*100).toFixed(2)}%）`:'—';
  node.className=Number.isFinite(imp)&&Math.abs(imp)>IMPACT_WARN?'red':'';
 }
 function spotMax(){
@@ -708,23 +718,30 @@ function spotPercent(f){
  $('spot-units').value=Math.max(0,Math.floor(spotMax()*f*1e4)/1e4);renderSpotForm();
 }
 $('spot-slider').addEventListener('input',e=>spotPercent(Number(e.target.value)/100));
-/* 档位杠杆: 每一段仓位按该段杠杆计保证金，像累进税一样只对新增部分生效。 */
+/* 档位杠杆: 每一段仓位按该段杠杆计保证金，超过最高档按 1x；总持仓不限。 */
 function renderTierHint(s){
  const t=s?.limits?.tiers||[],node=$('tier-hint');node.hidden=!t.length||s.symbol!==cur.sym;if(node.hidden)return;
- const gross=s.limits.gross_units||0,found=t.findIndex(([upTo])=>gross<upTo),at=found<0?t.length-1:found;
+ const gross=s.limits.gross_units||0,found=t.findIndex(([upTo])=>gross<upTo),at=found<0?t.length-1:found,last=t.at(-1)[0];
  node.textContent='档位杠杆：'+t.map(([upTo,lev],i)=>`${i===at&&gross>0?'▶':''}≤${compact(upTo)} ${lev}x`).join(' · ')+
-  ` ｜ 当前持仓 ${units(gross,2)} 枚，上限 ${compact(t.at(-1)[0])}`;
+  ` ｜ 超过 ${compact(last)} 1x · 当前 ${units(gross,2)} 枚 · 总持仓不限`;
 }
 async function spotTrade(){
- if(orderBusy)return;if(!$('spot-units').reportValidity())return;
- orderBusy=true;syncOrderControls();$('spot-submit').disabled=true;
- try{const j=await api('spot',{side:spotSide,units:Number($('spot-units').value)});
-  if(j.ok){msg(`NSTAR 现货${spotSide==='buy'?'买入':'卖出'}已成交`);await settle(j)}
+ if(orderBusy||!$('spot-units').reportValidity())return;
+ const units=Number($('spot-units').value),price=Number($('spot-price').value)||0,trigger=Number($('spot-trigger').value)||0;
+ if(spotType==='limit'&&!(price>0)){msg('请填写现货委托价');return}
+ if(spotType==='stop'&&!(trigger>0)){msg('请填写现货触发价');return}
+ orderBusy=true;syncOrderControls();
+ try{
+  const j=spotType==='market'?await api('spot',{side:spotSide,units})
+   :await api('order',{market:'spot',kind:spotType,side:spotSide,units,price:spotType==='limit'?price:trigger,limit:spotType==='stop'?price:0});
+  if(j.ok){msg(spotType==='market'?`NSTAR 现货${spotSide==='buy'?'买入':'卖出'}已成交`:`NSTAR 现货${spotType==='limit'?'限价':'条件'}委托已提交，可在「委托」中查看`);await settle(j)}
  }catch(e){msg('现货下单失败：'+e)}
- finally{orderBusy=false;$('spot-submit').disabled=false;syncOrderControls()}
+ finally{orderBusy=false;syncOrderControls();renderSpotForm()}
 }
 $('spot-units').addEventListener('input',renderSpotForm);
 function renderOrderEstimate(){
+$('spot-price').addEventListener('input',renderSpotForm);
+$('spot-trigger').addEventListener('input',renderSpotForm);
  const s=lastState,lots=Number($('lots').value);
  if(!s||s.symbol!==cur.sym||!(lots>0)){$('order-notional').textContent=$('order-margin').textContent='—';return}
  const notional=lots*(s.contract??1)*s.price,tiers=s.limits?.tiers||[];

@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const CONTRACT: f64 = 100_000.0;
 pub const STOPOUT: f64 = 0.5;
-pub const MAX_LEVERAGE: u64 = 50_000;
+pub const MAX_LEVERAGE: u64 = 10;
 pub const MAX_LOTS: f64 = 100_000.0;
 pub const LOAN_RATE: f64 = 0.10;
 /// Spot taker fee (0.1%, OKX's base tier) and order size bounds in units.
@@ -465,14 +465,17 @@ pub struct Account {
     pub order_seq: u64,
 }
 
-/// A pending perpetual order. `limit` fills only at `price` or better; `stop` waits until
-/// the mid crosses `price`, then opens at market or, with `limit > 0`, becomes a limit order.
+/// A pending perpetual or spot order. `limit` fills only at `price` or better; `stop` waits
+/// until the mid crosses `price`, then fills at market or becomes a limit order.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Order {
     pub id: u64,
     pub symbol: String,
-    /// "long" or "short".
+    /// Perpetual: "long"/"short"; spot: "buy"/"sell".
     pub side: String,
+    /// Spot orders use the same lots/AMM machinery as perpetual orders.
+    #[serde(default)]
+    pub spot: bool,
     /// "limit" or "stop".
     pub kind: String,
     /// Lots still to fill.
@@ -497,7 +500,7 @@ impl Default for Account {
     fn default() -> Self {
         Self {
             balance: 10000.0,
-            leverage: 100,
+            leverage: MAX_LEVERAGE,
             next_id: 1,
             positions: vec![],
             loan: 0.0,
@@ -558,7 +561,15 @@ impl Account {
             }
         }
         for o in &self.orders {
-            if !matches!(o.side.as_str(), "long" | "short")
+            let valid_side = if o.spot {
+                matches!(o.side.as_str(), "buy" | "sell")
+                    && o.symbol == symbols::NSTAR
+                    && o.tp == 0.0
+                    && o.sl == 0.0
+            } else {
+                matches!(o.side.as_str(), "long" | "short")
+            };
+            if !valid_side
                 || !matches!(o.kind.as_str(), "limit" | "stop")
                 || !lots_valid(&o.symbol, o.lots)
                 || !o.price.is_finite()
@@ -1015,8 +1026,12 @@ impl Account {
         prices: &Prices,
         now: i64,
     ) -> Result<u64> {
-        if !matches!(side, "long" | "short") {
+        let spot = matches!(side, "buy" | "sell");
+        if !spot && !matches!(side, "long" | "short") {
             return Err("交易方向无效".into());
+        }
+        if spot && (symbol != symbols::NSTAR || tp > 0.0 || sl > 0.0) {
+            return Err("现货条件单仅支持 NSTAR，且不附加永续止盈止损".into());
         }
         if !matches!(kind, "limit" | "stop") {
             return Err("委托类型无效".into());
@@ -1036,7 +1051,7 @@ impl Account {
             return Err(format!("最多同时挂 {MAX_ORDERS} 笔委托"));
         }
         self.validate()?;
-        let long = side == "long";
+        let long = matches!(side, "long" | "buy");
         let mid = market_price(prices, symbol)?;
         if kind == "stop" && (if long { price <= mid } else { price >= mid }) {
             return Err(format!(
@@ -1068,16 +1083,23 @@ impl Account {
             ));
         }
         // Margin must cover the order as if the book were at its price right now.
+        // Cash/holdings or margin must cover the order at its expected fill price.
         let mut at = prices.clone();
         at.insert(symbol.into(), fill);
         let mut trial = self.clone();
         trial.orders.clear();
-        trial.open(side, lots, symbol, &at, u64::MAX - 1, now)?;
+        if spot {
+            let signed = lots * contract(symbol) * if long { 1.0 } else { -1.0 };
+            trial.spot(symbol, signed, &at, now)?;
+        } else {
+            trial.open(side, lots, symbol, &at, u64::MAX - 1, now)?;
+        }
         self.order_seq += 1;
         self.orders.push(Order {
             id: self.order_seq,
             symbol: symbol.into(),
             side: side.into(),
+            spot,
             kind: kind.into(),
             lots,
             price,
@@ -1129,7 +1151,7 @@ impl Account {
             let Ok(mid) = market_price(&prices, &o.symbol) else {
                 continue;
             };
-            let long = o.side == "long";
+            let long = matches!(o.side.as_str(), "long" | "buy");
             let mut limit = (o.kind == "limit").then_some(o.price);
             if o.kind == "stop" {
                 if if long { mid < o.price } else { mid > o.price } {
@@ -1163,18 +1185,29 @@ impl Account {
                 0.01
             };
             let ok = |lots: f64| {
-                next.clone()
-                    .open(&o.side, lots, &o.symbol, &prices, nid, now)
-                    .is_ok()
+                let mut trial = next.clone();
+                if o.spot {
+                    let units = lots * contract(&o.symbol) * if long { 1.0 } else { -1.0 };
+                    trial.spot(&o.symbol, units, &prices, now).is_ok()
+                } else {
+                    trial
+                        .open(&o.side, lots, &o.symbol, &prices, nid, now)
+                        .is_ok()
+                }
             };
             let lots = largest(min, wanted, step, ok);
             if lots < min {
                 trades.push(next.cancel_order(o.id, "void", now)?);
                 continue;
             }
-            let trade = next.open(&o.side, lots, &o.symbol, &prices, nid, now)?;
+            let trade = if o.spot {
+                let units = lots * contract(&o.symbol) * if long { 1.0 } else { -1.0 };
+                next.spot(&o.symbol, units, &prices, now)?
+            } else {
+                next.open(&o.side, lots, &o.symbol, &prices, nid, now)?
+            };
             apply_fill(&mut prices, &trade)?;
-            if o.tp > 0.0 || o.sl > 0.0 {
+            if !o.spot && (o.tp > 0.0 || o.sl > 0.0) {
                 // Keep whichever of TP/SL is still on the right side of the moved price.
                 if next.set_triggers(nid, o.tp, o.sl, &prices).is_err() {
                     let _ = next.set_triggers(nid, o.tp, 0.0, &prices);
@@ -1386,7 +1419,7 @@ mod tests {
         let mut a = Account::default();
         let mut q = quotes(&[("USDJPY", 150.0)]);
         a.open("long", 0.1, "USDJPY", &q, 1, 123).unwrap();
-        near(a.used_margin(&q).unwrap(), 100.0);
+        near(a.used_margin(&q).unwrap(), 1_000.0);
         near(a.positions[0].pnl(&q).unwrap(), -100.0 / 150.0);
         q.insert("USDJPY".into(), 151.0);
         let t = a.close(Some(1), &q, 124).unwrap();
@@ -1467,7 +1500,7 @@ mod tests {
         let mut a = Account::default();
         let q = quotes(&[("EURJPY", 165.0), ("USDJPY", 150.0)]);
         a.open("long", 0.1, "EURJPY", &q, 1, 0).unwrap();
-        near(a.used_margin(&q).unwrap(), 110.0);
+        near(a.used_margin(&q).unwrap(), 1_100.0);
         near(
             a.close(None, &q, 1).unwrap()[0].pnl.unwrap(),
             -200.0 / 150.0,
@@ -1476,7 +1509,7 @@ mod tests {
     #[test]
     fn stopout_boundary_and_worst_first() {
         let mut a = Account {
-            balance: 50.0,
+            balance: 555.0,
             positions: vec![Position {
                 id: 1,
                 side: "long".into(),
@@ -1493,9 +1526,9 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let t = a.check_stopout(&quotes(&[("FXSIM", 0.9999)]), 1).unwrap();
+        let t = a.check_stopout(&quotes(&[("FXSIM", 0.94)]), 1).unwrap();
         assert_eq!(t.len(), 1);
-        near(a.balance, 48.0);
+        near(a.balance, -46.0);
         let p = |id, entry| Position {
             id,
             entry,
@@ -1505,7 +1538,7 @@ mod tests {
             tp: 0.0,
             sl: 0.0,
         };
-        a.balance = 80.0;
+        a.balance = 990.0;
         a.positions = vec![p(1, 1.0), p(2, 1.001)];
         let t = a.check_stopout(&quotes(&[("FXSIM", 1.0)]), 2).unwrap();
         assert_eq!(t[0].position_id, 2);
@@ -1549,7 +1582,7 @@ mod tests {
         let p = &a.positions[0];
         // 0.001 NSTAR barely touches the book: spread dominates.
         assert!((p.entry - 100.025).abs() < 1e-5, "{}", p.entry);
-        assert!((p.margin(&q, a.leverage).unwrap() - 0.001).abs() < 1e-6);
+        assert!((p.margin(&q, a.leverage).unwrap() - 0.01).abs() < 1e-6);
         let up = quotes(&[("NSTAR", 101.0)]);
         assert!((p.pnl_at(101.0, &up).unwrap() - 0.000975).abs() < 1e-5);
     }
@@ -1610,18 +1643,19 @@ mod tests {
         // Unwinding 1,000 NSTAR into a 50,000 book costs ~1%: the mark says so.
         let pnl = a.positions[0].pnl(&q).unwrap();
         assert!(pnl < -400.0, "{pnl}");
-        // Account leverage 1:50000 still margins NSTAR at 1:100 inside the first tier.
-        assert!((a.used_margin(&q).unwrap() - 1_000.0).abs() < 1e-6);
-        // A full 100,000 NSTAR book: 10k at 100x + 15k at 50x + 25k at 20x + 50k at 10x
-        // = 6,650 NSTAR of margin, ~15x effective, longs and shorts alike.
+        // Account leverage is capped at 10x inside the first NSTAR tier.
+        assert!((a.used_margin(&q).unwrap() - 10_000.0).abs() < 1e-6);
+        // 100,000 NSTAR: 10k at 10x + 15k at 5x + 25k at 2x + 50k at 1x
+        // = 66,500 NSTAR of margin (~1.5x effective), longs and shorts alike.
         let mut full = Account {
             balance: 1e9,
             ..Account::default()
         };
         full.open("long", 10_000_000.0, "NSTAR", &q, 1, 0).unwrap();
         let margin = full.used_margin(&q).unwrap();
-        assert!((margin - 665_000.0).abs() < 1e-3, "{margin}");
-        assert!(full.open("short", 0.01, "NSTAR", &q, 2, 0).is_err());
+        assert!((margin - 6_650_000.0).abs() < 1e-3, "{margin}");
+        // No total position cap: another order is accepted when collateral covers it.
+        full.open("short", 0.01, "NSTAR", &q, 2, 0).unwrap();
         // Built in slices, the stack costs exactly the same margin.
         let mut sliced = Account {
             balance: 1e9,
@@ -1636,13 +1670,14 @@ mod tests {
         let shares = sliced.position_margins(&q).unwrap();
         assert!(shares.iter().all(|m| (m - margin / 10.0).abs() < 1e-3));
         // A lower account leverage caps every tier: 20,000 NSTAR at 20x = 1,000 NSTAR.
+        // A lower account leverage caps every tier: 20,000 NSTAR at 5x = 4,000 NSTAR.
         let mut low = Account {
             balance: 1e9,
-            leverage: 20,
+            leverage: 5,
             ..Account::default()
         };
         low.open("long", 2_000_000.0, "NSTAR", &q, 1, 0).unwrap();
-        assert!((low.used_margin(&q).unwrap() - 100_000.0).abs() < 1e-3);
+        assert!((low.used_margin(&q).unwrap() - 400_000.0).abs() < 1e-3);
     }
     #[test]
     fn slider_ranges_match_what_open_and_spot_accept() {
@@ -1650,7 +1685,7 @@ mod tests {
         let fresh = Account::default();
         for side in ["long", "short"] {
             let max = fresh.max_open_lots(side, "NSTAR", &q);
-            assert!(max > 100_000.0 && max < 2_000_000.0, "{side} {max}");
+            assert!(max > 10_000.0 && max < 200_000.0, "{side} {max}");
             assert!(fresh.clone().open(side, max, "NSTAR", &q, 1, 0).is_ok());
             assert!(
                 fresh
@@ -1725,16 +1760,16 @@ mod tests {
     #[test]
     fn nstar_order_must_survive_its_own_impact() {
         let q = quotes(&[("NSTAR", 100.0)]);
-        // $1,050 passes the plain entry check (~$1,005 margin), but after its own fill the
-        // mark drops ~$52 and margin rises to ~$1,010 at the lifted mid: refused.
+        // $10,060 passes the plain entry check (~$10,050 margin), but after its own fill the
+        // account lacks a safety buffer; $12,000 survives the same order.
         let mut thin = Account {
-            balance: 1_050.0,
+            balance: 10_060.0,
             ..Account::default()
         };
         assert!(thin.open("long", MAX_LOTS, "NSTAR", &q, 1, 0).is_err());
         assert!(thin.positions.is_empty());
         let mut ok = Account {
-            balance: 1_200.0,
+            balance: 12_000.0,
             ..Account::default()
         };
         assert!(ok.open("long", MAX_LOTS, "NSTAR", &q, 1, 0).is_ok());
@@ -1743,7 +1778,7 @@ mod tests {
     fn nstar_cascade_stopout_pays_its_own_impact() {
         let q = quotes(&[("NSTAR", 100.0)]);
         let mut a = Account {
-            balance: 2_000.0,
+            balance: 20_000.0,
             ..Account::default()
         };
         let mut live = q.clone();
@@ -1751,7 +1786,7 @@ mod tests {
             let t = a.open("long", 10_000.0, "NSTAR", &live, id, 0).unwrap();
             apply_fill(&mut live, &t).unwrap();
         }
-        let crash = quotes(&[("NSTAR", 85.0)]);
+        let crash = quotes(&[("NSTAR", 30.0)]);
         let trades = a.check_stopout(&crash, 1).unwrap();
         assert_eq!(trades.len(), 3);
         // Each forced sale fills lower than the one before.
@@ -1849,17 +1884,15 @@ mod tests {
         assert!(closed.iter().map(|t| t.pnl.unwrap()).sum::<f64>() < 0.0);
     }
     #[test]
-    fn nstar_spot_holding_is_capped_per_account() {
+    fn nstar_spot_has_no_total_holding_cap() {
         let q = quotes(&[("NSTAR", 100.0)]);
         let mut a = Account {
             balance: 1e9,
             ..Account::default()
         };
         a.spot("NSTAR", 100_000.0, &q, 1).unwrap();
-        let before = a.clone();
-        assert!(a.spot("NSTAR", 0.01, &q, 3).is_err());
-        assert_eq!(a, before, "refused buy leaves the account untouched");
-        // Selling is always allowed, and frees room to buy again.
+        a.spot("NSTAR", 0.01, &q, 3).unwrap();
+        assert!((a.spot["NSTAR"].units - 100_000.01).abs() < 1e-9);
         a.spot("NSTAR", -5_000.0, &q, 4).unwrap();
         a.spot("NSTAR", 5_000.0, &q, 5).unwrap();
     }
@@ -2025,7 +2058,7 @@ mod tests {
         );
         let id = a
             .place_order(
-                "limit", "long", 500_000.0, "NSTAR", 90.0, 0.0, 0.0, 0.0, &q, 0,
+                "limit", "long", 50_000.0, "NSTAR", 90.0, 0.0, 0.0, 0.0, &q, 0,
             )
             .unwrap();
         // The money is gone by the time the price arrives: the order is voided, not filled.
@@ -2073,7 +2106,7 @@ mod tests {
     fn liquidations_trigger_on_mark_not_on_a_spike() {
         let q = quotes(&[("NSTAR", 100.0)]);
         let mut a = Account::default();
-        // 1,000 NSTAR short at 100x on $10k.
+        // 1,000 NSTAR short at 10x on $10k.
         a.open("short", 100_000.0, "NSTAR", &q, 1, 0).unwrap();
         // A spike to 110 on the book while the mark is still 100.5: nobody is liquidated.
         let mut spike = quotes(&[("NSTAR", 110.0)]);
@@ -2151,6 +2184,84 @@ mod exchange_tests {
         assert!(a.spot("BTCUSDT", 1.0, &q(100.0), 4).is_err());
     }
     #[test]
+    fn spot_limit_shares_perpetual_matching_without_opening_leverage() {
+        let mut a = Account::default();
+        let id = a
+            .place_order(
+                "limit",
+                "buy",
+                1_000.0,
+                "NSTAR",
+                95.0,
+                0.0,
+                0.0,
+                0.0,
+                &q(100.0),
+                0,
+            )
+            .unwrap();
+        assert!(a.orders[0].spot);
+        assert!(a.check_orders(&q(96.0), 1, 1).unwrap().is_empty());
+        let fills = a.check_orders(&q(94.0), 1, 2).unwrap();
+        assert_eq!(fills.len(), 1);
+        assert_eq!(
+            (fills[0].kind.as_str(), fills[0].side.as_str()),
+            ("spot", "buy")
+        );
+        assert!(fills[0].price <= 95.0);
+        assert!((a.spot["NSTAR"].units - 10.0).abs() < 1e-9);
+        assert!(a.positions.is_empty() && a.orders.is_empty());
+        assert_eq!(a.cancel_order(id, "cancel", 3).unwrap_err(), "无 # 1 委托");
+    }
+
+    #[test]
+    fn spot_stop_limit_and_unaffordable_orders_follow_perpetual_rules() {
+        let mut a = Account::default();
+        a.spot("NSTAR", 10.0, &q(100.0), 0).unwrap();
+        a.place_order(
+            "stop",
+            "sell",
+            500.0,
+            "NSTAR",
+            95.0,
+            94.5,
+            0.0,
+            0.0,
+            &q(100.0),
+            1,
+        )
+        .unwrap();
+        assert!(a.check_orders(&q(96.0), 1, 2).unwrap().is_empty());
+        let fills = a.check_orders(&q(95.0), 1, 3).unwrap();
+        assert_eq!(fills.len(), 1);
+        assert_eq!(
+            (fills[0].kind.as_str(), fills[0].side.as_str()),
+            ("spot", "sell")
+        );
+        assert!(fills[0].price >= 94.5);
+        assert!((a.spot["NSTAR"].units - 5.0).abs() < 1e-9);
+
+        let id = a
+            .place_order(
+                "limit",
+                "buy",
+                1_000.0,
+                "NSTAR",
+                90.0,
+                0.0,
+                0.0,
+                0.0,
+                &q(100.0),
+                4,
+            )
+            .unwrap();
+        a.balance = 0.0;
+        let void = a.check_orders(&q(85.0), 1, 5).unwrap();
+        assert_eq!((void[0].kind.as_str(), void[0].position_id), ("void", id));
+        assert!(a.orders.is_empty());
+    }
+
+    #[test]
     fn spot_round_trip_loses_and_split_buys_match_one() {
         let mut a = Account::default();
         let mut live = q(100.0);
@@ -2196,9 +2307,9 @@ mod exchange_tests {
             balance: 1_000.0,
             ..Account::default()
         };
-        a.open("long", 50_000.0, "NSTAR", &q(100.0), 1, 0).unwrap();
+        a.open("long", 5_000.0, "NSTAR", &q(100.0), 1, 0).unwrap();
         let liq = a.liquidation_price("NSTAR", &q(100.0)).unwrap().unwrap();
-        assert!(liq < 100.0 && liq > 90.0, "{liq}");
+        assert!(liq < 100.0 && liq > 80.0, "{liq}");
         let mut below = a.clone();
         assert!(!below.check_stopout(&q(liq * 0.999), 1).unwrap().is_empty());
         let mut above = a.clone();
@@ -2208,13 +2319,13 @@ mod exchange_tests {
             ..Account::default()
         };
         short
-            .open("short", 50_000.0, "NSTAR", &q(100.0), 1, 0)
+            .open("short", 5_000.0, "NSTAR", &q(100.0), 1, 0)
             .unwrap();
         let liq = short
             .liquidation_price("NSTAR", &q(100.0))
             .unwrap()
             .unwrap();
-        assert!(liq > 100.0 && liq < 110.0, "{liq}");
+        assert!(liq > 100.0 && liq < 120.0, "{liq}");
         assert_eq!(
             Account::default()
                 .liquidation_price("NSTAR", &q(100.0))
@@ -2253,9 +2364,13 @@ mod exchange_tests {
     }
     #[test]
     fn legacy_account_json_without_new_fields_still_loads() {
-        let old = r#"{"balance":5.0,"leverage":100,"positions":[{"id":1,"side":"long","lots":1.0,"entry":1.1,"symbol":"FXSIM"}]}"#;
+        let old = r#"{"balance":5.0,"leverage":100,"positions":[{"id":1,"side":"long","lots":1.0,"entry":1.1,"symbol":"FXSIM"}],"orders":[{"id":1,"symbol":"NSTAR","side":"long","kind":"limit","lots":1.0,"price":90.0,"created":0}]}"#;
         let a: Account = serde_json::from_str(old).unwrap();
         assert!(a.spot.is_empty());
         assert_eq!((a.positions[0].tp, a.positions[0].sl), (0.0, 0.0));
+        assert!(
+            !a.orders[0].spot,
+            "old perpetual orders default to the perpetual market"
+        );
     }
 }

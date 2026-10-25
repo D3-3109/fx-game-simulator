@@ -70,19 +70,25 @@
   <p id="tier-hint" class="muted tier-hint" hidden></p>
  </div>
  <form id="lev-form" class="leverage-form" onsubmit="event.preventDefault();setLev()">
-  <label for="lev">杠杆倍数<input id="lev" type="number" min="1" max="9007199254740991" step="1" list="lev-presets" required oninput="levDirty=true;syncLevSlider()"></label>
+  <label for="lev">杠杆倍数<input id="lev" type="number" min="1" max="10" step="1" list="lev-presets" required oninput="levDirty=true;syncLevSlider()"></label>
   <div class="slider-box lev-slider-box">
-   <input id="lev-slider" class="slider" type="range" min="0" max="20" step="1" value="9" aria-label="杠杆倍数滑块">
-   <div class="slider-ticks lev-ticks" aria-hidden="true"><span style="left:0">1x</span><span style="left:20%">10x</span><span style="left:45%">100x</span><span style="left:70%">1000x</span><span style="left:100%">50000x</span></div>
+   <input id="lev-slider" class="slider" type="range" min="0" max="9" step="1" value="9" aria-label="杠杆倍数滑块">
+   <div class="slider-ticks lev-ticks" aria-hidden="true"><span style="left:0">1x</span><span style="left:44.44%">5x</span><span style="left:100%">10x</span></div>
   </div>
-  <datalist id="lev-presets"><option value="1"><option value="10"><option value="20"><option value="50">
-   <option value="100"><option value="200"><option value="500"><option value="1000"></datalist>
+  <datalist id="lev-presets"><option value="1"><option value="2"><option value="3"><option value="5"><option value="10"></datalist>
   <button id="lev-apply" type="submit">应用杠杆</button>
   <p id="lev-hint">持仓时不可修改杠杆</p>
  </form>
  <div id="close-box" class="close-section"><button id="close-all" type="button" onclick="closeAll()">全部平仓</button></div>
  <div id="spot-form" class="order-form" hidden>
-  <div class="order-symbol"><b>NSTAR/USDT</b><span>现货 · 手续费 0.1%</span></div>
+  <div class="order-symbol"><b>NSTAR/USDT</b><span>现货 · 与永续共用 AMM · 手续费 0.1%</span></div>
+  <div class="type-tabs" role="tablist" aria-label="现货委托类型">
+   <button type="button" role="tab" data-spot-otype="market" aria-selected="true">市价</button>
+   <button type="button" role="tab" data-spot-otype="limit" aria-selected="false">限价</button>
+   <button type="button" role="tab" data-spot-otype="stop" aria-selected="false">条件单</button>
+  </div>
+  <label class="field" for="spot-trigger" id="spot-trigger-field" hidden><span>触发价</span><input id="spot-trigger" type="number" min="0" step="any" inputmode="decimal"><span class="unit">USDT</span></label>
+  <label class="field" for="spot-price" id="spot-price-field" hidden><span id="spot-price-label">委托价</span><input id="spot-price" type="number" min="0" step="any" inputmode="decimal"><span class="unit">USDT</span></label>
   <div class="side-tabs" role="tablist" aria-label="买卖方向">
    <button type="button" role="tab" id="spot-side-buy" class="buy" aria-selected="true" onclick="setSpotSide('buy')">买入</button>
    <button type="button" role="tab" id="spot-side-sell" class="sell" aria-selected="false" onclick="setSpotSide('sell')">卖出</button>

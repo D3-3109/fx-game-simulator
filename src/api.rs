@@ -477,7 +477,12 @@ async fn post_inner(
         }
         _ => return Err(Failure(StatusCode::NOT_FOUND, "unknown".into())),
     }
-    Ok(json!({"ok":true}))
+    // Hand back the post-trade account so the page needs no follow-up GET /api/state.
+    let mut out = json!({"ok":true});
+    if let Ok(state) = app.state(&name).await {
+        out["state"] = state;
+    }
+    Ok(out)
 }
 
 async fn ws_upgrade(
@@ -503,10 +508,10 @@ async fn ws_upgrade(
         _ => Failure(StatusCode::UNAUTHORIZED, "auth".into()).into_response(),
     }
 }
-async fn send(socket: &mut WebSocket, value: Value) -> bool {
+async fn send_text(socket: &mut WebSocket, text: &str) -> bool {
     tokio::time::timeout(
         Duration::from_secs(5),
-        socket.send(Message::Text(value.to_string().into())),
+        socket.send(Message::Text(text.to_owned().into())),
     )
     .await
     .is_ok_and(|r| r.is_ok())
@@ -533,6 +538,8 @@ async fn serve_ws(
     }
     let _presence = app.connected(&name);
     let mut interval = tokio::time::interval(Duration::from_secs(1));
+    // State is pushed only when it changed, plus a heartbeat so a quiet tab still refreshes.
+    let (mut last, mut sent_at) = (String::new(), tokio::time::Instant::now());
     loop {
         if app.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
             break;
@@ -544,14 +551,29 @@ async fn serve_ws(
                 _=>{},
             },
             event=events.recv()=>match event {
-                Ok(Event::Message(value))=>if !send(&mut socket,value).await {break;},
+                Ok(Event::Message(text,symbol))=>{
+                    // Quote ticks are per pair: only the one this user is viewing is sent.
+                    let wanted=symbol.is_none_or(|s|app.store.selected(&name).is_some_and(|sel|*sel==*s));
+                    if wanted&&!send_text(&mut socket,&text).await {break;}
+                },
                 Ok(Event::Deleted(owner))=>if owner==name {break;},
                 Ok(Event::Shutdown)=>break,
                 Err(_)=>break,
             },
             _=interval.tick()=> {
                 if app.store.authenticate(&token).await.ok().flatten().as_deref()!=Some(&name) {break;}
-                if let Ok(state)=app.state(&name).await && !send(&mut socket,state).await {break;}
+                if let Ok(state)=app.state(&name).await {
+                    // Quote fields also arrive in the live tick; only account changes count.
+                    let mut key=state.clone();
+                    if let Some(o)=key.as_object_mut() {
+                        for f in ["price","bid","ask","quote_at","quote_valid","nstar_price"] {o.remove(f);}
+                    }
+                    let key=key.to_string();
+                    if key!=last||sent_at.elapsed()>=Duration::from_secs(15) {
+                        if !send_text(&mut socket,&state.to_string()).await {break;}
+                        last=key;sent_at=tokio::time::Instant::now();
+                    }
+                }
             }
         }
     }

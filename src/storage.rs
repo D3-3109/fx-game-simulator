@@ -66,6 +66,15 @@ pub struct Store {
     /// NSTAR units (player, forced) settled but not yet applied to the book.
     nstar_flow: std::sync::Mutex<(f64, f64)>,
     login_aliases: Mutex<BTreeMap<String, String>>,
+    /// Committed copy of every account, so hot paths (risk sweeps, leaderboard, live state)
+    /// never re-read and re-parse SQLite. Updated only after a successful commit.
+    cache: std::sync::RwLock<Cache>,
+}
+
+#[derive(Default)]
+struct Cache {
+    users: BTreeMap<String, User>,
+    tokens: std::collections::HashMap<String, String>,
 }
 
 impl Store {
@@ -73,7 +82,11 @@ impl Store {
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
-            .busy_timeout(Duration::from_secs(10));
+            .busy_timeout(Duration::from_secs(10))
+            // WAL + NORMAL: a commit is an append, not a full fsync; a crash can lose at most
+            // the last un-checkpointed commits, never corrupt the database.
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(options)
@@ -114,55 +127,78 @@ impl Store {
             tx.commit().await?;
         }
         let mut next_id = 1;
-        for row in sqlx::query("SELECT account FROM users")
-            .fetch_all(&pool)
+        let mut cache = Cache::default();
+        let mut conn = pool.acquire().await?;
+        for row in sqlx::query("SELECT name,token FROM users ORDER BY name")
+            .fetch_all(&mut *conn)
             .await?
         {
-            let a: Account = serde_json::from_str(row.get("account"))?;
-            a.validate()?;
+            let name: String = row.get("name");
+            let user = load_user(&mut conn, &name).await?;
+            let token: String = row.get("token");
+            if !token.is_empty() {
+                cache.tokens.insert(token, name.clone());
+            }
+            let a = user.account.clone();
+            cache.users.insert(name, user);
             // Python restores Position._seq to at least persisted next_id, then increments.
             next_id = next_id.max(a.next_id.saturating_add(1));
             for p in a.positions {
                 next_id = next_id.max(p.id.saturating_add(1));
             }
         }
+        drop(conn);
         Ok(Self {
             pool,
             gate: Mutex::new(()),
             next_id: AtomicU64::new(next_id),
             nstar_flow: std::sync::Mutex::new((0.0, 0.0)),
             login_aliases: Mutex::new(BTreeMap::new()),
+            cache: std::sync::RwLock::new(cache),
         })
     }
     pub async fn close(&self) {
         self.pool.close().await;
     }
     pub async fn user(&self, name: &str) -> Result<User> {
-        let mut conn = self.pool.acquire().await?;
-        load_user(&mut conn, name).await
+        self.cache
+            .read()
+            .unwrap()
+            .users
+            .get(name)
+            .cloned()
+            .ok_or_else(|| invalid("账号不存在"))
     }
     pub async fn users(&self) -> Result<Vec<User>> {
+        Ok(self.cache.read().unwrap().users.values().cloned().collect())
+    }
+    /// The pair a user is viewing, from the cache; None for an unknown user.
+    pub fn selected(&self, name: &str) -> Option<String> {
+        self.cache
+            .read()
+            .unwrap()
+            .users
+            .get(name)
+            .map(|u| u.symbol.clone())
+    }
+    /// Re-read one account from SQLite into the cache after a committed write.
+    async fn refresh(&self, name: &str) -> Result<()> {
         let mut conn = self.pool.acquire().await?;
-        let names = sqlx::query("SELECT name FROM users ORDER BY name")
-            .fetch_all(&mut *conn)
-            .await?;
-        let mut users = Vec::new();
-        for row in names {
-            users.push(load_user(&mut conn, row.get("name")).await?);
-        }
-        Ok(users)
+        let user = load_user(&mut conn, name).await?;
+        self.cache.write().unwrap().users.insert(name.into(), user);
+        Ok(())
+    }
+    fn forget(&self, name: &str) {
+        let mut cache = self.cache.write().unwrap();
+        cache.users.remove(name);
+        cache.tokens.retain(|_, owner| owner != name);
     }
     pub async fn authenticate(&self, tok: &str) -> Result<Option<String>> {
         if tok.is_empty() {
             return Ok(None);
         }
-        let current = sqlx::query("SELECT name FROM users WHERE token=?")
-            .bind(tok)
-            .fetch_optional(&self.pool)
-            .await?
-            .map(|r| r.get("name"));
-        if current.is_some() {
-            return Ok(current);
+        if let Some(name) = self.cache.read().unwrap().tokens.get(tok) {
+            return Ok(Some(name.clone()));
         }
         Ok(self.login_aliases.lock().await.get(tok).cloned())
     }
@@ -243,6 +279,12 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+        self.refresh(name).await?;
+        self.cache
+            .write()
+            .unwrap()
+            .tokens
+            .insert(tok.clone(), name.into());
         Ok(tok)
     }
     pub async fn login(&self, name: &str, pwd: &str) -> Result<String> {
@@ -265,6 +307,11 @@ impl Store {
             .bind(name)
             .execute(&self.pool)
             .await?;
+        {
+            let mut cache = self.cache.write().unwrap();
+            cache.tokens.remove(&old);
+            cache.tokens.insert(tok.clone(), name.into());
+        }
         if !old.is_empty() {
             self.login_aliases.lock().await.insert(old, name.into());
         }
@@ -313,10 +360,18 @@ impl Store {
                 }
             })
             .sum();
-        for trade in trades {
-            insert_trade(&mut tx, name, &trade).await?;
+        for trade in &trades {
+            insert_trade(&mut tx, name, trade).await?;
+        }
+        if !trades.is_empty() {
+            user.last_trade = history(&mut tx, name, 1).await?.into_iter().next();
         }
         tx.commit().await?;
+        self.cache
+            .write()
+            .unwrap()
+            .users
+            .insert(name.into(), user.clone());
         if total != 0.0 {
             let mut flow = self.nstar_flow.lock().unwrap();
             flow.0 += player;
@@ -339,6 +394,7 @@ impl Store {
         user.symbol = symbol.into();
         persist(&mut tx, &user).await?;
         tx.commit().await?;
+        self.cache.write().unwrap().users.insert(name.into(), user);
         Ok(())
     }
     pub async fn require_tradable(&self, symbol: &str) -> Result<()> {
@@ -465,6 +521,7 @@ impl Store {
         .await?;
         event(&mut tx, "deposit", name, now, Some(request_id), &row).await?;
         tx.commit().await?;
+        self.cache.write().unwrap().users.insert(name.into(), user);
         Ok(row)
     }
     pub async fn delete(&self, name: &str, confirmation: &str, now: i64) -> Result<Value> {
@@ -483,6 +540,7 @@ impl Store {
                 .await?;
         }
         tx.commit().await?;
+        self.forget(name);
         // A deleted account's NSTAR book is unwound into the market like a stopout.
         self.nstar_flow.lock().unwrap().1 -= nstar_units(&user.account);
         self.login_aliases

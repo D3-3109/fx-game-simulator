@@ -18,7 +18,9 @@ use tokio::sync::broadcast;
 
 #[derive(Clone, Debug)]
 pub enum Event {
-    Message(Value),
+    /// Pre-serialized JSON, shared by every socket instead of re-encoded per connection.
+    /// Quote ticks carry their symbol so sockets can skip pairs nobody on them is viewing.
+    Message(Arc<str>, Option<Arc<str>>),
     Deleted(String),
     Shutdown,
 }
@@ -102,7 +104,12 @@ impl App {
         let _ = self.events.send(Event::Shutdown);
     }
     pub fn broadcast(&self, message: Value) {
-        let _ = self.events.send(Event::Message(message));
+        let symbol = (message.get("type").is_none())
+            .then(|| message["sym"].as_str().map(Arc::from))
+            .flatten();
+        let _ = self
+            .events
+            .send(Event::Message(message.to_string().into(), symbol));
     }
     pub fn connected(&self, name: &str) -> Presence {
         let id = self.connection_seq.fetch_add(1, Ordering::Relaxed);
@@ -188,6 +195,16 @@ impl App {
         let used = acc.used_margin(&prices)?;
         let equity = acc.equity(&prices)?;
         let marks = acc.marks(&prices)?;
+        // The liquidation price depends on the symbol, not the position: solve once each.
+        let mut liq = std::collections::BTreeMap::new();
+        for p in &acc.positions {
+            if !liq.contains_key(p.symbol.as_str()) {
+                liq.insert(
+                    p.symbol.as_str(),
+                    acc.liquidation_price(&p.symbol, &prices)?,
+                );
+            }
+        }
         let mut positions = Vec::new();
         for (p, (now, pnl)) in acc.positions.iter().zip(marks) {
             let margin = p.margin(&prices, acc.leverage)?;
@@ -197,7 +214,7 @@ impl App {
                 "leverage":trading::leverage_for(&p.symbol,acc.leverage),
                 "roe":if margin>0.0 {pnl/margin} else {0.0},
                 "tp":p.tp,"sl":p.sl,
-                "liq":acc.liquidation_price(&p.symbol,&prices)?}));
+                "liq":liq[p.symbol.as_str()]}));
         }
         let mut spot = Vec::new();
         for (symbol, h) in &acc.spot {

@@ -794,7 +794,8 @@ impl Account {
                 continue;
             }
             let (mut bad, mut good) = (bad, good);
-            for _ in 0..60 {
+            // 40 geometric halvings over a 1000x range resolve to ~1e-9 relative.
+            for _ in 0..40 {
                 let m = (bad * good).sqrt();
                 if at(m)? { bad = m } else { good = m }
             }

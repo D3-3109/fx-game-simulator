@@ -882,6 +882,9 @@ async fn nstar_spot_wallet_tpsl_and_public_market_panel() {
         .request("/api/spot", Some(json!({"side":"buy","units":5})), &token)
         .await;
     assert_eq!(status, 200, "{v}");
+    // The reply carries the post-trade account, so the page needs no follow-up GET.
+    assert_eq!(v["state"]["type"], "state");
+    assert!((v["state"]["spot"][0]["units"].as_f64().unwrap() - 5.0).abs() < 1e-9);
     let state = h.request("/api/state", None, &token).await.1;
     let spot = &state["spot"][0];
     assert_eq!(spot["sym"], "NSTAR");

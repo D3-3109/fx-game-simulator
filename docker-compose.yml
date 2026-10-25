@@ -18,6 +18,10 @@ services:
       FX_PROXY: "${FX_PROXY:-}"
       # Behind nginx/Caddy/etc., its address here makes per-IP limits use X-Forwarded-For.
       FX_TRUSTED_PROXY: "${FX_TRUSTED_PROXY:-}"
+      # Registration caps per IP (hour/day) and site-wide per hour; 0 disables a cap.
+      FX_REGISTER_PER_IP_HOUR: "${FX_REGISTER_PER_IP_HOUR:-}"
+      FX_REGISTER_PER_IP_DAY: "${FX_REGISTER_PER_IP_DAY:-}"
+      FX_REGISTER_GLOBAL_HOUR: "${FX_REGISTER_GLOBAL_HOUR:-}"
     extra_hosts:
       # Required on Linux; Docker Desktop provides this name automatically.
       - "host.docker.internal:host-gateway"

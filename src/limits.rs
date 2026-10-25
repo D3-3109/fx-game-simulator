@@ -45,31 +45,67 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            // 50 requests/s sustained per IP, with a burst for page loads and rapid
-            // trading; only scripted floods notice it.
+            // Generous enough that a whole NAT'd office or a proxy that is not configured as
+            // trusted keeps working; only scripted floods notice it.
             api: Rate {
-                burst: 300.0,
-                per_sec: 50.0,
+                burst: 1000.0,
+                per_sec: 200.0,
             },
-            // Login brute force guard; registration has its own hard quota below.
+            // Login brute force guard; registration has its own quota below.
             auth: Rate {
-                burst: 30.0,
-                per_sec: 1.0,
-            },
-            ws: Rate {
-                burst: 30.0,
+                burst: 60.0,
                 per_sec: 5.0,
             },
-            ws_per_client: 100,
+            ws: Rate {
+                burst: 100.0,
+                per_sec: 20.0,
+            },
+            ws_per_client: 500,
             register: Quota {
-                per_client_hour: 2,
-                per_client_day: 5,
-                global_hour: 30,
+                per_client_hour: 20,
+                per_client_day: 100,
+                global_hour: 500,
             },
         }
     }
 }
 impl Limits {
+    /// Defaults, with registration quotas overridable from the environment:
+    /// `FX_REGISTER_PER_IP_HOUR`, `FX_REGISTER_PER_IP_DAY`, `FX_REGISTER_GLOBAL_HOUR`
+    /// (`0` disables that cap) and the request rate via `FX_API_RATE` (requests/s per IP).
+    pub fn from_env() -> Result<Self, String> {
+        let mut limits = Self::default();
+        let read = |key: &str| -> Result<Option<i64>, String> {
+            match std::env::var(key) {
+                Ok(v) if !v.trim().is_empty() => v
+                    .trim()
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|n| *n >= 0)
+                    .map(Some)
+                    .ok_or_else(|| format!("{key} must be a non-negative integer")),
+                _ => Ok(None),
+            }
+        };
+        let cap = |n: i64| if n == 0 { i64::MAX } else { n };
+        if let Some(n) = read("FX_REGISTER_PER_IP_HOUR")? {
+            limits.register.per_client_hour = cap(n);
+        }
+        if let Some(n) = read("FX_REGISTER_PER_IP_DAY")? {
+            limits.register.per_client_day = cap(n);
+        }
+        if let Some(n) = read("FX_REGISTER_GLOBAL_HOUR")? {
+            limits.register.global_hour = cap(n);
+        }
+        if let Some(n) = read("FX_API_RATE")? {
+            let n = if n == 0 { 1e9 } else { n as f64 };
+            limits.api = Rate {
+                burst: (n * 5.0).max(100.0),
+                per_sec: n,
+            };
+        }
+        Ok(limits)
+    }
     /// No effective limits, for offline fixtures and tests that exercise other behavior.
     pub fn unlimited() -> Self {
         let free = Rate {
@@ -268,6 +304,43 @@ mod tests {
         for bad in ["172.16.0.0/33", "nope", "10.0.0.0/x"] {
             assert!(bad.parse::<Net>().is_err(), "{bad}");
         }
+    }
+    #[test]
+    fn env_overrides_registration_quota_and_rate() {
+        // One test owns these variables; nothing else in the crate reads them.
+        let keys = [
+            "FX_REGISTER_PER_IP_HOUR",
+            "FX_REGISTER_PER_IP_DAY",
+            "FX_REGISTER_GLOBAL_HOUR",
+            "FX_API_RATE",
+        ];
+        let set = |pairs: &[(&str, &str)]| {
+            for k in keys {
+                unsafe { std::env::remove_var(k) };
+            }
+            for (k, v) in pairs {
+                unsafe { std::env::set_var(k, v) };
+            }
+        };
+        set(&[]);
+        let d = Limits::from_env().unwrap();
+        assert_eq!(d.register.per_client_hour, 20);
+        assert_eq!(d.api.per_sec, 200.0);
+        set(&[
+            ("FX_REGISTER_PER_IP_HOUR", "0"),
+            ("FX_REGISTER_GLOBAL_HOUR", " 1000 "),
+            ("FX_API_RATE", "500"),
+        ]);
+        let l = Limits::from_env().unwrap();
+        assert_eq!(l.register.per_client_hour, i64::MAX, "0 disables the cap");
+        assert_eq!(l.register.per_client_day, 100);
+        assert_eq!(l.register.global_hour, 1000);
+        assert_eq!((l.api.per_sec, l.api.burst), (500.0, 2500.0));
+        set(&[("FX_REGISTER_PER_IP_DAY", "-3")]);
+        assert!(Limits::from_env().is_err());
+        set(&[("FX_API_RATE", "lots")]);
+        assert!(Limits::from_env().is_err());
+        set(&[]);
     }
     #[test]
     fn socket_slots_cap_and_release() {

@@ -894,10 +894,12 @@ impl SimFeed {
         }
         let drift: f64 = StandardNormal.sample(&mut rng);
         let book = &mut self.book;
-        book.fair += FAIR_REVERT * (book.base - book.fair) + drift * FAIR_VOL;
+        let dev = book.fair - book.base;
+        let pull = (FAIR_REVERT * (1.0 + (dev / FAIR_SOFT).powi(2))).min(0.5);
+        book.fair -= pull * dev;
+        book.fair += drift * FAIR_VOL;
         book.news(&mut rng);
         book.log += REVERT * (book.fair - book.log) + shock + self.trend;
-        book.clamp();
         book.anchor += ANCHOR_FOLLOW * (book.log - book.anchor);
         book.published()
     }
@@ -914,14 +916,14 @@ impl SimFeed {
 
 const TICK_VOL: f64 = 0.0003;
 const FAIR_VOL: f64 = 0.00012;
-/// Fair value drifts back toward base with a ~1 h half-life.
+/// Fair value drifts back toward base with a ~1 h half-life near it...
 const FAIR_REVERT: f64 = 4e-5;
-/// Fair value stays within base/4 ..= base*4 (25..=400 for NSTAR).
-const FAIR_BAND: f64 = 2.0 * std::f64::consts::LN_2;
+/// ...and that pull grows with the square of the distance (in log units), replacing the old
+/// hard 25..=400 band: 5x stronger at 2x/0.5x base, 17x (~3.5 min half-life) at 4x/0.25x.
+/// Trends can run, but sustained one-sided raids cannot walk the price off to absurd levels.
+const FAIR_SOFT: f64 = std::f64::consts::LN_2 / 2.0;
 /// Pull of price toward fair value per tick: a displacement halves in ~90 s.
 const REVERT: f64 = 0.0015;
-/// Price stays within fair/2 ..= fair*2 whatever the flow.
-const STRETCH: f64 = std::f64::consts::LN_2;
 /// Share of flow impact that becomes fair value instead of reverting.
 const CONVICTION: f64 = 0.35;
 /// Per-tick pull of the AMM anchor toward the book: a gap halves in ~5 min (1,500 ticks).
@@ -957,7 +959,7 @@ impl Book {
     fn new(base: f64, price: f64) -> Self {
         let lb = base.ln();
         let log = price.ln();
-        let mut book = Self {
+        Self {
             log,
             fair: log,
             base: lb,
@@ -967,15 +969,7 @@ impl Book {
             events: Vec::new(),
             tape: VecDeque::new(),
             volume: VecDeque::new(),
-        };
-        book.clamp();
-        book
-    }
-    fn clamp(&mut self) {
-        self.fair = self
-            .fair
-            .clamp(self.base - FAIR_BAND, self.base + FAIR_BAND);
-        self.log = self.log.clamp(self.fair - STRETCH, self.fair + STRETCH);
+        }
     }
     fn published(&self) -> f64 {
         (self.log.exp() * 1e5).round() / 1e5
@@ -1057,7 +1051,6 @@ impl Book {
         let avg = self.log.exp() * trading::amm_avg(x0, x1, width);
         self.log += d;
         self.fair += CONVICTION * d;
-        self.clamp();
         self.print(avg, units);
         if d.abs() >= BIG_FLOW {
             let side = if units > 0.0 { "买入" } else { "卖出" };

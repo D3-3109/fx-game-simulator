@@ -206,12 +206,26 @@ impl App {
             }
         }
         let mut positions = Vec::new();
-        for (p, (now, pnl)) in acc.positions.iter().zip(marks) {
-            let margin = p.margin(&prices, acc.leverage)?;
+        let margins = acc.position_margins(&prices)?;
+        for ((p, (now, pnl)), margin) in acc.positions.iter().zip(marks).zip(margins) {
+            let units = p.lots * trading::contract(&p.symbol);
+            let notional = units * p.entry * trading::usd_rate(&prices, &p.symbol)?;
+            // Tiered stacks show their effective leverage, e.g. 15x for a full NSTAR book.
+            let leverage = if trading::leverage_tiers(&p.symbol).is_empty() || margin <= 0.0 {
+                trading::leverage_for(&p.symbol, acc.leverage) as f64
+            } else {
+                (notional / margin * 10.0).round() / 10.0
+            };
+            // Whole leverages stay integers on the wire, as before tiers existed.
+            let leverage = if leverage.fract() == 0.0 {
+                json!(leverage as u64)
+            } else {
+                json!(leverage)
+            };
             positions.push(json!({"id":p.id,"side":p.side,"lots":p.lots,"sym":p.symbol,
                 "entry":p.entry,"now":now,"pnl":pnl,"margin":margin,
-                "units":p.lots*trading::contract(&p.symbol),
-                "leverage":trading::leverage_for(&p.symbol,acc.leverage),
+                "units":units,
+                "leverage":leverage,
                 "roe":if margin>0.0 {pnl/margin} else {0.0},
                 "tp":p.tp,"sl":p.sl,
                 "liq":liq[p.symbol.as_str()]}));
@@ -228,12 +242,34 @@ impl App {
             );
         }
         // Shown in the asset panel even with no NSTAR held; absent offline.
-        let nstar = match prices.get(symbols::NSTAR) {
-            Some(p) => Some(*p),
-            None => self.market.price(symbols::NSTAR).await.ok(),
+        let nstar_prices = if prices.contains_key(symbols::NSTAR) {
+            Some(prices.clone())
+        } else {
+            self.market.prices([symbols::NSTAR]).await.ok()
         };
+        let nstar = nstar_prices
+            .as_ref()
+            .and_then(|q| q.get(symbols::NSTAR).copied());
+        // Slider ranges: the largest orders the real checks would accept right now.
+        let max_lots = json!({
+            "buy": acc.max_open_lots("long", &user.symbol, &prices),
+            "sell": acc.max_open_lots("short", &user.symbol, &prices),
+        });
+        let spot_max_buy = nstar_prices
+            .as_ref()
+            .map(|q| acc.max_spot_buy(symbols::NSTAR, q));
+        let tiers: Vec<_> = trading::leverage_tiers(&user.symbol)
+            .iter()
+            .map(|(up_to, lev)| json!([up_to, (*lev).min(acc.leverage)]))
+            .collect();
+        let limits = json!({
+            "max_lots": max_lots, "spot_max_buy": spot_max_buy,
+            "order_max_lots": trading::max_order_lots(&user.symbol),
+            "tiers": tiers, "gross_units": acc.gross_units(&user.symbol),
+            "max_leverage": trading::MAX_LEVERAGE,
+        });
         Ok(
-            json!({"ok":true,"type":"state","name":name,"symbol":user.symbol,"price":prices[&user.symbol],"bid":bid,"ask":ask,"quote_valid":quote_valid,"quote_at":if self.market.is_offline(){None}else{Some(quote.at)},"balance":acc.balance,"loan":acc.loan,"debt":acc.debt(),"debt_since":acc.debt_since,"debt_limit":trading::DEBT_LIMIT,"equity":equity,"used":used,"free":equity-used,"margin_level":if used==0.0 {None} else {Some(equity/used)},"leverage":acc.leverage,"positions":positions,"spot":spot,"nstar_price":nstar,"spot_fee":trading::SPOT_FEE,"contract":trading::contract(&user.symbol),"symbol_leverage":trading::leverage_for(&user.symbol,acc.leverage),"funding_at":acc.funding_at,"stopout_level":trading::STOPOUT,"currency":"USD","last_trade":user.last_trade}),
+            json!({"ok":true,"type":"state","name":name,"symbol":user.symbol,"price":prices[&user.symbol],"bid":bid,"ask":ask,"quote_valid":quote_valid,"quote_at":if self.market.is_offline(){None}else{Some(quote.at)},"balance":acc.balance,"loan":acc.loan,"debt":acc.debt(),"debt_since":acc.debt_since,"debt_limit":trading::DEBT_LIMIT,"equity":equity,"used":used,"free":equity-used,"margin_level":if used==0.0 {None} else {Some(equity/used)},"leverage":acc.leverage,"positions":positions,"spot":spot,"nstar_price":nstar,"spot_fee":trading::SPOT_FEE,"contract":trading::contract(&user.symbol),"symbol_leverage":trading::leverage_for(&user.symbol,acc.leverage),"funding_at":acc.funding_at,"stopout_level":trading::STOPOUT,"currency":"USD","last_trade":user.last_trade,"limits":limits}),
         )
     }
     pub async fn leaderboard(&self) -> Result<Value, String> {

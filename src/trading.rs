@@ -11,7 +11,7 @@ pub const LOAN_RATE: f64 = 0.10;
 /// Spot taker fee (0.1%, OKX's base tier) and order size bounds in units.
 pub const SPOT_FEE: f64 = 0.001;
 pub const SPOT_MIN: f64 = 0.0001;
-pub const SPOT_MAX: f64 = 10_000.0;
+pub const SPOT_MAX: f64 = 100_000.0;
 /// Slowest the book anchor may be ignored: displacements beyond this many widths are
 /// solved on the clamped value so `sinh`/`exp` stay finite for absurd inputs.
 const AMM_MAX_C: f64 = 1e12;
@@ -135,6 +135,41 @@ pub fn leverage_for(symbol: &str, leverage: u64) -> u64 {
     }
 }
 
+/// Risk-limit tiers of a symbol, `(gross units up to, max leverage)`; empty when none.
+pub fn leverage_tiers(symbol: &str) -> &'static [(f64, u64)] {
+    symbols::spec(symbol).map_or(&[], |s| s.leverage_tiers)
+}
+
+/// Margin in units of price for `gross` units of a tiered symbol: each tier slice divided
+/// by `min(account leverage, tier leverage)`. Size past the last tier keeps its leverage.
+pub fn tiered_margin_units(symbol: &str, gross: f64, leverage: u64) -> f64 {
+    let tiers = leverage_tiers(symbol);
+    let (mut from, mut margin) = (0.0, 0.0);
+    for (i, &(up_to, lev)) in tiers.iter().enumerate() {
+        let to = if i + 1 == tiers.len() {
+            gross
+        } else {
+            gross.min(up_to)
+        };
+        if to > from {
+            margin += (to - from) / leverage.min(lev).max(1) as f64;
+        }
+        from = up_to;
+        if gross <= up_to {
+            break;
+        }
+    }
+    margin
+}
+
+/// Largest single order in lots for a symbol.
+pub fn max_order_lots(symbol: &str) -> f64 {
+    match symbols::spec(symbol) {
+        Some(s) if s.max_order_lots > 0.0 => s.max_order_lots,
+        _ => MAX_LOTS,
+    }
+}
+
 /// Elastic AMM width of a book symbol (0: constant depth).
 pub fn amm_width(symbol: &str) -> f64 {
     symbols::spec(symbol).map_or(0.0, |s| s.amm_width)
@@ -238,7 +273,10 @@ fn book_price(prices: &Prices, symbol: &str, lots: f64, buy: bool) -> Result<f64
 
 pub fn lots_valid(symbol: &str, lots: f64) -> bool {
     let (min, whole) = symbols::spec(symbol).map_or((0.01, false), |s| (s.min_lots, s.whole_lots));
-    lots.is_finite() && lots >= min && lots <= MAX_LOTS && (!whole || lots.fract() == 0.0)
+    lots.is_finite()
+        && lots >= min
+        && lots <= max_order_lots(symbol)
+        && (!whole || lots.fract() == 0.0)
 }
 
 pub fn spread(symbol: &str, mid: f64) -> f64 {
@@ -544,15 +582,37 @@ impl Account {
                 + self.marks(prices)?.iter().map(|(_, pnl)| pnl).sum::<f64>(),
         )
     }
+    /// Gross units this account holds in a symbol's perpetuals, longs and shorts alike.
+    pub fn gross_units(&self, symbol: &str) -> f64 {
+        self.positions
+            .iter()
+            .filter(|p| p.symbol == symbol)
+            .map(|p| p.lots * contract(symbol))
+            .sum()
+    }
+    /// Margin per position. Tiered symbols are margined as one stack and shared out by size,
+    /// so the order positions were opened in never changes the total.
+    pub fn position_margins(&self, prices: &Prices) -> Result<Vec<f64>> {
+        let mut stacks = BTreeMap::<&str, f64>::new();
+        for p in &self.positions {
+            if !leverage_tiers(&p.symbol).is_empty() && !stacks.contains_key(p.symbol.as_str()) {
+                let gross = self.gross_units(&p.symbol);
+                let margin = tiered_margin_units(&p.symbol, gross, self.leverage)
+                    * market_price(prices, &p.symbol)?
+                    * usd_rate(prices, &p.symbol)?;
+                stacks.insert(p.symbol.as_str(), finite(margin / gross)?);
+            }
+        }
+        self.positions
+            .iter()
+            .map(|p| match stacks.get(p.symbol.as_str()) {
+                Some(per_unit) => finite(per_unit * p.lots * contract(&p.symbol)),
+                None => p.margin(prices, self.leverage),
+            })
+            .collect()
+    }
     pub fn used_margin(&self, prices: &Prices) -> Result<f64> {
-        finite(
-            self.positions
-                .iter()
-                .map(|p| p.margin(prices, self.leverage))
-                .collect::<Result<Vec<_>>>()?
-                .iter()
-                .sum::<f64>(),
-        )
+        finite(self.position_margins(prices)?.iter().sum::<f64>())
     }
     pub fn margin_level(&self, prices: &Prices) -> Result<Option<f64>> {
         let used = self.used_margin(prices)?;
@@ -591,8 +651,11 @@ impl Account {
                 .map(|p| p.lots)
                 .sum();
             if held + lots > cap {
+                let unit = contract(symbol);
                 return Err(format!(
-                    "{symbol} 单账户持仓上限 {cap} 手，当前已持 {held} 手"
+                    "{symbol} 单账户持仓上限 {} 枚，当前已持 {} 枚",
+                    cap * unit,
+                    held * unit
                 ));
             }
         }
@@ -601,10 +664,17 @@ impl Account {
         } else {
             execution_price(prices, symbol, side == "long")?
         };
-        let need = finite(
-            lots * contract(symbol) * px * usd_rate(prices, symbol)?
-                / leverage_for(symbol, self.leverage) as f64,
-        )?;
+        let units = lots * contract(symbol);
+        let need = finite(if leverage_tiers(symbol).is_empty() {
+            units * px * usd_rate(prices, symbol)? / leverage_for(symbol, self.leverage) as f64
+        } else {
+            // Only the added slice pays its tier's leverage.
+            let held = self.gross_units(symbol);
+            (tiered_margin_units(symbol, held + units, self.leverage)
+                - tiered_margin_units(symbol, held, self.leverage))
+                * px
+                * usd_rate(prices, symbol)?
+        })?;
         let free = self.equity(prices)? - self.used_margin(prices)?;
         if need > free {
             return Err(format!("保证金不足: 需 ${need:.2}，可用 ${free:.2}（USD）"));
@@ -842,6 +912,24 @@ impl Account {
         *self = next;
         Ok(trades)
     }
+    /// Largest order in lots this account could open now (0 if none), found by bisection
+    /// on the real `open` checks so margin, tiers, impact and caps all count.
+    pub fn max_open_lots(&self, side: &str, symbol: &str, prices: &Prices) -> f64 {
+        let whole = symbols::spec(symbol).is_some_and(|s| s.whole_lots);
+        let min = symbols::spec(symbol).map_or(0.01, |s| s.min_lots);
+        let step = if whole { 1.0 } else { 0.01 };
+        let ok = |lots: f64| {
+            self.clone()
+                .open(side, lots, symbol, prices, u64::MAX - 1, 0)
+                .is_ok()
+        };
+        largest(min, max_order_lots(symbol), step, ok)
+    }
+    /// Largest spot buy in units this account could make now (0 if none).
+    pub fn max_spot_buy(&self, symbol: &str, prices: &Prices) -> f64 {
+        let ok = |units: f64| self.clone().spot(symbol, units, prices, 0).is_ok();
+        largest(SPOT_MIN, SPOT_MAX, SPOT_MIN, ok)
+    }
     /// Mid at which the account would hit stop-out if only this symbol moved, holding
     /// everything else fixed; None when no move in range would liquidate it.
     pub fn liquidation_price(&self, symbol: &str, prices: &Prices) -> Result<Option<f64>> {
@@ -945,6 +1033,24 @@ impl Account {
         *self = next;
         Ok(trades)
     }
+}
+
+/// Largest multiple of `step` in `[min, max]` accepted by a monotone check; 0 if none.
+fn largest(min: f64, max: f64, step: f64, ok: impl Fn(f64) -> bool) -> f64 {
+    if !ok(min) {
+        return 0.0;
+    }
+    if ok(max) {
+        return max;
+    }
+    let (mut good, mut bad) = (min, max);
+    // Geometric bisection over up to ~1e9x, then snap down to the order step.
+    for _ in 0..48 {
+        let mid = (good * bad).sqrt();
+        if ok(mid) { good = mid } else { bad = mid }
+    }
+    let snapped = ((good / step + 1e-9).floor() * step).max(min);
+    if ok(snapped) { snapped } else { min }
 }
 
 #[cfg(test)]
@@ -1174,7 +1280,7 @@ mod tests {
         );
     }
     #[test]
-    fn nstar_is_marked_at_liquidation_value_and_caps_size() {
+    fn nstar_is_marked_at_liquidation_value_and_margined_by_tiers() {
         let q = quotes(&[("NSTAR", 100.0)]);
         let mut a = Account {
             balance: 1e9,
@@ -1185,14 +1291,74 @@ mod tests {
         // Unwinding 1,000 NSTAR into a 50,000 book costs ~1%: the mark says so.
         let pnl = a.positions[0].pnl(&q).unwrap();
         assert!(pnl < -400.0, "{pnl}");
-        // Account leverage 1:50000 still margins NSTAR at 1:100.
-        let margin = a.positions[0].margin(&q, a.leverage).unwrap();
-        assert!((margin - MAX_LOTS * 0.01 * 100.0 / 100.0).abs() < 1e-6);
-        for id in 2..=20 {
-            a.open("long", MAX_LOTS, "NSTAR", &q, id, 0).unwrap();
+        // Account leverage 1:50000 still margins NSTAR at 1:100 inside the first tier.
+        assert!((a.used_margin(&q).unwrap() - 1_000.0).abs() < 1e-6);
+        // A full 100,000 NSTAR book: 10k at 100x + 15k at 50x + 25k at 20x + 50k at 10x
+        // = 6,650 NSTAR of margin, ~15x effective, longs and shorts alike.
+        let mut full = Account {
+            balance: 1e9,
+            ..Account::default()
+        };
+        full.open("long", 10_000_000.0, "NSTAR", &q, 1, 0).unwrap();
+        let margin = full.used_margin(&q).unwrap();
+        assert!((margin - 665_000.0).abs() < 1e-3, "{margin}");
+        assert!(full.open("short", 0.01, "NSTAR", &q, 2, 0).is_err());
+        // Built in slices, the stack costs exactly the same margin.
+        let mut sliced = Account {
+            balance: 1e9,
+            ..Account::default()
+        };
+        for id in 1..=10 {
+            sliced
+                .open("long", 1_000_000.0, "NSTAR", &q, id, 0)
+                .unwrap();
         }
-        // Gross cap: 20,000 NSTAR per account, longs and shorts alike.
-        assert!(a.open("short", 0.01, "NSTAR", &q, 6, 0).is_err());
+        assert!((sliced.used_margin(&q).unwrap() - margin).abs() < 1e-3);
+        let shares = sliced.position_margins(&q).unwrap();
+        assert!(shares.iter().all(|m| (m - margin / 10.0).abs() < 1e-3));
+        // A lower account leverage caps every tier: 20,000 NSTAR at 20x = 1,000 NSTAR.
+        let mut low = Account {
+            balance: 1e9,
+            leverage: 20,
+            ..Account::default()
+        };
+        low.open("long", 2_000_000.0, "NSTAR", &q, 1, 0).unwrap();
+        assert!((low.used_margin(&q).unwrap() - 100_000.0).abs() < 1e-3);
+    }
+    #[test]
+    fn slider_ranges_match_what_open_and_spot_accept() {
+        let q = quotes(&[("NSTAR", 100.0)]);
+        let fresh = Account::default();
+        for side in ["long", "short"] {
+            let max = fresh.max_open_lots(side, "NSTAR", &q);
+            assert!(max > 100_000.0 && max < 2_000_000.0, "{side} {max}");
+            assert!(fresh.clone().open(side, max, "NSTAR", &q, 1, 0).is_ok());
+            assert!(
+                fresh
+                    .clone()
+                    .open(side, max + 0.01, "NSTAR", &q, 1, 0)
+                    .is_err()
+            );
+        }
+        let rich = Account {
+            balance: 1e9,
+            ..Account::default()
+        };
+        assert_eq!(rich.max_open_lots("long", "NSTAR", &q), 10_000_000.0);
+        let buy = fresh.max_spot_buy("NSTAR", &q);
+        assert!(buy > 90.0 && buy < 100.0, "{buy}");
+        assert!(fresh.clone().spot("NSTAR", buy, &q, 1).is_ok());
+        assert!(fresh.clone().spot("NSTAR", buy + 0.001, &q, 1).is_err());
+        let broke = Account {
+            balance: 0.0,
+            ..Account::default()
+        };
+        assert_eq!(broke.max_spot_buy("NSTAR", &q), 0.0);
+        assert_eq!(broke.max_open_lots("long", "NSTAR", &q), 0.0);
+        // Whole-share symbols snap to whole shares.
+        let s = quotes(&[("AAPL", 187.3)]);
+        let shares = fresh.max_open_lots("long", "AAPL", &s);
+        assert!(shares >= 1.0 && shares.fract() == 0.0, "{shares}");
     }
     #[test]
     fn stacked_nstar_orders_are_marked_jointly_and_cannot_inflate_equity() {
@@ -1332,7 +1498,7 @@ mod tests {
             balance: 1e9,
             ..Account::default()
         };
-        let big = one.open("long", 1_000_000.0, "NSTAR", &q, 1, 0);
+        let big = one.open("long", 10_000_000.01, "NSTAR", &q, 1, 0);
         assert!(big.is_err(), "per-order lot cap");
         let big = one.open("long", 100_000.0, "NSTAR", &q, 1, 0).unwrap();
         let mut many = Account {
@@ -1370,8 +1536,7 @@ mod tests {
             balance: 1e9,
             ..Account::default()
         };
-        a.spot("NSTAR", 10_000.0, &q, 1).unwrap();
-        a.spot("NSTAR", 10_000.0, &q, 2).unwrap();
+        a.spot("NSTAR", 100_000.0, &q, 1).unwrap();
         let before = a.clone();
         assert!(a.spot("NSTAR", 0.01, &q, 3).is_err());
         assert_eq!(a, before, "refused buy leaves the account untouched");

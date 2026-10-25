@@ -45,18 +45,24 @@
  <div id="perp-form" class="order-form">
   <div class="order-symbol"><b id="order-symbol">USDJPY</b><span>市价 · USDT 结算</span></div>
   <label class="field" for="lots"><span>数量</span><input id="lots" type="number" min="0.01" step="0.01" value="0.10" inputmode="decimal" required><span id="lots-unit" class="unit">手</span></label>
-  <div class="lot-presets" role="group" aria-label="快捷数量">
-   <button type="button" data-lots="0.01" onclick="setLots(this.dataset.lots)">0.01</button><button type="button" data-lots="0.1" onclick="setLots(this.dataset.lots)">0.10</button>
-   <button type="button" data-lots="0.5" onclick="setLots(this.dataset.lots)">0.50</button><button type="button" data-lots="1" onclick="setLots(this.dataset.lots)">1.00</button>
+  <div class="slider-box">
+   <input id="lots-slider" class="slider" type="range" min="0" max="100" step="1" value="0" aria-label="按可开数量比例">
+   <div class="slider-ticks" role="group" aria-label="按比例"><button type="button" onclick="setLotsPct(0)">0</button><button type="button" onclick="setLotsPct(25)">25%</button><button type="button" onclick="setLotsPct(50)">50%</button><button type="button" onclick="setLotsPct(75)">75%</button><button type="button" onclick="setLotsPct(100)">100%</button></div>
   </div>
+  <div class="order-meta"><span>最大可开 多/空</span><b id="order-max">—</b></div>
   <div class="order-meta"><span>名义价值</span><b id="order-notional">—</b></div>
   <div class="order-meta"><span>所需保证金</span><b id="order-margin">—</b></div>
   <div class="order-buttons"><button id="trade-buy" type="button" class="buy" onclick="trade('buy')">BUY<small id="buy-price">—</small></button>
    <button id="trade-sell" type="button" class="sell" onclick="trade('sell')">SELL<small id="sell-price">—</small></button></div>
   <p id="symbol-status" class="muted" role="status"></p>
+  <p id="tier-hint" class="muted tier-hint" hidden></p>
  </div>
  <form id="lev-form" class="leverage-form" onsubmit="event.preventDefault();setLev()">
-  <label for="lev">杠杆倍数<input id="lev" type="number" min="1" max="9007199254740991" step="1" list="lev-presets" required oninput="levDirty=true"></label>
+  <label for="lev">杠杆倍数<input id="lev" type="number" min="1" max="9007199254740991" step="1" list="lev-presets" required oninput="levDirty=true;syncLevSlider()"></label>
+  <div class="slider-box lev-slider-box">
+   <input id="lev-slider" class="slider" type="range" min="0" max="20" step="1" value="9" aria-label="杠杆倍数滑块">
+   <div class="slider-ticks lev-ticks" aria-hidden="true"><span style="left:0">1x</span><span style="left:20%">10x</span><span style="left:45%">100x</span><span style="left:70%">1000x</span><span style="left:100%">50000x</span></div>
+  </div>
   <datalist id="lev-presets"><option value="1"><option value="10"><option value="20"><option value="50">
    <option value="100"><option value="200"><option value="500"><option value="1000"></datalist>
   <button id="lev-apply" type="submit">应用杠杆</button>
@@ -70,9 +76,9 @@
    <button type="button" role="tab" id="spot-side-sell" class="sell" aria-selected="false" onclick="setSpotSide('sell')">卖出</button>
   </div>
   <label class="field" for="spot-units"><span>数量</span><input id="spot-units" type="number" min="0.0001" step="0.0001" value="1" inputmode="decimal" required><span class="unit">NSTAR</span></label>
-  <div class="lot-presets" role="group" aria-label="按比例">
-   <button type="button" onclick="spotPercent(.25)">25%</button><button type="button" onclick="spotPercent(.5)">50%</button>
-   <button type="button" onclick="spotPercent(.75)">75%</button><button type="button" onclick="spotPercent(1)">100%</button>
+  <div class="slider-box">
+   <input id="spot-slider" class="slider" type="range" min="0" max="100" step="1" value="0" aria-label="按可用比例">
+   <div class="slider-ticks" role="group" aria-label="按比例"><button type="button" onclick="spotPercent(0)">0</button><button type="button" onclick="spotPercent(.25)">25%</button><button type="button" onclick="spotPercent(.5)">50%</button><button type="button" onclick="spotPercent(.75)">75%</button><button type="button" onclick="spotPercent(1)">100%</button></div>
   </div>
   <div class="order-meta"><span>预估金额</span><b id="spot-total">—</b></div>
   <div class="order-meta"><span>可用</span><b id="spot-avail">—</b></div>

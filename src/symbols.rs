@@ -39,6 +39,12 @@ pub struct Spec {
     pub max_leverage: u64,
     /// Gross open lots one account may hold in this symbol; 0 means only the per-order cap.
     pub max_open_lots: f64,
+    /// Largest single order in lots; 0 means the global `MAX_LOTS`.
+    pub max_order_lots: f64,
+    /// Risk-limit tiers on the account's gross units in this symbol: each `(up_to, lev)`
+    /// slice is margined at `min(account leverage, lev)`, like income-tax brackets, so the
+    /// margin grows smoothly and only the extra size pays the lower leverage. Empty: none.
+    pub leverage_tiers: &'static [(f64, u64)],
     /// Units that move the price by one log unit (e≈2.72x) near the anchor; 0 means no
     /// simulated order book.
     pub depth: f64,
@@ -62,6 +68,8 @@ const fn lot(symbol: &'static str, spread: f64, settle: Option<&'static str>) ->
         settle,
         max_leverage: 0,
         max_open_lots: 0.0,
+        max_order_lots: 0.0,
+        leverage_tiers: &[],
         depth: 0.0,
         amm_width: 0.0,
         max_spot_units: 0.0,
@@ -78,6 +86,8 @@ const fn coin(symbol: &'static str) -> Spec {
         settle: None,
         max_leverage: 0,
         max_open_lots: 0.0,
+        max_order_lots: 0.0,
+        leverage_tiers: &[],
         depth: 0.0,
         amm_width: 0.0,
         max_spot_units: 0.0,
@@ -94,6 +104,8 @@ const fn stock(symbol: &'static str) -> Spec {
         settle: None,
         max_leverage: 0,
         max_open_lots: 0.0,
+        max_order_lots: 0.0,
+        leverage_tiers: &[],
         depth: 0.0,
         amm_width: 0.0,
         max_spot_units: 0.0,
@@ -103,16 +115,26 @@ const SPECS: &[Spec] = &[
     lot(SIM, TIGHT, None),
     // 1 lot = 0.01 NSTAR. ~500 NSTAR (~$50k) moves the price ~1% near the anchor. The
     // elastic curve thickens away from it: 20,000 NSTAR lifts ~18% (49% on a flat book),
-    // 100,000 ~37% (flat: 7x). One account holds at most 20,000 NSTAR gross in perpetuals
-    // plus 20,000 spot. Fills pay for every step of a move both ways, so a pump only pays
-    // off for whoever sells into someone else's buying.
+    // 100,000 ~37% (flat: 7x). Perpetual size is limited by leverage tiers rather than a
+    // wall: the first 10,000 NSTAR gross get 100x, the next slices 50x/20x/10x, up to a
+    // 100,000 NSTAR safety ceiling (effective ~15x when full); spot also tops out at
+    // 100,000. One order may use the whole ceiling, since splitting costs the same. Fills
+    // pay for every step of a move both ways, so a pump only pays off for whoever sells
+    // into someone else's buying.
     Spec {
         contract: 0.01,
         max_leverage: 100,
-        max_open_lots: 2_000_000.0,
+        max_open_lots: 10_000_000.0,
+        max_order_lots: 10_000_000.0,
+        leverage_tiers: &[
+            (10_000.0, 100),
+            (25_000.0, 50),
+            (50_000.0, 20),
+            (100_000.0, 10),
+        ],
         depth: 50_000.0,
         amm_width: 0.08,
-        max_spot_units: 20_000.0,
+        max_spot_units: 100_000.0,
         ..coin(NSTAR)
     },
     lot("BTCUSDT", TIGHT, None),

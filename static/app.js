@@ -271,8 +271,7 @@ function syncOrderControls(){
  $('order-symbol').textContent=pairName(cur.sym)+(cur.sym==='NSTAR'?' 永续':'');
  const whole=STOCKS.includes(cur.sym),star=cur.sym==='NSTAR';
  $('lots').min=whole?1:0.01;$('lots').step=whole?1:0.01;
- // NSTAR: 1 手 = 0.01 枚 ≈ $1；预设对应 $100 / $1k / $10k / $100k 名义价值。
- document.querySelectorAll('[data-lots]').forEach((b,i)=>{const v=(whole?[1,10,50,100]:star?[100,1000,10000,100000]:[0.01,0.1,0.5,1])[i];b.dataset.lots=v;b.textContent=whole?String(v):star?(v>=1000?v/1000+'k':String(v)):v.toFixed(2)});
+ // NSTAR: 1 手 = 0.01 枚 ≈ $1。
  if(lotsFor!==cur.sym){lotsFor=cur.sym;$('lots').value=star?'1000':whole?'1':'0.10'}
  syncLotPresets();renderOrderEstimate();
  $('trade-buy').disabled=$('trade-sell').disabled=orderBusy||symbolSaving||!allowed||!quoteReady;
@@ -281,7 +280,7 @@ function syncOrderControls(){
  document.querySelectorAll('.close-position').forEach(button=>button.disabled=orderBusy);
  $('symbol-status').textContent=orderBusy?'订单提交中，请稍候…':tradableSymbols===null?'正在获取币种配置…':allowed?'':
   tradableSymbols.length?'该币对已禁用，已有持仓仍可平仓':'暂无启用的币对，已有持仓仍可平仓';
- if(allowed&&!orderBusy&&cur.sym==='NSTAR')$('symbol-status').textContent='NSTAR 杠杆上限 1:100 · 偏离锚价越远流动性越厚 · 单账户合约/现货上限各 20,000 枚';
+ if(allowed&&!orderBusy&&cur.sym==='NSTAR')$('symbol-status').textContent='NSTAR 最高 1:100，仓位越大杠杆档位越低 · 偏离锚价越远流动性越厚';
 }
 function applySymbols(settings){
  if(settings.version<symbolsVersion)return;
@@ -310,10 +309,24 @@ async function api(path,body){const r=await fetch('/api/'+path,{method:'POST',he
 const settle=j=>j.state?(connOk(),render(j.state)):refresh();
 let messageTimer=null;
 function msg(t){clearTimeout(messageTimer);$('msg').textContent=t;messageTimer=setTimeout(()=>$('msg').textContent='',6000)}
+/* 数量滑块: 100% = 服务器按真实保证金/档位/冲击成本算出的最大可开（多空取小）。 */
+const fmtLots=n=>STOCKS.includes(cur.sym)||cur.sym==='NSTAR'&&n>=1?String(+n.toFixed(2)):n.toFixed(2);
+function maxLots(){const s=lastState,m=s?.limits?.max_lots;return m&&s.symbol===cur.sym?m:null}
+function setSlider(el,pct,enabled){el.value=Math.round(pct);el.style.setProperty('--fill',`${Math.min(100,Math.max(0,pct))}%`);el.disabled=!enabled}
 function syncLotPresets(){
- document.querySelectorAll('[data-lots]').forEach(button=>button.setAttribute('aria-pressed',Number(button.dataset.lots)===Number($('lots').value)));
+ const m=maxLots(),cap=m?Math.min(m.buy,m.sell):0,n=Number($('lots').value),star=cur.sym==='NSTAR',c=lastState?.contract??1;
+ setSlider($('lots-slider'),cap>0&&n>0?n/cap*100:0,cap>0);
+ const node=$('order-max');
+ node.textContent=!m?'—':star?`${units(m.buy*c,2)} / ${units(m.sell*c,2)} NSTAR`:`${fmtLots(m.buy)} / ${fmtLots(m.sell)} ${STOCKS.includes(cur.sym)?'股':'手'}`;
+ node.className=m&&n>Math.max(m.buy,m.sell)?'red':'';
 }
-function setLots(value){const n=Number(value);$('lots').value=STOCKS.includes(cur.sym)||cur.sym==='NSTAR'&&n>=1?String(n):n.toFixed(2);syncLotPresets()}
+function setLots(value){$('lots').value=fmtLots(Number(value));syncLotPresets();renderOrderEstimate()}
+function setLotsPct(pct){
+ const m=maxLots(),cap=m?Math.min(m.buy,m.sell):0;if(!(cap>0))return;
+ const step=STOCKS.includes(cur.sym)?1:.01,min=STOCKS.includes(cur.sym)?1:.01;
+ setLots(Math.min(cap,Math.max(min,Math.floor(cap*pct/100/step+1e-9)*step)));
+}
+$('lots-slider').addEventListener('input',e=>setLotsPct(Number(e.target.value)));
 /* NSTAR 快讯: 传闻/消息/巨鲸，所有人可见，仅保留最近 4 条。 */
 let nstarFeed=[];
 function nstarEvent(e){
@@ -370,6 +383,14 @@ async function submitClose(body){
  catch(e){msg('平仓失败：'+e)}
  finally{orderBusy=false;syncOrderControls()}
 }
+/* 杠杆滑块: 对数刻度的常用档位，数字框仍可输入任意整数。 */
+const LEV_STOPS=[1,2,3,5,10,20,25,50,75,100,150,200,300,500,1000,2000,3000,5000,10000,20000,50000];
+function syncLevSlider(){
+ const v=Number($('lev').value),sl=$('lev-slider');if(!(v>=1))return;
+ let best=0;LEV_STOPS.forEach((x,i)=>{if(Math.abs(Math.log(x/v))<Math.abs(Math.log(LEV_STOPS[best]/v)))best=i});
+ setSlider(sl,best/(LEV_STOPS.length-1)*100,!$('lev').disabled);sl.value=best;
+}
+$('lev-slider').addEventListener('input',e=>{$('lev').value=LEV_STOPS[Number(e.target.value)];levDirty=true;syncLevSlider()});
 async function setLev(){
  if(levSaving)return;
  const input=$('lev'),value=Number(input.value);
@@ -382,7 +403,7 @@ async function setLev(){
   if(j.ok){accountLeverage=value;levDirty=false;input.value=value;await settle(j)}
   else{input.value=accountLeverage;levDirty=false}
  }catch(e){msg('杠杆保存失败，请重试：'+e)}
- finally{levSaving=false;input.disabled=$('lev-apply').disabled=curPos.length>0;$('lev-apply').textContent='应用杠杆'}
+ finally{levSaving=false;input.disabled=$('lev-apply').disabled=curPos.length>0;$('lev-apply').textContent='应用杠杆';syncLevSlider()}
 }
 
 const SEC={'1s':1,'1m':60,'5m':300,'15m':900,'30m':1800,'1h':3600,'4h':14400,'1d':86400,'1w':604800};
@@ -466,6 +487,7 @@ function render(s){
  if(!levSaving&&(!levDirty||s.positions.length)){$('lev').value=s.leverage;levDirty=false}
  $('lev').disabled=$('lev-apply').disabled=levSaving||s.positions.length>0;
  $('lev-hint').textContent=s.positions.length?'先平仓再修改杠杆':`当前 ${s.leverage} 倍 · 高杠杆更易强平`;
+ syncLevSlider();renderTierHint(s);
  observePrices(s.symbol,[s.price]);
  for(const p of s.positions)observePrices(p.sym||s.symbol,[p.now]);
  curPos=s.positions;drawPosLines();$('position-count').textContent=curPos.length;
@@ -596,7 +618,8 @@ function setMode(next){
  for(const m of ['perp','spot'])$('mode-'+m).setAttribute('aria-selected',m===mode);
  $('perp-form').hidden=$('lev-form').hidden=$('close-box').hidden=mode!=='perp';
  $('spot-form').hidden=mode!=='spot';
- if(mode==='spot'&&cur.sym!=='NSTAR')switchSymbol('NSTAR');
+ // 现货只有 NSTAR：沿用币对下拉框的切换流程（保存选择、重载行情与图表）。
+ if(mode==='spot'&&cur.sym!=='NSTAR'&&!symbolSaving){symSel.value='NSTAR';symSel.onchange()}
  renderSpotForm();
 }
 function setSpotSide(side){
@@ -610,12 +633,25 @@ function heldNstar(){return (lastState?.spot||[]).find(h=>h.sym==='NSTAR')?.unit
 function renderSpotForm(){
  const px=nstarMid(),n=Number($('spot-units').value);
  $('spot-total').textContent=Number.isFinite(px)&&n>0?`≈ ${units(px*n*(1+(spotSide==='buy'?1:-1)*(lastState?.spot_fee??.001)),2)} USDT`:'—';
- $('spot-avail').textContent=lastState?spotSide==='buy'?`${units(lastState.balance,2)} USDT`:`${units(heldNstar())} NSTAR`:'—';
+ $('spot-avail').textContent=lastState?spotSide==='buy'?`${units(lastState.balance,2)} USDT · 最多 ${units(spotMax(),2)} NSTAR`:`${units(heldNstar())} NSTAR`:'—';
+ const max=spotMax();setSlider($('spot-slider'),max>0&&n>0?n/max*100:0,max>0);
+}
+function spotMax(){
+ if(!lastState)return 0;if(spotSide==='sell')return heldNstar();
+ const exact=lastState.limits?.spot_max_buy,px=nstarMid();
+ return Number.isFinite(exact)?exact:Number.isFinite(px)&&px>0?lastState.balance/(px*1.003):0;
 }
 function spotPercent(f){
- const px=nstarMid();if(!lastState)return;
- const n=spotSide==='buy'?(Number.isFinite(px)&&px>0?lastState.balance*f/(px*1.003):0):heldNstar()*f;
- $('spot-units').value=Math.max(0,Math.floor(n*1e4)/1e4);renderSpotForm();
+ if(!lastState)return;
+ $('spot-units').value=Math.max(0,Math.floor(spotMax()*f*1e4)/1e4);renderSpotForm();
+}
+$('spot-slider').addEventListener('input',e=>spotPercent(Number(e.target.value)/100));
+/* 档位杠杆: 每一段仓位按该段杠杆计保证金，像累进税一样只对新增部分生效。 */
+function renderTierHint(s){
+ const t=s?.limits?.tiers||[],node=$('tier-hint');node.hidden=!t.length||s.symbol!==cur.sym;if(node.hidden)return;
+ const gross=s.limits.gross_units||0,found=t.findIndex(([upTo])=>gross<upTo),at=found<0?t.length-1:found;
+ node.textContent='档位杠杆：'+t.map(([upTo,lev],i)=>`${i===at&&gross>0?'▶':''}≤${compact(upTo)} ${lev}x`).join(' · ')+
+  ` ｜ 当前持仓 ${units(gross,2)} 枚，上限 ${compact(t.at(-1)[0])}`;
 }
 async function spotTrade(){
  if(orderBusy)return;if(!$('spot-units').reportValidity())return;
@@ -629,10 +665,18 @@ $('spot-units').addEventListener('input',renderSpotForm);
 function renderOrderEstimate(){
  const s=lastState,lots=Number($('lots').value);
  if(!s||s.symbol!==cur.sym||!(lots>0)){$('order-notional').textContent=$('order-margin').textContent='—';return}
- const notional=lots*(s.contract??1)*s.price;
+ const notional=lots*(s.contract??1)*s.price,tiers=s.limits?.tiers||[];
+ let margin=notional/(s.symbol_leverage||s.leverage);
+ if(tiers.length){
+  // 与后端 tiered_margin_units 一致：只有新增的那一段按所在档位计保证金。
+  const tm=g=>{let from=0,m=0;tiers.forEach(([upTo,lev],i)=>{const to=i===tiers.length-1?g:Math.min(g,upTo);if(to>from)m+=(to-from)/lev;from=upTo});return m},
+   held=s.limits.gross_units||0;
+  margin=(tm(held+lots*(s.contract??1))-tm(held))*s.price;
+ }
  $('order-notional').textContent=`${units(notional,2)} USDT`;
- $('order-margin').textContent=`${units(notional/(s.symbol_leverage||s.leverage),2)} USDT · ${s.symbol_leverage||s.leverage}x`;
+ $('order-margin').textContent=`${units(margin,2)} USDT · ${units(margin>0?notional/margin:s.symbol_leverage||s.leverage,1)}x`;
  $('lots-unit').textContent=cur.sym==='NSTAR'?`手 (=${units(lots*(s.contract??1))} NSTAR)`:STOCKS.includes(cur.sym)?'股':'手';
+ syncLotPresets();
 }
 $('lots').addEventListener('input',renderOrderEstimate);
 function renderAssets(s){

@@ -136,9 +136,20 @@ button:active:not(:disabled){transform:translateY(1px)}
 .field>span:first-child{color:var(--muted);flex:none;font-size:12px}
 .field input{flex:1;background:transparent;border:0;text-align:right;padding:9px 6px;outline:none}
 .field .unit{color:var(--soft);flex:none;font-size:12px}
-.lot-presets{display:grid;grid-template-columns:repeat(4,1fr);gap:5px}
-.lot-presets button{font-size:11px;padding:4px 0;background:transparent;border:1px solid var(--line-strong);color:var(--soft)}
-.lot-presets button[aria-pressed='true']{border-color:#fff;color:#fff}
+.slider-box{padding:2px 2px 0}
+input.slider,.leverage-form input.slider{-webkit-appearance:none;appearance:none;display:block;box-sizing:border-box;width:100%;height:4px;padding:0;border:0;margin:10px 0 6px;border-radius:2px;outline:none;cursor:pointer;
+ background:linear-gradient(90deg,#fff 0,#fff var(--fill,0%),var(--line-strong) var(--fill,0%))}
+input.slider:disabled{opacity:.4;cursor:not-allowed}
+.slider::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:#fff;border:3px solid var(--input);box-shadow:0 0 0 1px #fff}
+.slider::-moz-range-thumb{width:10px;height:10px;border-radius:50%;background:#fff;border:3px solid var(--input);box-shadow:0 0 0 1px #fff}
+.slider:focus-visible::-webkit-slider-thumb{box-shadow:0 0 0 3px #888}
+.slider-ticks{display:flex;justify-content:space-between}
+.slider-ticks button{font-size:11px;padding:2px 0;min-width:30px;background:transparent;border:0;color:var(--soft)}
+.slider-ticks button:hover{color:#fff}
+.lev-ticks{position:relative;height:16px}
+.lev-ticks span{position:absolute;transform:translateX(-50%);font-size:11px;color:var(--soft);white-space:nowrap}
+.lev-ticks span:first-child{transform:none}.lev-ticks span:last-child{transform:translateX(-100%)}
+.tier-hint{font-size:11px;line-height:1.5}
 .order-meta{display:flex;justify-content:space-between;color:var(--muted);font-size:11px}
 .order-meta b{color:var(--soft);font-weight:500}
 .order-buttons{display:grid;grid-template-columns:1fr 1fr;gap:8px}

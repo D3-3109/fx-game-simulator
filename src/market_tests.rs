@@ -343,7 +343,7 @@ fn nstar_anchor_trails_slowly_and_big_flow_never_halts() {
     let t = 1800000000000;
     let mut sim = SimFeed::new("NSTAR", 100.0, t);
     let start = sim.book.anchor;
-    // 40,000 NSTAR at once: ~+25% on the AMM curve (flat book: +122%, then the clamp).
+    // 40,000 NSTAR at once: ~+25% on the AMM curve (flat book: +122%).
     sim.flow(40_000.0, 0.0);
     let lifted = sim.book.log - start;
     assert!(lifted < 0.23, "{lifted}");
@@ -364,20 +364,41 @@ fn nstar_anchor_trails_slowly_and_big_flow_never_halts() {
 }
 
 #[test]
-fn nstar_price_is_bounded_by_fair_value_and_band() {
+fn nstar_price_has_no_hard_ceiling_or_floor_and_stays_finite() {
     let t = 1800000000000;
     let mut sim = SimFeed::new("NSTAR", 100.0, t);
     let depth = crate::trading::depth("NSTAR");
-    for _ in 0..200 {
-        sim.flow(0.25 * depth, 0.0);
+    // The old clamps stopped everything at 800 / 12.5; now only the curve pushes back,
+    // and hard: 2.5M NSTAR of buying (that pinned 800 before) only reaches ~266.
+    for _ in 0..50 {
+        sim.flow(depth, 0.0);
     }
-    assert!(sim.book.fair <= (400.0f64).ln() + 1e-9);
-    assert!(sim.book.log <= sim.book.fair + std::f64::consts::LN_2 + 1e-9);
-    assert!(sim.book.log.exp() <= 800.0 + 1e-6);
-    for _ in 0..400 {
-        sim.flow(-0.25 * depth, 0.0);
+    let lifted = sim.book.log.exp();
+    assert!(lifted > 200.0 && lifted < 320.0, "{lifted}");
+    let mut bought = 50.0 * depth;
+    while sim.book.log.exp() <= 800.0 && bought < 1e9 {
+        sim.flow(10.0 * depth, 0.0);
+        bought += 10.0 * depth;
     }
-    assert!(sim.book.log.exp() >= 12.5 - 1e-6);
+    let high = sim.book.log.exp();
+    assert!(high.is_finite() && high > 800.0, "{high}");
+    assert!(bought > 2e7, "passing 800 took only {bought} NSTAR");
+    while sim.book.log.exp() >= 12.5 {
+        sim.flow(-10.0 * depth, 0.0);
+    }
+    let low = sim.book.log.exp();
+    assert!(low.is_finite() && low > 0.0, "{low}");
+    // Left alone, far-off fair value is pulled home hard by the soft band: from 400 it is
+    // ~120 within an hour (a plain 1 h half-life would leave ~200), and price follows.
+    let mut s = SimFeed::new("NSTAR", 100.0, t);
+    s.book.fair = 400.0f64.ln();
+    s.book.log = s.book.fair;
+    s.book.anchor = s.book.fair;
+    nstar_run(&mut s, t, 1, 18_000);
+    let fair = s.book.fair.exp();
+    assert!(fair > 90.0 && fair < 165.0, "{fair}");
+    let price = s.book.log.exp();
+    assert!(price > 80.0 && price < 200.0, "{price}");
 }
 
 #[test]

@@ -191,15 +191,19 @@ jobs:
 
       - name: Admin login and registration
         run: |
-          set -eu
+          set -euo pipefail
           tok=$(curl -fsS -X POST http://127.0.0.1:8000/api/admin/login \
             -H 'Content-Type: application/json' \
             -d '{"psk":"smoke-test-psk"}' \
-            | node -pe 'JSON.parse(require("fs").readFileSync(0)).token')
+            | node -e 'const d=JSON.parse(require("fs").readFileSync(0)); if(!d.ok || !d.token) process.exit(1); process.stdout.write(d.token)')
           test -n "$tok"
-          curl -fsS -X POST http://127.0.0.1:8000/api/auth \
+          user_tok=$(curl -fsS -X POST http://127.0.0.1:8000/api/auth \
             -H 'Content-Type: application/json' \
-            -d '{"action":"register","name":"smoke","pwd":"smoke"}' | head -c 120
+            -d '{"action":"register","name":"smoke","pwd":"SmokeTest123!"}' \
+            | node -e 'const d=JSON.parse(require("fs").readFileSync(0)); if(!d.ok || !d.token) process.exit(1); process.stdout.write(d.token)')
+          curl -fsS http://127.0.0.1:8000/api/state \
+            -H "Authorization: Bearer $user_tok" \
+            | node -e 'const d=JSON.parse(require("fs").readFileSync(0)); if(!d.ok || d.symbol!=="NSTAR") process.exit(1); console.log("NSTAR registration and state verified")'
 
       - name: Confirm the container runs unprivileged and persisted the key
         run: |

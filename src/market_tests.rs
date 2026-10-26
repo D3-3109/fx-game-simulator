@@ -1,6 +1,127 @@
 use super::*;
 use crate::trading::{Account, Position};
 
+#[tokio::test]
+async fn nstar_only_market_has_no_external_client_or_legacy_feed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(&dir.path().join("nstar.db")).await.unwrap());
+    let market = Market::new(store.clone()).await.unwrap();
+    assert!(
+        market.client.is_none(),
+        "production NSTAR must not build a proxy/client"
+    );
+    assert!(market.sim.is_none(), "production NSTAR must not load FXSIM");
+    assert!(!market.is_offline());
+    assert!(market.price(symbols::NSTAR).await.unwrap() > 0.0);
+    assert_eq!(market.tick_nstar().await.unwrap().0["sym"], symbols::NSTAR);
+    assert!(
+        !market.klines(symbols::NSTAR, "1s", 5).await.unwrap()["klines"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(market.tick_sim().await.is_err());
+    assert!(market.record_sim(1.1, now_ms()).await.is_err());
+    assert!(store.load_bars(symbols::SIM, 60).await.unwrap().is_empty());
+    assert_eq!(
+        market
+            .snapshot()
+            .await
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec![symbols::NSTAR]
+    );
+    store.close().await;
+}
+
+#[tokio::test]
+async fn nstar_only_blocks_cached_quotes_history_and_direct_upstreams_without_egress() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        Store::open(&dir.path().join("nstar-guard.db"))
+            .await
+            .unwrap(),
+    );
+    let mut market = Market::offline(
+        store.clone(),
+        [
+            (symbols::NSTAR.into(), 100.0),
+            (symbols::SIM.into(), 1.1),
+            ("USDJPY".into(), 150.0),
+            ("AAPL".into(), 200.0),
+            ("BTCUSDT".into(), 60000.0),
+        ]
+        .into(),
+    )
+    .await
+    .unwrap();
+    assert!(market.client.is_none());
+    assert_eq!(
+        market.snapshot().await.len(),
+        1,
+        "initial legacy cache leaked"
+    );
+    // Inject a real client and legacy cache entries to exercise guards, not just None/offline.
+    market.offline = false;
+    let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    market.client = Some(
+        reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{}", proxy.local_addr().unwrap())).unwrap())
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap(),
+    );
+    for symbol in [symbols::SIM, "USDJPY", "AAPL", "BTCUSDT", "UNKNOWN"] {
+        market
+            .cache
+            .write()
+            .await
+            .insert(symbol.into(), Quote::single(100.0, now_ms()));
+        assert!(market.price(symbol).await.is_err(), "{symbol}");
+        assert!(market.quote(symbol).await.is_err(), "{symbol}");
+        assert!(market.prices([symbol]).await.is_err(), "{symbol}");
+        assert!(market.trading_prices([symbol]).await.is_err(), "{symbol}");
+        assert!(market.klines(symbol, "1m", 1).await.is_err(), "{symbol}");
+        assert!(
+            market.on_quote(symbol, 101.0, now_ms()).await.is_err(),
+            "{symbol}"
+        );
+        assert!(
+            market
+                .on_market_quote(symbol, Quote::single(101.0, now_ms()))
+                .await
+                .is_err(),
+            "{symbol}"
+        );
+        assert_eq!(market.cache.read().await[symbol].price, 100.0);
+    }
+    let blocked = "NSTAR-only 已禁用外部行情";
+    assert_eq!(market.biquote_price("USDJPY").await.unwrap_err(), blocked);
+    assert_eq!(market.biquote_quote("USDJPY").await.unwrap_err(), blocked);
+    assert_eq!(
+        market.biquote_quotes(&["USDJPY".into()]).await.unwrap_err(),
+        blocked
+    );
+    assert_eq!(market.biquote_quotes(&[]).await.unwrap_err(), blocked);
+    assert_eq!(market.yahoo_price("AAPL").await.unwrap_err(), blocked);
+    assert_eq!(market.fetch_price("BTCUSDT").await.unwrap_err(), blocked);
+    assert_eq!(
+        market
+            .get("https://biquote.io/api/USDJPY")
+            .await
+            .unwrap_err(),
+        blocked
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), proxy.accept())
+            .await
+            .is_err(),
+        "a blocked entry point opened a network connection"
+    );
+    store.close().await;
+}
+
 #[test]
 fn biquote_latest_is_order_independent_and_active_close_changes_intraminute() {
     let old = json!({"openTime":"2026-10-06T19:29:00Z","open":150.0,"high":150.1,"low":149.9,"close":150.02,"isOpen":false});
@@ -65,16 +186,22 @@ fn retry_after_seconds_dates_and_missing_headers_are_respected() {
 #[tokio::test]
 async fn receipt_cache_reuses_frozen_quotes_without_making_stale_quotes_tradable() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(Store::open(&dir.path().join("receipt.db")).await.unwrap());
+    let store = Arc::new(
+        Store::open_legacy(&dir.path().join("receipt.db"))
+            .await
+            .unwrap(),
+    );
     let mut market = Market::offline(store.clone(), Prices::new()).await.unwrap();
     market.offline = false;
     // Local unresponsive proxy makes any unintended HTTP fetch fail this bounded check.
     let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    market.client = reqwest::Client::builder()
-        .proxy(reqwest::Proxy::all(format!("http://{}", proxy.local_addr().unwrap())).unwrap())
-        .timeout(Duration::from_secs(1))
-        .build()
-        .unwrap();
+    market.client = Some(
+        reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{}", proxy.local_addr().unwrap())).unwrap())
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap(),
+    );
     let now = now_ms();
     let tick = json!({"symbol":"USDCNH","bid":6.70493,"ask":6.70746,"mid":6.706195,
         "timestamp":chrono::DateTime::from_timestamp_millis(now-10000).unwrap().to_rfc3339(),
@@ -142,7 +269,11 @@ fn weekly_bars_use_monday_and_keep_partial_current_week() {
 #[tokio::test]
 async fn live_fx_cache_cannot_be_overwritten_by_cny_or_single_price_feed() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(Store::open(&dir.path().join("quotes.db")).await.unwrap());
+    let store = Arc::new(
+        Store::open_legacy(&dir.path().join("quotes.db"))
+            .await
+            .unwrap(),
+    );
     let mut market = Market::offline(store.clone(), Prices::new()).await.unwrap();
     market.offline = false;
     let at = now_ms();
@@ -204,7 +335,7 @@ fn recorded_ticks_preserve_wicks_freeze_closed_candles_and_bound_retention() {
 async fn sqlite_sim_restart_retains_closed_extremes_and_does_not_fill_gap() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bars.db");
-    let store = Store::open(&path).await.unwrap();
+    let store = Store::open_legacy(&path).await.unwrap();
     let t = 1800000000000;
     let mut sim = SimFeed::new("FXSIM", 1.1, t);
     sim.record(0.9, t + 200);
@@ -214,7 +345,7 @@ async fn sqlite_sim_restart_retains_closed_extremes_and_does_not_fill_gap() {
     store.save_bars("FXSIM", &sim.pending()).await.unwrap();
     let old = sim.klines(60, 1000);
     store.close().await;
-    let store = Store::open(&path).await.unwrap();
+    let store = Store::open_legacy(&path).await.unwrap();
     let restored = SimFeed::load(&store, "FXSIM", 1.1, t + 600000)
         .await
         .unwrap();
@@ -228,7 +359,11 @@ async fn sqlite_sim_restart_retains_closed_extremes_and_does_not_fill_gap() {
 #[tokio::test]
 async fn stale_missing_and_out_of_order_quotes_never_misliquidate() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(Store::open(&dir.path().join("risk.db")).await.unwrap());
+    let store = Arc::new(
+        Store::open_legacy(&dir.path().join("risk.db"))
+            .await
+            .unwrap(),
+    );
     store.register("player", "pw").await.unwrap();
     let market = Market::offline(store.clone(), Prices::new()).await.unwrap();
     store
@@ -275,7 +410,11 @@ async fn stale_missing_and_out_of_order_quotes_never_misliquidate() {
 #[tokio::test]
 async fn sim_rest_and_ws_share_authoritative_ohlc() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(Store::open(&dir.path().join("sim.db")).await.unwrap());
+    let store = Arc::new(
+        Store::open_legacy(&dir.path().join("sim.db"))
+            .await
+            .unwrap(),
+    );
     let market = Market::offline(store, Prices::new()).await.unwrap();
     let now = (now_ms() + 60000) / 1000 * 1000;
     // The first tick into a new candle carries the closed one too.
@@ -740,4 +879,578 @@ fn fxsim_keeps_its_original_walk() {
     }
     assert!(sim.price > 0.55 && sim.price < 2.0, "{}", sim.price);
     assert!(sim.book.events.is_empty());
+}
+
+async fn persistence_fixture() -> (tempfile::TempDir, Arc<Store>, Arc<Market>, sqlx::SqlitePool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("faults.db");
+    let store = Arc::new(Store::open(&path).await.unwrap());
+    let market = Arc::new(Market::offline(store.clone(), Prices::new()).await.unwrap());
+    let sql = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&path))
+        .await
+        .unwrap();
+    (dir, store, market, sql)
+}
+
+// Exercise the same dirty merge as a tick, but use deterministic prices and timestamps.
+async fn dirty_record(market: &Market, price: f64, at: i64) {
+    let mut feed = market.nstar.lock().await;
+    feed.record(price, at);
+    market
+        .dirty_bars
+        .lock()
+        .unwrap()
+        .merge(feed.symbol, &feed.pending())
+        .unwrap();
+    let _ = feed.packet();
+}
+
+fn stop_order(trigger: f64, limit: f64) -> trading::Order {
+    trading::Order {
+        id: 1,
+        symbol: symbols::NSTAR.into(),
+        side: "long".into(),
+        spot: false,
+        kind: "stop".into(),
+        lots: 1.0,
+        price: trigger,
+        limit,
+        tp: 0.0,
+        sl: 0.0,
+        created: now_ms(),
+    }
+}
+
+async fn wait_for_transaction(store: &Store, before: u64) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while store.persistence_stats()["transactions"].as_u64().unwrap() <= before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("writer did not start a transaction");
+}
+
+#[tokio::test]
+async fn bar_save_failure_retains_all_closed_ohlc_and_retries() {
+    let (_dir, store, market, sql) = persistence_fixture().await;
+    let t = (now_ms() / 60_000 + 1) * 60_000;
+    dirty_record(&market, 100.0, t).await;
+    dirty_record(&market, 120.0, t + 100).await;
+    dirty_record(&market, 80.0, t + 200).await;
+    dirty_record(&market, 110.0, t + 1100).await;
+    let count = market.pending_bar_count();
+    sqlx::query(
+        "CREATE TRIGGER fail_bars BEFORE INSERT ON sim_bars BEGIN SELECT RAISE(ABORT,'fault'); END",
+    )
+    .execute(&sql)
+    .await
+    .unwrap();
+    assert!(market.flush_bars().await.is_err());
+    assert_eq!(market.pending_bar_count(), count);
+    sqlx::query("DROP TRIGGER fail_bars")
+        .execute(&sql)
+        .await
+        .unwrap();
+    market.flush_bars().await.unwrap();
+    assert_eq!(market.pending_bar_count(), 0);
+    let bars = store.load_bars(symbols::NSTAR, 1).await.unwrap();
+    assert_eq!(
+        bars.iter().find(|b| b[0] == (t / 1000) as f64).unwrap(),
+        &[(t / 1000) as f64, 100.0, 120.0, 80.0, 80.0]
+    );
+    sql.close().await;
+    store.close().await;
+}
+
+#[tokio::test]
+async fn concurrent_flush_preserves_new_version_and_closed_correction() {
+    let (_dir, store, market, sql) = persistence_fixture().await;
+    let t = (now_ms() / 60_000 + 1) * 60_000;
+    dirty_record(&market, 100.0, t).await;
+    let mut lock = sql.acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let before = store.persistence_stats()["transactions"].as_u64().unwrap();
+    let flushing = tokio::spawn({
+        let market = market.clone();
+        async move { market.flush_bars().await }
+    });
+    wait_for_transaction(&store, before).await;
+    // These writes happen AFTER flush took its old candle snapshot, while SQLite is blocked.
+    dirty_record(&market, 125.0, t + 100).await;
+    dirty_record(&market, 75.0, t + 200).await;
+    dirty_record(&market, 110.0, t + 1100).await;
+    sqlx::query("COMMIT").execute(&mut *lock).await.unwrap();
+    flushing.await.unwrap().unwrap();
+    assert!(
+        market.pending_bar_count() > 0,
+        "old acknowledgement erased a newer candle"
+    );
+    market.flush_bars().await.unwrap();
+    let bars = store.load_bars(symbols::NSTAR, 1).await.unwrap();
+    assert_eq!(
+        bars.iter().find(|b| b[0] == (t / 1000) as f64).unwrap(),
+        &[(t / 1000) as f64, 100.0, 125.0, 75.0, 75.0]
+    );
+    assert_eq!(bars.last().unwrap()[4], 110.0);
+    drop(lock);
+    sql.close().await;
+    store.close().await;
+}
+
+#[tokio::test]
+async fn early_tick_cancel_keeps_flow_for_immediate_next_desk() {
+    let (_dir, store, market, sql) = persistence_fixture().await;
+    store.restore_nstar_flow(250.0, -15.0);
+    let expected = {
+        let mut feed = market.nstar.lock().await.clone();
+        feed.flow(250.0, -15.0);
+        feed.book.log.exp()
+    };
+    let gate = market.quote_gate.lock().await;
+    let ticking = tokio::spawn({
+        let market = market.clone();
+        async move { market.tick_nstar().await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while market.nstar.try_lock().is_ok() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    ticking.abort();
+    assert!(ticking.await.unwrap_err().is_cancelled());
+    drop(gate);
+    // No random tick in between: a new order request must already see the committed flow.
+    let desk = market.nstar_desk().await;
+    let mut prices = Prices::new();
+    desk.price(&mut prices).unwrap();
+    assert_eq!(prices[symbols::NSTAR], expected);
+    assert_eq!(store.take_nstar_flow(), (0.0, 0.0));
+    drop(desk);
+    market.flush_pending().await.unwrap();
+    assert_eq!(
+        market.nstar.lock().await.book.log.exp(),
+        expected,
+        "flow applied twice"
+    );
+    sql.close().await;
+    store.close().await;
+}
+
+#[tokio::test]
+async fn full_dirty_queue_rejects_tick_and_restores_both_flow_components() {
+    let (_dir, store, market, sql) = persistence_fixture().await;
+    let original = market.nstar.lock().await.book.log;
+    {
+        let mut dirty = market.dirty_bars.lock().unwrap();
+        for t in 0..MAX_DIRTY_BARS as i64 {
+            dirty.rows.insert(
+                (symbols::NSTAR, 1, -t - 1),
+                DirtyBar {
+                    bar: [(-t - 1) as f64, 1.0, 1.0, 1.0, 1.0],
+                    keep_from: -36_000,
+                    version: 1,
+                },
+            );
+        }
+    }
+    store.restore_nstar_flow(100.0, -12.0);
+    assert!(market.tick_nstar().await.unwrap_err().contains("队列已满"));
+    assert_eq!(market.nstar.lock().await.book.log, original);
+    assert_eq!(store.take_nstar_flow(), (100.0, -12.0));
+    assert_eq!(market.pending_bar_count(), MAX_DIRTY_BARS);
+    sql.close().await;
+    store.close().await;
+}
+
+#[tokio::test]
+async fn failed_batch_retries_crossed_quote_before_new_price_and_keeps_ids_unique() {
+    let (_dir, store, market, sql) = persistence_fixture().await;
+    for name in ["alpha", "bravo"] {
+        store.register(name, "pw").await.unwrap();
+        store
+            .transaction(name, |account, _, _| {
+                account.orders = vec![stop_order(101.0, 0.0)];
+                account.order_seq = 1;
+                Ok(vec![])
+            })
+            .await
+            .unwrap();
+    }
+    let now = now_ms();
+    market.on_quote(symbols::NSTAR, 100.0, now).await.unwrap();
+    let revision = market.revision();
+    sqlx::query("CREATE TRIGGER fail_risk BEFORE UPDATE ON users WHEN NEW.name='bravo' BEGIN SELECT RAISE(ABORT,'fault'); END")
+        .execute(&sql).await.unwrap();
+    assert!(
+        market
+            .on_quote(symbols::NSTAR, 102.0, now + 1)
+            .await
+            .is_err()
+    );
+    assert_eq!(market.revision(), revision);
+    assert_eq!(market.snapshot().await[symbols::NSTAR].price, 100.0);
+    for name in ["alpha", "bravo"] {
+        assert!(store.user(name).await.unwrap().account.positions.is_empty());
+        assert!(store.history(name).await.unwrap().is_empty());
+    }
+    assert_eq!(store.take_nstar_flow(), (0.0, 0.0));
+    sqlx::query("DROP TRIGGER fail_risk")
+        .execute(&sql)
+        .await
+        .unwrap();
+    // The rebound no longer crosses the stop. The failed crossing still must execute once.
+    market
+        .on_quote(symbols::NSTAR, 100.0, now + 2)
+        .await
+        .unwrap();
+    let a = store.user("alpha").await.unwrap().account;
+    let b = store.user("bravo").await.unwrap().account;
+    assert_eq!(a.positions.len(), 1);
+    assert_eq!(b.positions.len(), 1);
+    assert_ne!(a.positions[0].id, b.positions[0].id);
+    assert!(
+        b.positions[0].entry > a.positions[0].entry,
+        "second account reused unmoved live AMM"
+    );
+    for name in ["alpha", "bravo"] {
+        assert_eq!(store.history(name).await.unwrap().len(), 1);
+    }
+    market.flush_pending().await.unwrap();
+    sql.close().await;
+    store.close().await;
+}
+
+#[tokio::test]
+async fn stop_limit_transition_without_trade_is_durable() {
+    let (dir, store, market, sql) = persistence_fixture().await;
+    store.register("stopper", "pw").await.unwrap();
+    store
+        .transaction("stopper", |account, _, _| {
+            account.orders = vec![stop_order(101.0, 90.0)];
+            account.order_seq = 1;
+            Ok(vec![])
+        })
+        .await
+        .unwrap();
+    let before = store.persistence_stats()["account_updates"]
+        .as_u64()
+        .unwrap();
+    market
+        .on_quote(symbols::NSTAR, 102.0, now_ms())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.persistence_stats()["account_updates"]
+            .as_u64()
+            .unwrap(),
+        before + 1
+    );
+    let account = store.user("stopper").await.unwrap().account;
+    assert_eq!(account.orders[0].kind, "limit");
+    assert_eq!(account.orders[0].price, 90.0);
+    assert!(store.history("stopper").await.unwrap().is_empty());
+    market.flush_bars().await.unwrap();
+    sql.close().await;
+    store.close().await;
+    let reopened = Store::open(&dir.path().join("faults.db")).await.unwrap();
+    assert_eq!(reopened.user("stopper").await.unwrap().account, account);
+    reopened.close().await;
+}
+
+#[tokio::test]
+async fn unchanged_five_hundred_risk_accounts_execute_zero_sql_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("five-hundred.db");
+    Store::open(&path).await.unwrap().close().await;
+    let sql = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&path))
+        .await
+        .unwrap();
+    let mut tx = sql.begin().await.unwrap();
+    let account = Account {
+        orders: vec![stop_order(200.0, 0.0)],
+        order_seq: 1,
+        ..Account::default()
+    };
+    let account = serde_json::to_string(&account).unwrap();
+    for n in 0..500 {
+        sqlx::query("INSERT INTO users(name,symbol,account,token) VALUES(?,'NSTAR',?,'')")
+            .bind(format!("user{n:03}"))
+            .bind(&account)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+    let store = Arc::new(Store::open(&path).await.unwrap());
+    let market = Market::offline(store.clone(), Prices::new()).await.unwrap();
+    sqlx::query("CREATE TRIGGER forbid_update BEFORE UPDATE ON users BEGIN SELECT RAISE(ABORT,'unexpected risk write'); END")
+        .execute(&sql).await.unwrap();
+    let before = store.persistence_stats();
+    market
+        .on_quote(symbols::NSTAR, 100.0, now_ms())
+        .await
+        .unwrap();
+    let after = store.persistence_stats();
+    assert_eq!(after["transactions"], before["transactions"]);
+    assert_eq!(after["account_updates"], before["account_updates"]);
+    assert_eq!(
+        after["noop_accounts"].as_u64().unwrap() - before["noop_accounts"].as_u64().unwrap(),
+        500
+    );
+    assert_eq!(
+        after["noops"].as_u64().unwrap() - before["noops"].as_u64().unwrap(),
+        1
+    );
+    sql.close().await;
+    store.close().await;
+}
+
+#[tokio::test]
+async fn cancelled_quote_reuses_inflight_batch_result_before_publishing() {
+    let (_dir, store, market, sql) = persistence_fixture().await;
+    store.register("cancelled", "pw").await.unwrap();
+    store
+        .transaction("cancelled", |account, _, _| {
+            account.orders = vec![stop_order(101.0, 90.0)];
+            account.order_seq = 1;
+            Ok(vec![])
+        })
+        .await
+        .unwrap();
+    let now = now_ms();
+    market.on_quote(symbols::NSTAR, 100.0, now).await.unwrap();
+    let mut lock = sql.acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let before = store.persistence_stats()["transactions"].as_u64().unwrap();
+    let updating = tokio::spawn({
+        let market = market.clone();
+        async move { market.on_quote(symbols::NSTAR, 102.0, now + 1).await }
+    });
+    wait_for_transaction(&store, before).await;
+    updating.abort();
+    assert!(updating.await.unwrap_err().is_cancelled());
+    assert_eq!(market.snapshot().await[symbols::NSTAR].price, 100.0);
+    sqlx::query("COMMIT").execute(&mut *lock).await.unwrap();
+    store.flush_pending().await.unwrap();
+    let noops = store.persistence_stats()["noops"].as_u64().unwrap();
+    market
+        .on_quote(symbols::NSTAR, 100.0, now + 2)
+        .await
+        .unwrap();
+    // Only the NEW quote gets a no-op batch; the cancelled old quote awaits its old result.
+    assert_eq!(
+        store.persistence_stats()["noops"].as_u64().unwrap(),
+        noops + 1
+    );
+    assert_eq!(
+        store.user("cancelled").await.unwrap().account.orders[0].kind,
+        "limit"
+    );
+    assert!(market.quote_gate.lock().await.is_none());
+    drop(lock);
+    sql.close().await;
+    store.close().await;
+}
+
+#[tokio::test]
+async fn cancelled_committed_order_is_applied_before_next_request_price() {
+    let (_dir, store, market, sql) = persistence_fixture().await;
+    store.register("buyer", "pw").await.unwrap();
+    let mut lock = sql.acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let before = store.persistence_stats()["transactions"].as_u64().unwrap();
+    let request = tokio::spawn({
+        let market = market.clone();
+        let store = store.clone();
+        async move {
+            let desk = market.nstar_desk().await;
+            let mut prices = Prices::new();
+            desk.price(&mut prices).unwrap();
+            store
+                .transaction("buyer", |account, _, id| {
+                    Ok(vec![account.open(
+                        "long",
+                        1.0,
+                        symbols::NSTAR,
+                        &prices,
+                        id,
+                        now_ms(),
+                    )?])
+                })
+                .await
+                .unwrap();
+            desk.commit().await
+        }
+    });
+    wait_for_transaction(&store, before).await;
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    sqlx::query("COMMIT").execute(&mut *lock).await.unwrap();
+    let mut expected = market.nstar.lock().await.clone();
+    expected.flow(trading::contract(symbols::NSTAR), 0.0);
+    // No tick and no manual Store barrier: desk itself must wait for commit publication.
+    let desk = market.nstar_desk().await;
+    let mut prices = Prices::new();
+    desk.price(&mut prices).unwrap();
+    assert_eq!(prices[symbols::NSTAR], expected.book.log.exp());
+    assert_eq!(
+        store.user("buyer").await.unwrap().account.positions.len(),
+        1
+    );
+    assert_eq!(store.history("buyer").await.unwrap().len(), 1);
+    assert_eq!(store.take_nstar_flow(), (0.0, 0.0));
+    drop(desk);
+    market.flush_pending().await.unwrap();
+    drop(lock);
+    sql.close().await;
+    store.close().await;
+}
+
+#[tokio::test]
+async fn tick_does_not_write_bars_until_explicit_flush() {
+    let (dir, store, market, sql) = persistence_fixture().await;
+    let before = store.persistence_stats()["bar_rows"].as_u64().unwrap();
+    let packet = market.tick_nstar().await.unwrap().0;
+    assert_eq!(
+        store.persistence_stats()["bar_rows"].as_u64().unwrap(),
+        before
+    );
+    assert!(market.pending_bar_count() > 0);
+    market.flush_pending().await.unwrap();
+    assert_eq!(market.pending_bar_count(), 0);
+    let expected = market.nstar.lock().await.klines(1, 1000);
+    assert_eq!(
+        expected.last().unwrap()[4],
+        packet["price"].as_f64().unwrap()
+    );
+    sql.close().await;
+    store.close().await;
+    let reopened = Store::open(&dir.path().join("faults.db")).await.unwrap();
+    let actual = reopened
+        .load_bars(symbols::NSTAR, 1)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|b| [b[0] * 1000.0, b[1], b[2], b[3], b[4]])
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+    reopened.close().await;
+}
+
+#[tokio::test]
+async fn five_round_reverse_stop_chain_applies_final_fill_before_desk_price() {
+    let (_dir, store, market, sql) = persistence_fixture().await;
+    market
+        .on_quote(symbols::NSTAR, 100.0, now_ms())
+        .await
+        .unwrap();
+    let units = 100.0;
+    let mut expected = market.nstar.lock().await.clone();
+    let mut trigger_prices = Vec::new();
+    // Reverse account order forces exactly one stop to trigger in each risk batch.
+    // Four normal rounds + the final check must all move the real book before price().
+    for _ in 0..=MATCH_ROUNDS {
+        let before = expected.book.log.exp();
+        expected.flow(units, 0.0);
+        trigger_prices.push((before + expected.book.log.exp()) / 2.0);
+    }
+    expected.flow(units, 0.0); // initial committed flow plus all five stop fills
+    for (step, trigger) in trigger_prices.into_iter().enumerate() {
+        let name = format!("chain{:02}", MATCH_ROUNDS - step);
+        store.register(&name, "pw").await.unwrap();
+        store
+            .transaction(&name, |account, _, _| {
+                let mut order = stop_order(trigger, 0.0);
+                order.lots = units / trading::contract(symbols::NSTAR);
+                account.orders = vec![order];
+                account.order_seq = 1;
+                Ok(vec![])
+            })
+            .await
+            .unwrap();
+    }
+    store.restore_nstar_flow(units, 0.0);
+    // No tick and no shutdown helper: constructing the new request's desk must reconcile
+    // even the fifth fill, which was committed by the post-MATCH_ROUNDS risk check.
+    let desk = market.nstar_desk().await;
+    let mut prices = Prices::new();
+    desk.price(&mut prices).unwrap();
+    for step in 0..=MATCH_ROUNDS {
+        let account = store
+            .user(&format!("chain{step:02}"))
+            .await
+            .unwrap()
+            .account;
+        assert_eq!(
+            account.positions.len(),
+            1,
+            "chain stage {step} did not fill"
+        );
+        assert!(account.orders.is_empty());
+    }
+    assert_eq!(
+        store.take_nstar_flow(),
+        (0.0, 0.0),
+        "final committed fill left unapplied"
+    );
+    assert!(
+        (prices[symbols::NSTAR] - expected.book.log.exp()).abs() < 1e-10,
+        "desk reused the mid from before the final committed fill"
+    );
+    assert_eq!(
+        market.snapshot().await[symbols::NSTAR].price,
+        expected.book.published()
+    );
+    drop(desk);
+    let desk = market.nstar_desk().await;
+    desk.price(&mut prices).unwrap();
+    assert!((prices[symbols::NSTAR] - expected.book.log.exp()).abs() < 1e-10);
+    drop(desk);
+    market.flush_pending().await.unwrap();
+    assert_eq!(
+        store
+            .load_bars(symbols::NSTAR, 1)
+            .await
+            .unwrap()
+            .last()
+            .unwrap()[4],
+        expected.book.published()
+    );
+    sql.close().await;
+    store.close().await;
+}
+
+#[tokio::test]
+async fn market_revision_includes_mark_anchor_and_source_time() {
+    let (_dir, store, market, sql) = persistence_fixture().await;
+    let mut quote = Quote::single(100.0, now_ms());
+    for update in 0..4 {
+        match update {
+            1 => quote.mark = Some(99.0),
+            2 => quote.anchor = Some(100.0_f64.ln()),
+            3 => quote.at += 1,
+            _ => {}
+        }
+        let before = market.revision();
+        market.on_market_quote(symbols::NSTAR, quote).await.unwrap();
+        assert_eq!(market.revision(), before + 1);
+    }
+    sql.close().await;
+    store.close().await;
 }

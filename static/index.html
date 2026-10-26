@@ -2,11 +2,11 @@
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#000000">
-<title>— | USDJPY</title>
+<title>— | NSTAR/USDT</title>
 <link rel="stylesheet" href="/app.css"></head><body>
 <div id="auth"><div id="authbox">
  <div class="brand"><span class="brand-mark" aria-hidden="true">NS</span><span>NorthStar<small>北极星模拟交易所</small></span></div>
- <h1>登录交易所</h1><p class="muted">真实行情 + 北极星币 NSTAR/USDT。现货、永续合约，与其他交易者同场竞技。</p>
+ <h1>登录交易所</h1><p class="muted">北极星币 NSTAR/USDT 模拟交易。现货、永续合约，与其他交易者同场竞技。</p>
  <form id="auth-form" onsubmit="event.preventDefault();doAuth('login')">
   <label for="f-name">用户名</label><input id="f-name" placeholder="输入用户名" maxlength="16" autocomplete="username" required>
   <label for="f-pwd">密码</label><input id="f-pwd" type="password" placeholder="输入密码" autocomplete="current-password" required aria-describedby="pwd-rule">
@@ -22,11 +22,11 @@
 <nav id="topnav" aria-label="主导航">
  <div class="brand"><span class="brand-mark" aria-hidden="true">NS</span><span>NorthStar</span></div>
  <div class="nav-links"><b>交易</b><span>现货</span><span>永续合约</span><span>排行榜</span></div>
- <div class="user-controls"><span id="connection" class="connection" data-state="connecting" role="status">连接中</span><span id="who"></span><button class="quiet" type="button" onclick="logout()">退出</button></div>
+ <div class="user-controls"><label class="low-power" for="low-power"><input id="low-power" type="checkbox">低耗模式</label><span id="connection" class="connection" data-state="connecting" role="status">连接中</span><span id="who"></span><button class="quiet" type="button" onclick="logout()">退出</button></div>
 </nav>
 <header id="pairbar">
- <div class="market-controls"><label class="sr-only" for="sym">交易币对</label><select id="sym"></select></div>
- <div class="quote"><div class="quote-price"><span id="price" aria-label="最新报价">—</span><span id="quote-unit"></span></div><span id="quote-change" class="quote-change" title="较前日收盘"></span></div>
+ <div class="market-controls"><label class="sr-only" for="sym">交易币对</label><select id="sym" disabled><option value="NSTAR">NSTAR/USDT · 北极星币</option></select></div>
+ <div class="quote"><div class="quote-price"><span id="price" aria-label="最新报价">—</span><span id="quote-unit">USDT</span></div><span id="quote-change" class="quote-change" title="较前日收盘"></span></div>
  <div class="stat" data-nstar hidden><span>标记价格</span><b id="stat-mark">—</b></div>
  <div class="stat" data-nstar hidden><span>公允价值</span><b id="stat-fair">—</b></div>
  <div class="stat" data-nstar hidden><span>24h 最高</span><b id="stat-high">—</b></div>
@@ -43,7 +43,7 @@
   <button type="button" role="tab" id="mode-spot" aria-selected="false" onclick="setMode('spot')">现货</button>
  </div>
  <div id="perp-form" class="order-form">
-  <div class="order-symbol"><b id="order-symbol">USDJPY</b><span id="order-kind-label">市价 · USDT 结算</span></div>
+  <div class="order-symbol"><b id="order-symbol">NSTAR/USDT 永续</b><span id="order-kind-label">市价 · USDT 结算</span></div>
   <div class="type-tabs" role="tablist" aria-label="委托类型">
    <button type="button" role="tab" data-otype="market" aria-selected="true">市价</button>
    <button type="button" role="tab" data-otype="limit" aria-selected="false">限价</button>
@@ -51,7 +51,7 @@
   </div>
   <label class="field" for="order-trigger" id="trigger-field" hidden><span>触发价</span><input id="order-trigger" type="number" min="0" step="any" inputmode="decimal"><span class="unit">USDT</span></label>
   <label class="field" for="order-price" id="price-field" hidden><span id="price-label">委托价</span><input id="order-price" type="number" min="0" step="any" inputmode="decimal"><span class="unit">USDT</span></label>
-  <label class="field" for="lots"><span>数量</span><input id="lots" type="number" min="0.01" step="0.01" value="0.10" inputmode="decimal" required><span id="lots-unit" class="unit">手</span></label>
+  <label class="field" for="lots"><span>数量</span><input id="lots" type="number" min="0.01" step="0.01" value="1000" inputmode="decimal" required><span id="lots-unit" class="unit">手</span></label>
   <div class="slider-box">
    <input id="lots-slider" class="slider" type="range" min="0" max="100" step="1" value="0" aria-label="按可开数量比例">
    <div class="slider-ticks" role="group" aria-label="按比例"><button type="button" onclick="setLotsPct(0)">0</button><button type="button" onclick="setLotsPct(25)">25%</button><button type="button" onclick="setLotsPct(50)">50%</button><button type="button" onclick="setLotsPct(75)">75%</button><button type="button" onclick="setLotsPct(100)">100%</button></div>
@@ -183,6 +183,8 @@
   <div id="book-bids" class="book-side"></div>
  </div>
  <div class="side-pane" data-upper-pane="rank" hidden>
+  <div id="rank-me" role="status">我的排名：等待账户更新</div>
+  <div class="rank-controls"><button id="rank-prev" type="button" onclick="leaderboardPage(-1)" disabled>上一页</button><span id="rank-page">Top 50</span><button id="rank-next" type="button" onclick="leaderboardPage(1)" disabled>下一页</button></div>
   <table id="rankT"><thead><tr><th>#</th><th>玩家</th><th>净值</th><th>总收益</th><th>近 5 分钟</th></tr></thead><tbody></tbody></table>
  </div>
 </section>

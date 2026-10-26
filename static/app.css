@@ -28,6 +28,8 @@ button:active:not(:disabled){transform:translateY(1px)}
 .brand small{display:block;font-size:10px;font-weight:400;color:var(--muted);letter-spacing:0}
 .nav-links{display:flex;gap:18px;color:var(--soft);font-size:13px}.nav-links b{color:#fff;font-weight:600}
 .user-controls{margin-left:auto;display:flex;align-items:center;gap:12px;color:var(--soft)}
+.low-power{display:flex;align-items:center;gap:4px;white-space:nowrap;font-size:11px;cursor:pointer}.low-power input{margin:0}
+.rank-controls{display:flex;align-items:center;justify-content:space-between;gap:4px;padding:6px 8px}.rank-controls button{padding:3px 6px}#rank-me{padding:6px 10px;color:var(--soft)}
 .user-controls .quiet{background:transparent;border:1px solid var(--line-strong);border-radius:16px;padding:4px 12px}
 .connection{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--muted)}
 .connection::before{content:'';width:6px;height:6px;border-radius:50%;background:var(--muted)}

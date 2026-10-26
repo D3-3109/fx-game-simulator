@@ -18,6 +18,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
@@ -55,6 +56,12 @@ fn bad(s: &str) -> Failure {
 }
 fn upstream(s: String) -> Failure {
     Failure(StatusCode::BAD_GATEWAY, s)
+}
+fn require_symbol(app: &App, symbol: &str) -> Result<(), Failure> {
+    if app.store.is_nstar_only() && symbol != symbols::NSTAR {
+        return Err(bad("仅支持 NSTAR"));
+    }
+    Ok(())
 }
 fn bearer(headers: &HeaderMap) -> &str {
     headers
@@ -191,6 +198,10 @@ async fn get_inner(app: &App, uri: &Uri, headers: &HeaderMap) -> ApiResult {
     if path.starts_with("/api/admin/") {
         admin(app, headers)?;
         return match path {
+            "/api/admin/performance" => Ok(
+                json!({"ok":true,"persistence":app.store.persistence_stats(),
+                "pending_bars":app.market.pending_bar_count()}),
+            ),
             "/api/admin/users" => {
                 let totals = app.store.deposit_totals().await?;
                 Ok(
@@ -212,7 +223,22 @@ async fn get_inner(app: &App, uri: &Uri, headers: &HeaderMap) -> ApiResult {
             v["ok"] = json!(true);
             Ok(v)
         }
-        "/api/leaderboard" => app.leaderboard().await.map_err(upstream),
+        "/api/leaderboard" => {
+            let q = params(uri)?;
+            let parse = |key: &str, default| -> Result<usize, Failure> {
+                q.get(key)
+                    .map(|s| s.parse::<usize>())
+                    .transpose()
+                    .map_err(|_| bad("分页参数无效"))
+                    .map(|n| n.unwrap_or(default))
+            };
+            let offset = parse("offset", 0)?;
+            let limit = parse("limit", 50)?.min(100);
+            let name = app.store.authenticate(bearer(headers)).await?;
+            app.leaderboard_page(name.as_deref(), offset, limit)
+                .await
+                .map_err(upstream)
+        }
         "/api/market" => {
             let mut v = app.market.nstar_stats().await;
             v["ok"] = json!(true);
@@ -223,7 +249,15 @@ async fn get_inner(app: &App, uri: &Uri, headers: &HeaderMap) -> ApiResult {
             let symbol = q
                 .get("symbol")
                 .map(|s| s.to_uppercase())
-                .unwrap_or("USDJPY".into());
+                .unwrap_or_else(|| {
+                    if app.store.is_nstar_only() {
+                        symbols::NSTAR
+                    } else {
+                        "USDJPY"
+                    }
+                    .into()
+                });
+            require_symbol(app, &symbol)?;
             let interval = q.get("interval").map(String::as_str).unwrap_or("15m");
             let limit = q
                 .get("limit")
@@ -304,6 +338,7 @@ async fn post_inner(
             }
             "/api/admin/symbols" => {
                 let symbol = text(body, "symbol")?.to_uppercase();
+                require_symbol(app, &symbol)?;
                 let enabled = body["enabled"]
                     .as_bool()
                     .ok_or_else(|| bad("币种对或启用状态无效"))?;
@@ -331,6 +366,12 @@ async fn post_inner(
         return Ok(json!({"ok":true,"token":token,"name":name}));
     }
     let name = user(app, headers).await?;
+    if app.store.is_nstar_only()
+        && matches!(path, "/api/trade" | "/api/order" | "/api/spot")
+        && body.get("symbol").is_some()
+    {
+        require_symbol(app, &text(body, "symbol")?.to_uppercase())?;
+    }
     match path {
         "/api/chat" => {
             let row = app.store.post_chat(&name, text(body, "text")?, now).await?;
@@ -548,9 +589,9 @@ async fn post_inner(
                 .await?;
         }
         "/api/symbol" => {
-            app.store
-                .select_symbol(&name, &text(body, "symbol")?.to_uppercase())
-                .await?
+            let symbol = text(body, "symbol")?.to_uppercase();
+            require_symbol(app, &symbol)?;
+            app.store.select_symbol(&name, &symbol).await?
         }
         _ => return Err(Failure(StatusCode::NOT_FOUND, "unknown".into())),
     }
@@ -585,22 +626,70 @@ async fn ws_upgrade(
         _ => Failure(StatusCode::UNAUTHORIZED, "auth".into()).into_response(),
     }
 }
-async fn send_text(socket: &mut WebSocket, text: &str) -> bool {
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        socket.send(Message::Text(text.to_owned().into())),
-    )
-    .await
-    .is_ok_and(|r| r.is_ok())
+// Display slots replace old values; only controls have a bounded FIFO queue.
+#[derive(Clone, Default)]
+struct Display {
+    epoch: u64,
+    state: Option<(u64, Arc<str>)>,
+    quote: Option<(u64, Arc<str>)>,
+    leaderboard: Option<(u64, Arc<str>)>,
+}
+#[derive(Default)]
+struct View {
+    hidden: bool,
+    no_leaderboard: bool,
+    interval: Option<String>, // None retains all intervals for legacy clients.
+    low_power: bool,
+}
+async fn ws_writer(
+    mut sink: futures_util::stream::SplitSink<WebSocket, Message>,
+    mut controls: tokio::sync::mpsc::Receiver<Message>,
+    mut display: tokio::sync::watch::Receiver<Display>,
+) {
+    let mut sent = [0; 3];
+    let mut epoch = 0;
+    loop {
+        let latest = display.borrow_and_update().clone();
+        if epoch != latest.epoch {
+            epoch = latest.epoch;
+            sent = [0; 3];
+        }
+        let next = [latest.state, latest.quote, latest.leaderboard]
+            .into_iter()
+            .enumerate()
+            .find_map(|(kind, value)| {
+                value
+                    .filter(|(id, _)| *id != sent[kind])
+                    .map(|(id, text)| (kind, id, text))
+            });
+        let message = tokio::select! {
+            biased;
+            control = controls.recv() => match control { Some(message)=>message, None=>break },
+            _ = std::future::ready(()), if next.is_some() => {
+                let (kind,id,text) = next.unwrap(); sent[kind] = id;
+                Message::Text(text.to_string().into())
+            },
+            changed = display.changed() => { if changed.is_err() { break; } continue; },
+        };
+        let close = matches!(message, Message::Close(_));
+        if !tokio::time::timeout(Duration::from_secs(5), sink.send(message))
+            .await
+            .is_ok_and(|r| r.is_ok())
+            || close
+        {
+            break;
+        }
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(2), sink.close()).await;
 }
 async fn serve_ws(
-    mut socket: WebSocket,
+    socket: WebSocket,
     app: Arc<App>,
     name: String,
     token: String,
     _slot: SocketSlot,
 ) {
-    let mut events = app.events.subscribe();
+    let mut events = app.control_events();
     // Recheck after upgrade to close the deletion/handshake race.
     if app
         .store
@@ -614,45 +703,117 @@ async fn serve_ws(
         return;
     }
     let _presence = app.connected(&name);
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
-    // State is pushed only when it changed, plus a heartbeat so a quiet tab still refreshes.
-    let (mut last, mut sent_at) = (String::new(), tokio::time::Instant::now());
+    let (sink, mut source) = socket.split();
+    let (control_tx, control_rx) = tokio::sync::mpsc::channel(64);
+    let (display_tx, display_rx) = tokio::sync::watch::channel(Display::default());
+    let mut writer = tokio::task::JoinSet::new();
+    writer.spawn(ws_writer(sink, control_rx, display_rx));
+    let mut clock = tokio::time::interval(Duration::from_millis(200));
+    clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut view = View::default();
+    let mut display = Display::default();
+    let mut last_state: Arc<str> = Arc::from("");
+    let mut last_account = String::new();
+    let mut state_sequence = 0;
+    let mut account_revision = 0;
+    let mut account_at = tokio::time::Instant::now() - Duration::from_secs(2);
+    let mut quote_at = account_at;
+    let mut heartbeat_at = tokio::time::Instant::now();
+    let mut force_state = true;
     loop {
         if app.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
             break;
         }
         tokio::select! {
-            incoming=socket.recv()=>match incoming {
-                Some(Ok(Message::Ping(data)))=> {if !tokio::time::timeout(Duration::from_secs(5),socket.send(Message::Pong(data))).await.is_ok_and(|r|r.is_ok()) {break;}},
-                Some(Ok(Message::Close(_)))|None|Some(Err(_))=>break,
-                _=>{},
-            },
-            event=events.recv()=>match event {
-                Ok(Event::Message(text,symbol))=>{
-                    // Quote ticks are per pair: only the one this user is viewing is sent.
-                    let wanted=symbol.is_none_or(|s|app.store.selected(&name).is_some_and(|sel|*sel==*s));
-                    if wanted&&!send_text(&mut socket,&text).await {break;}
+            _ = writer.join_next() => return,
+            incoming = source.next() => match incoming {
+                Some(Ok(Message::Ping(data))) => {
+                    if control_tx.send(Message::Pong(data)).await.is_err() { break; }
                 },
-                Ok(Event::Deleted(owner))=>if owner==name {break;},
-                Ok(Event::Shutdown)=>break,
-                Err(_)=>break,
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(value) = serde_json::from_str::<Value>(&text) && value["type"] == "view" {
+                        if let Some(visible) = value["visible"].as_bool() { view.hidden = !visible; }
+                        if let Some(visible) = value["leaderboard"].as_bool() { view.no_leaderboard = !visible; }
+                        if let Some(low_power) = value["low_power"].as_bool() { view.low_power = low_power; }
+                        if let Some(interval) = value["interval"].as_str()
+                            && symbols::INTERVALS.iter().any(|(i,_)| *i == interval) {
+                            view.interval = Some(interval.to_owned());
+                        }
+                        display = Display { epoch: display.epoch+1, ..Display::default() };
+                        display_tx.send_replace(display.clone());
+                        force_state = !view.hidden;
+                        account_at = tokio::time::Instant::now() - Duration::from_secs(2);
+                        quote_at = account_at;
+                    }
+                },
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                _ => {},
             },
-            _=interval.tick()=> {
-                if app.store.authenticate(&token).await.ok().flatten().as_deref()!=Some(&name) {break;}
-                if let Ok(state)=app.state(&name).await {
-                    // Quote fields also arrive in the live tick; only account changes count.
-                    let mut key=state.clone();
-                    if let Some(o)=key.as_object_mut() {
-                        for f in ["price","bid","ask","quote_at","quote_valid","nstar_price"] {o.remove(f);}
+            event = events.recv() => match event {
+                Ok(Event::Message(text, _)) => {
+                    if control_tx.send(Message::Text(text.to_string().into())).await.is_err() { break; }
+                },
+                Ok(Event::Deleted(owner)) => if owner == name { break; },
+                Ok(Event::Shutdown) | Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    if app.store.authenticate(&token).await.ok().flatten().as_deref() != Some(&name) { break; }
+                    // Display traffic cannot lag this channel. Recover controls from durable
+                    // state/history rather than interpreting missed quotes as a disconnect.
+                    let _ = control_tx.send(Message::Text(json!({"type":"resync","history":true,"chat":true}).to_string().into())).await;
+                    if let Ok(mut settings) = app.store.settings().await {
+                        settings["type"] = json!("symbols");
+                        let _ = control_tx.send(Message::Text(settings.to_string().into())).await;
                     }
-                    let key=key.to_string();
-                    if key!=last||sent_at.elapsed()>=Duration::from_secs(15) {
-                        if !send_text(&mut socket,&state.to_string()).await {break;}
-                        last=key;sent_at=tokio::time::Instant::now();
+                    force_state = true;
+                    account_at = tokio::time::Instant::now() - Duration::from_secs(2);
+                },
+            },
+            _ = clock.tick() => {
+                let mut changed = false;
+                if account_at.elapsed() >= Duration::from_secs(1) {
+                    account_at = tokio::time::Instant::now();
+                    if app.store.authenticate(&token).await.ok().flatten().as_deref() != Some(&name) { break; }
+                    let revision = app.store.revision();
+                    let mut account_changed = false;
+                    if revision != account_revision && let Ok(user) = app.store.user(&name).await {
+                        let key = json!([user.account,user.symbol,user.last_trade]).to_string();
+                        account_changed = key != last_account;
+                        last_account = key;
                     }
+                    if (!view.hidden || account_changed || force_state)
+                        && let Ok(packet) = app.state_packet(&name).await {
+                        if force_state || packet.key != last_state {
+                            state_sequence += 1;
+                            display.state = Some((state_sequence, packet.text.clone()));
+                            last_state = packet.key.clone();
+                            changed = true;
+                        }
+                        force_state = false;
+                    }
+                    account_revision = revision;
+                }
+                if !view.hidden && quote_at.elapsed() >= Duration::from_millis(if view.low_power { 1000 } else { 200 }) {
+                    quote_at = tokio::time::Instant::now();
+                    if let Some(symbol) = app.store.selected(&name)
+                        && let Some(quote) = app.latest_quote(&symbol, view.interval.as_deref())
+                        && display.quote.as_ref().is_none_or(|(id,_)| *id != quote.0) {
+                        display.quote = Some(quote); changed = true;
+                    }
+                }
+                if !view.hidden && !view.no_leaderboard
+                    && let Some(board) = app.leaderboard_packet()
+                    && display.leaderboard.as_ref().is_none_or(|(id,_)|*id != board.0) {
+                    display.leaderboard = Some(board); changed = true;
+                }
+                if changed { display_tx.send_replace(display.clone()); }
+                if heartbeat_at.elapsed() >= Duration::from_secs(15) {
+                    heartbeat_at = tokio::time::Instant::now();
+                    if control_tx.send(Message::Text(json!({"type":"heartbeat"}).to_string().into())).await.is_err() { break; }
                 }
             }
         }
     }
-    let _ = tokio::time::timeout(Duration::from_secs(2), socket.send(Message::Close(None))).await;
+    let _ = control_tx.send(Message::Close(None)).await;
+    drop(control_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(2), writer.join_next()).await;
 }

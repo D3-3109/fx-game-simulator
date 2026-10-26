@@ -32,7 +32,7 @@ async function refresh(){
 }
 function renderSymbols(rows){
  $('symbols').replaceChildren();
- for(const symbol of rows){
+ for(const symbol of rows.filter(symbol=>symbol.symbol==='NSTAR')){
   const tr=row([symbol.symbol,symbol.provider]),td=document.createElement('td'),checkbox=document.createElement('input');
   checkbox.type='checkbox';checkbox.checked=symbol.enabled;checkbox.setAttribute('aria-label','启用 '+symbol.symbol);
   checkbox.onchange=()=>setSymbol(checkbox,symbol.symbol,symbol.enabled);

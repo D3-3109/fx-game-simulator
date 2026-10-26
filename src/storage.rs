@@ -1,7 +1,14 @@
 //! SQLite ownership and complete business transactions; callers never assemble SQL.
+#[path = "backup.rs"]
+mod backup;
+#[cfg(test)]
+#[path = "nstar_migration_tests.rs"]
+mod nstar_migration_tests;
 #[cfg(test)]
 #[path = "storage_tests.rs"]
 mod tests;
+#[path = "storage_writer.rs"]
+mod writer;
 use crate::{
     limits::Quota,
     symbols,
@@ -15,12 +22,16 @@ use sqlx::{
 };
 use std::{
     collections::BTreeMap,
-    path::Path,
-    sync::atomic::{AtomicU64, Ordering},
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
+use writer::{Mutation, PreparedAccount, Publication, Work, Writer};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -28,8 +39,12 @@ pub enum Error {
     Invalid(String),
     #[error("database operation failed")]
     Database(#[from] sqlx::Error),
+    #[error("{0}")]
+    Unavailable(String),
     #[error("stored account data is invalid")]
     Json(#[from] serde_json::Error),
+    #[error("database backup failed: {0}")]
+    Backup(#[from] std::io::Error),
 }
 impl From<String> for Error {
     fn from(e: String) -> Self {
@@ -58,35 +73,74 @@ pub struct User {
     pub last_trade: Option<Value>,
 }
 
+#[derive(Debug, Default, serde::Serialize)]
+pub struct NstarMigration {
+    pub backup: Option<PathBuf>,
+    pub accounts: usize,
+    pub positions: usize,
+    pub orders: usize,
+    pub spot_assets: usize,
+}
+
 pub struct Store {
     pool: SqlitePool,
-    // ponytail: one process-wide mutation lock; per-account locks if throughput requires it.
-    gate: Mutex<()>,
-    next_id: AtomicU64,
+    nstar_only: bool,
+    // The writer owns this gate through COMMIT and synchronous cache publication.
+    gate: Arc<Mutex<()>>,
+    next_id: Arc<AtomicU64>,
     /// NSTAR units (player, forced) settled but not yet applied to the book.
-    nstar_flow: std::sync::Mutex<(f64, f64)>,
-    login_aliases: Mutex<BTreeMap<String, String>>,
-    /// Committed copy of every account, so hot paths (risk sweeps, leaderboard, live state)
-    /// never re-read and re-parse SQLite. Updated only after a successful commit.
-    cache: std::sync::RwLock<Cache>,
+    nstar_flow: Arc<std::sync::Mutex<(f64, f64)>>,
+    login_aliases: Arc<std::sync::Mutex<BTreeMap<String, String>>>,
+    /// Committed copies only; hot paths never re-read and re-parse SQLite.
+    cache: Arc<std::sync::RwLock<Cache>>,
+    revision: Arc<AtomicU64>,
+    writer: Writer,
 }
 
 #[derive(Default)]
 struct Cache {
     users: BTreeMap<String, User>,
     tokens: std::collections::HashMap<String, String>,
+    deposits: BTreeMap<String, f64>,
+}
+
+#[derive(Clone, Copy)]
+enum AccountLoad {
+    Validated,
+    ForMigration,
 }
 
 impl Store {
     pub async fn open(path: &Path) -> Result<Self> {
+        Self::open_mode(path, true, AccountLoad::Validated).await
+    }
+    /// Explicit compatibility mode for legacy fixtures; account validation stays enabled.
+    /// Retains WAL/NORMAL for compatibility: unlike production WAL/FULL, acknowledged
+    /// commits may be lost on power failure before the next checkpoint.
+    pub async fn open_legacy(path: &Path) -> Result<Self> {
+        Self::open_mode(path, false, AccountLoad::Validated).await
+    }
+    /// Offline CLI only: load typed legacy data before filtering and validating it.
+    /// Never use this store to serve requests. The database must already exist.
+    pub async fn open_for_migration(path: &Path) -> Result<Self> {
+        Self::open_mode(path, true, AccountLoad::ForMigration).await
+    }
+    pub fn is_nstar_only(&self) -> bool {
+        self.nstar_only
+    }
+    async fn open_mode(path: &Path, nstar_only: bool, load: AccountLoad) -> Result<Self> {
         let options = SqliteConnectOptions::new()
             .filename(path)
-            .create_if_missing(true)
+            .create_if_missing(matches!(load, AccountLoad::Validated))
             .busy_timeout(Duration::from_secs(10))
-            // WAL + NORMAL: a commit is an append, not a full fsync; a crash can lose at most
-            // the last un-checkpointed commits, never corrupt the database.
+            // Reliable production acknowledgement requires WAL/FULL. Only explicitly
+            // selected legacy fixture mode retains the old NORMAL durability policy.
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-            .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
+            .synchronous(if nstar_only {
+                sqlx::sqlite::SqliteSynchronous::Full
+            } else {
+                sqlx::sqlite::SqliteSynchronous::Normal
+            });
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(options)
@@ -134,7 +188,7 @@ impl Store {
             .await?
         {
             let name: String = row.get("name");
-            let user = load_user(&mut conn, &name).await?;
+            let user = load_user_mode(&mut conn, &name, load).await?;
             let token: String = row.get("token");
             if !token.is_empty() {
                 cache.tokens.insert(token, name.clone());
@@ -147,18 +201,215 @@ impl Store {
                 next_id = next_id.max(p.id.saturating_add(1));
             }
         }
+        cache.deposits =
+            sqlx::query("SELECT name,SUM(amount) AS total FROM deposits GROUP BY name")
+                .fetch_all(&mut *conn)
+                .await?
+                .into_iter()
+                .map(|row| (row.get("name"), row.get("total")))
+                .collect();
         drop(conn);
+        let gate = Arc::new(Mutex::new(()));
+        let next_id = Arc::new(AtomicU64::new(next_id));
+        let nstar_flow = Arc::new(std::sync::Mutex::new((0.0, 0.0)));
+        let login_aliases = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let cache = Arc::new(std::sync::RwLock::new(cache));
+        let revision = Arc::new(AtomicU64::new(0));
+        let writer = Writer::start(writer::Shared {
+            pool: pool.clone(),
+            nstar_only,
+            gate: gate.clone(),
+            cache: cache.clone(),
+            next_id: next_id.clone(),
+            flow: nstar_flow.clone(),
+            aliases: login_aliases.clone(),
+            revision: revision.clone(),
+        });
         Ok(Self {
             pool,
-            gate: Mutex::new(()),
-            next_id: AtomicU64::new(next_id),
-            nstar_flow: std::sync::Mutex::new((0.0, 0.0)),
-            login_aliases: Mutex::new(BTreeMap::new()),
-            cache: std::sync::RwLock::new(cache),
+            nstar_only,
+            gate,
+            next_id,
+            nstar_flow,
+            login_aliases,
+            cache,
+            revision,
+            writer,
         })
     }
+    pub async fn ensure_nstar_only(&self) -> Result<()> {
+        if self.nstar_only
+            && self
+                .cache
+                .read()
+                .unwrap()
+                .users
+                .values()
+                .any(has_legacy_exposure)
+        {
+            return Err(invalid(
+                "数据库含非 NSTAR 选中币种、持仓或挂单；停服后使用 --migrate-nstar-only --migration-backup <新备份路径> 迁移",
+            ));
+        }
+        Ok(())
+    }
+    /// Run only while the service is stopped. VACUUM INTO includes committed WAL content.
+    pub async fn migrate_nstar_only(&self, backup: &Path) -> Result<NstarMigration> {
+        let mutation = self.writer.admit(&self.gate).await?;
+        let mut conn = self.pool.acquire().await?;
+        let names: Vec<String> = sqlx::query_scalar("SELECT name FROM users ORDER BY name")
+            .fetch_all(&mut *conn)
+            .await?;
+        let mut users = Vec::new();
+        for name in names {
+            let user = load_user_mode(&mut conn, &name, AccountLoad::ForMigration).await?;
+            if has_legacy_exposure(&user) {
+                users.push(user);
+            } else {
+                // A no-op migration must not report success for invalid retained data.
+                user.account.validate()?;
+            }
+        }
+        if users.is_empty() {
+            return Ok(NstarMigration::default());
+        }
+        let backup_path = backup
+            .to_str()
+            .ok_or_else(|| invalid("备份路径必须是有效文本"))?;
+        // Permissions are restricted before any secrets are written. Keep the handle
+        // through VACUUM and sync the same file; Windows also denies delete/rename.
+        let reserved = backup::reserve(backup)?;
+        sqlx::query("VACUUM INTO ?")
+            .bind(backup_path)
+            .execute(&mut *conn)
+            .await?;
+        reserved.sync_all()?;
+        drop(reserved);
+        drop(conn);
+        let mut report = NstarMigration {
+            backup: Some(backup.to_path_buf()),
+            ..NstarMigration::default()
+        };
+        let mut tx = self.begin().await?;
+        let now = now_ms();
+        let mut committed = Vec::new();
+        for before in users {
+            let mut user = load_user_mode(&mut tx, &before.name, AccountLoad::ForMigration).await?;
+            if user.account != before.account || user.symbol != before.symbol {
+                return Err(invalid(
+                    "迁移期间账户发生变化；请停止所有访问该数据库的服务后重试",
+                ));
+            }
+            let positions = user.account.positions.len();
+            let orders = user.account.orders.len();
+            let spot = user.account.spot.len();
+            user.account
+                .positions
+                .retain(|p| p.symbol == symbols::NSTAR);
+            user.account.orders.retain(|o| o.symbol == symbols::NSTAR);
+            user.account
+                .spot
+                .retain(|symbol, _| symbol == symbols::NSTAR);
+            let removed_positions = positions - user.account.positions.len();
+            let removed_orders = orders - user.account.orders.len();
+            let removed_spot = spot - user.account.spot.len();
+            let detail = json!({
+                "actor":"NSTAR迁移", "backup":backup, "previous_symbol":user.symbol,
+                "positions_removed":removed_positions, "orders_removed":removed_orders,
+                "spot_assets_removed":removed_spot, "balance":user.account.balance,
+                "settled":false
+            });
+            user.symbol = symbols::NSTAR.into();
+            user.account.validate()?;
+            persist(&mut tx, &user).await?;
+            if removed_positions > 0 || removed_spot > 0 {
+                sqlx::query("DELETE FROM equity_samples WHERE name=?")
+                    .bind(&user.name)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            event(&mut tx, "nstar_migration", &user.name, now, None, &detail).await?;
+            report.accounts += 1;
+            report.positions += removed_positions;
+            report.orders += removed_orders;
+            report.spot_assets += removed_spot;
+            committed.push(user);
+        }
+        self.commit(
+            mutation,
+            tx,
+            Publication {
+                users: committed,
+                revision: true,
+                ..Publication::default()
+            },
+        )
+        .await?;
+        Ok(report)
+    }
+    /// Stops admission, drains accepted commits and publications, then closes SQLite.
+    /// Kept infallible for existing callers; failure is explicit in stats and stderr.
     pub async fn close(&self) {
-        self.pool.close().await;
+        if let Err(error) = self.writer.close().await {
+            eprintln!("storage close failed: {error}");
+            self.pool.close().await;
+        }
+    }
+    pub async fn flush_pending(&self) -> Result<()> {
+        let _mutation = self.writer.admit(&self.gate).await?;
+        Ok(())
+    }
+    pub fn persistence_stats(&self) -> Value {
+        self.writer.snapshot()
+    }
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+    pub async fn leaderboard_snapshot(&self) -> Result<(Vec<User>, BTreeMap<String, f64>)> {
+        let _guard = self.gate.lock().await;
+        let cache = self.cache.read().unwrap();
+        Ok((
+            cache.users.values().cloned().collect(),
+            cache.deposits.clone(),
+        ))
+    }
+    pub fn risk_user_names(&self, symbol: &str) -> Vec<String> {
+        self.cache
+            .read()
+            .unwrap()
+            .users
+            .values()
+            .filter(|user| {
+                if user.account.positions.is_empty() && user.account.orders.is_empty() {
+                    return false;
+                }
+                let symbols = user
+                    .account
+                    .symbols()
+                    .chain(user.account.orders.iter().map(|o| o.symbol.as_str()));
+                // Invalid legacy exposure must still reach the risk engine for its
+                // established error policy, rather than silently disappear here.
+                trading::price_symbols(symbols).map_or(true, |required| required.contains(symbol))
+            })
+            .map(|user| user.name.clone())
+            .collect()
+    }
+    async fn commit(
+        &self,
+        mutation: Mutation,
+        tx: sqlx::Transaction<'static, sqlx::Sqlite>,
+        publication: Publication,
+    ) -> Result<()> {
+        self.writer
+            .submit(mutation, Work::Commit { tx, publication })
+            .await
+    }
+    async fn begin(&self) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
+        self.writer
+            .stats
+            .transactions
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(self.pool.begin().await?)
     }
     pub async fn user(&self, name: &str) -> Result<User> {
         self.cache
@@ -181,18 +432,6 @@ impl Store {
             .get(name)
             .map(|u| u.symbol.clone())
     }
-    /// Re-read one account from SQLite into the cache after a committed write.
-    async fn refresh(&self, name: &str) -> Result<()> {
-        let mut conn = self.pool.acquire().await?;
-        let user = load_user(&mut conn, name).await?;
-        self.cache.write().unwrap().users.insert(name.into(), user);
-        Ok(())
-    }
-    fn forget(&self, name: &str) {
-        let mut cache = self.cache.write().unwrap();
-        cache.users.remove(name);
-        cache.tokens.retain(|_, owner| owner != name);
-    }
     pub async fn authenticate(&self, tok: &str) -> Result<Option<String>> {
         if tok.is_empty() {
             return Ok(None);
@@ -200,7 +439,7 @@ impl Store {
         if let Some(name) = self.cache.read().unwrap().tokens.get(tok) {
             return Ok(Some(name.clone()));
         }
-        Ok(self.login_aliases.lock().await.get(tok).cloned())
+        Ok(self.login_aliases.lock().unwrap().get(tok).cloned())
     }
     /// Trusted in-process registration (tests, tools); bypasses client quotas.
     pub async fn register(&self, name: &str, pwd: &str) -> Result<String> {
@@ -217,7 +456,7 @@ impl Store {
         quota: &Quota,
         now: i64,
     ) -> Result<String> {
-        let _guard = self.gate.lock().await;
+        let mutation = self.writer.admit(&self.gate).await?;
         let since = |ms: i64| now - ms;
         let count = |sql: &'static str, key: Option<&str>, from: i64| {
             let q = sqlx::query_scalar::<_, i64>(sql);
@@ -265,9 +504,24 @@ impl Store {
             next_id: self.next_id.load(Ordering::SeqCst),
             ..Account::default()
         };
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("INSERT INTO users(name,salt,hash,token,symbol,account,created) VALUES(?,?,?,?,'USDJPY',?,?)")
-            .bind(name).bind(&salt).bind(password_hash(&salt,pwd)).bind(&tok).bind(serde_json::to_string(&account)?).bind(now/1000).execute(&mut *tx).await?;
+        let mut tx = self.begin().await?;
+        let symbol = if self.nstar_only {
+            symbols::NSTAR
+        } else {
+            "USDJPY"
+        };
+        sqlx::query(
+            "INSERT INTO users(name,salt,hash,token,symbol,account,created) VALUES(?,?,?,?,?,?,?)",
+        )
+        .bind(name)
+        .bind(&salt)
+        .bind(password_hash(&salt, pwd))
+        .bind(&tok)
+        .bind(symbol)
+        .bind(serde_json::to_string(&account)?)
+        .bind(now / 1000)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("INSERT INTO registrations(client,time,name) VALUES(?,?,?)")
             .bind(client)
             .bind(now)
@@ -278,17 +532,26 @@ impl Store {
             .bind(since(7 * 24 * HOUR))
             .execute(&mut *tx)
             .await?;
-        tx.commit().await?;
-        self.refresh(name).await?;
-        self.cache
-            .write()
-            .unwrap()
-            .tokens
-            .insert(tok.clone(), name.into());
+        self.commit(
+            mutation,
+            tx,
+            Publication {
+                users: vec![User {
+                    name: name.into(),
+                    symbol: symbol.into(),
+                    account,
+                    last_trade: None,
+                }],
+                tokens: vec![(tok.clone(), name.into())],
+                revision: true,
+                ..Publication::default()
+            },
+        )
+        .await?;
         Ok(tok)
     }
     pub async fn login(&self, name: &str, pwd: &str) -> Result<String> {
-        let _guard = self.gate.lock().await;
+        let mutation = self.writer.admit(&self.gate).await?;
         let row = sqlx::query("SELECT salt,hash,token FROM users WHERE name=?")
             .bind(name)
             .fetch_optional(&self.pool)
@@ -302,104 +565,180 @@ impl Store {
         // Python rotates the durable token but keeps older logins in memory until restart.
         let old: String = row.get("token");
         let tok = token(16);
+        let mut tx = self.begin().await?;
         sqlx::query("UPDATE users SET token=? WHERE name=?")
             .bind(&tok)
             .bind(name)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
-        {
-            let mut cache = self.cache.write().unwrap();
-            cache.tokens.remove(&old);
-            cache.tokens.insert(tok.clone(), name.into());
-        }
-        if !old.is_empty() {
-            self.login_aliases.lock().await.insert(old, name.into());
-        }
+        self.commit(
+            mutation,
+            tx,
+            Publication {
+                tokens: vec![(tok.clone(), name.into())],
+                aliases: vec![(old, name.into())],
+                revision: true,
+                ..Publication::default()
+            },
+        )
+        .await?;
         Ok(tok)
     }
     pub async fn transaction<F>(&self, name: &str, operation: F) -> Result<()>
     where
         F: FnOnce(&mut Account, &mut String, u64) -> std::result::Result<Vec<Trade>, String> + Send,
     {
-        let _guard = self.gate.lock().await;
-        let mut tx = self.pool.begin().await?;
-        let mut user = load_user(&mut tx, name).await?;
-        let id = self.next_id.load(Ordering::SeqCst);
-        let held = nstar_units(&user.account);
-        let trades = operation(&mut user.account, &mut user.symbol, id)?;
-        let opened = trades.iter().any(|t| t.kind == "open");
-        user.account.validate()?;
-        // Re-check enabled status inside the same transaction for all new positions/selection changes.
-        for t in &trades {
-            if t.kind == "open" {
-                require_tradable(&mut tx, &t.symbol).await?;
+        let mut operation = Some(operation);
+        self.transaction_batch(&[name.to_owned()], |_, account, symbol, id| {
+            operation.take().expect("single account operation")(account, symbol, id)
+        })
+        .await
+    }
+    /// Executes names in order on committed cache copies under one mutation gate.
+    /// Any closure/validation/SQL error aborts the WHOLE batch. Callers that skip an
+    /// invalid operation must restore that account's local copy inside their closure.
+    /// No changes (full Account + symbol equality, and no trades) means zero SQL.
+    pub async fn transaction_batch<F>(&self, names: &[String], mut operation: F) -> Result<()>
+    where
+        F: FnMut(&str, &mut Account, &mut String, u64) -> std::result::Result<Vec<Trade>, String>
+            + Send,
+    {
+        let mutation = self.writer.admit(&self.gate).await?;
+        let mut next_id = self.next_id.load(Ordering::SeqCst);
+        let mut rows: Vec<PreparedAccount> = Vec::new();
+        let mut indices = BTreeMap::<String, usize>::new();
+        let mut flow = (0.0, 0.0);
+        for name in names {
+            let before = if let Some(index) = indices.get(name) {
+                rows[*index].user.clone()
+            } else {
+                self.cache
+                    .read()
+                    .unwrap()
+                    .users
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| invalid("账号不存在"))?
+            };
+            let mut user = before.clone();
+            let id = next_id.max(user.account.next_id);
+            let trades = operation(name, &mut user.account, &mut user.symbol, id)?;
+            user.account.validate()?;
+            if self.nstar_only
+                && (has_legacy_exposure(&user)
+                    || trades
+                        .iter()
+                        .any(|t| !t.symbol.is_empty() && t.symbol != symbols::NSTAR))
+            {
+                return Err(invalid("当前服务仅支持 NSTAR"));
             }
-        }
-        let old_symbol: String = sqlx::query_scalar("SELECT symbol FROM users WHERE name=?")
-            .bind(name)
-            .fetch_one(&mut *tx)
-            .await?;
-        if old_symbol != user.symbol {
-            require_tradable(&mut tx, &user.symbol).await?;
-        }
-        persist(&mut tx, &user).await?;
-        // Net change in held NSTAR is exactly the flow, including stopouts and resets that
-        // abandon positions. Only voluntary orders count as player flow.
-        let total = nstar_units(&user.account) - held;
-        let player: f64 = trades
-            .iter()
-            .filter(|t| t.symbol == symbols::NSTAR)
-            .map(|t| {
-                let units = t.lots * trading::contract(symbols::NSTAR);
-                match (t.kind.as_str(), t.side.as_str()) {
-                    ("open", "long") | ("close" | "tp" | "sl", "short") | ("spot", "buy") => units,
-                    ("open", "short") | ("close" | "tp" | "sl", "long") | ("spot", "sell") => {
-                        -units
+            let changed = user.account != before.account || user.symbol != before.symbol;
+            if !changed && trades.is_empty() {
+                self.writer
+                    .stats
+                    .noop_accounts
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            // IDs are reserved locally, not published until the single batch commits.
+            // Account.next_id also captures multiple fills in one risk operation.
+            next_id = next_id.max(user.account.next_id);
+            for position in &user.account.positions {
+                next_id = next_id.max(position.id.saturating_add(1));
+            }
+            for trade in trades.iter().filter(|trade| trade.kind == "open") {
+                next_id = next_id.max(trade.position_id.saturating_add(1));
+            }
+            let total = nstar_units(&user.account) - nstar_units(&before.account);
+            let player: f64 = trades
+                .iter()
+                .filter(|t| t.symbol == symbols::NSTAR)
+                .map(|t| {
+                    let units = t.lots * trading::contract(symbols::NSTAR);
+                    match (t.kind.as_str(), t.side.as_str()) {
+                        ("open", "long") | ("close" | "tp" | "sl", "short") | ("spot", "buy") => {
+                            units
+                        }
+                        ("open", "short") | ("close" | "tp" | "sl", "long") | ("spot", "sell") => {
+                            -units
+                        }
+                        _ => 0.0,
                     }
-                    _ => 0.0,
-                }
-            })
-            .sum();
-        for trade in &trades {
-            insert_trade(&mut tx, name, trade).await?;
-        }
-        if !trades.is_empty() {
-            user.last_trade = history(&mut tx, name, 1).await?.into_iter().next();
-        }
-        tx.commit().await?;
-        self.cache
-            .write()
-            .unwrap()
-            .users
-            .insert(name.into(), user.clone());
-        if total != 0.0 {
-            let mut flow = self.nstar_flow.lock().unwrap();
+                })
+                .sum();
             flow.0 += player;
             flow.1 += total - player;
+            if let Some(index) = indices.get(name) {
+                let row = &mut rows[*index];
+                row.user = user;
+                row.changed |= changed;
+                row.trades.extend(trades);
+            } else {
+                indices.insert(name.clone(), rows.len());
+                rows.push(PreparedAccount {
+                    user,
+                    old_symbol: before.symbol,
+                    changed,
+                    trades,
+                });
+            }
         }
-        if opened {
-            self.next_id
-                .fetch_max(user.account.next_id, Ordering::SeqCst);
+        // Repeated names are allowed; a later operation can undo an earlier edit.
+        // Compare the final full account to the original committed copy, not just
+        // a per-operation dirty flag, before deciding whether any SQL is needed.
+        {
+            let cache = self.cache.read().unwrap();
+            rows.retain_mut(|row| {
+                let original = &cache.users[&row.user.name];
+                row.changed =
+                    row.user.account != original.account || row.user.symbol != original.symbol;
+                row.changed || !row.trades.is_empty()
+            });
         }
-        Ok(())
+        if rows.is_empty() {
+            self.writer.stats.noops.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        self.writer
+            .submit(
+                mutation,
+                Work::Accounts {
+                    rows,
+                    next_id,
+                    flow,
+                },
+            )
+            .await
     }
     pub fn take_nstar_flow(&self) -> (f64, f64) {
         std::mem::take(&mut *self.nstar_flow.lock().unwrap())
     }
+    pub fn restore_nstar_flow(&self, player: f64, forced: f64) {
+        let mut flow = self.nstar_flow.lock().unwrap();
+        flow.0 += player;
+        flow.1 += forced;
+    }
     pub async fn select_symbol(&self, name: &str, symbol: &str) -> Result<()> {
-        let _guard = self.gate.lock().await;
-        let mut tx = self.pool.begin().await?;
-        require_tradable(&mut tx, symbol).await?;
-        let mut user = load_user(&mut tx, name).await?;
+        let mutation = self.writer.admit(&self.gate).await?;
+        let mut tx = self.begin().await?;
+        require_tradable(&mut tx, symbol, self.nstar_only).await?;
+        let mut user = self.user(name).await?;
         user.symbol = symbol.into();
         persist(&mut tx, &user).await?;
-        tx.commit().await?;
-        self.cache.write().unwrap().users.insert(name.into(), user);
-        Ok(())
+        self.commit(
+            mutation,
+            tx,
+            Publication {
+                users: vec![user],
+                revision: true,
+                ..Publication::default()
+            },
+        )
+        .await
     }
     pub async fn require_tradable(&self, symbol: &str) -> Result<()> {
         let mut conn = self.pool.acquire().await?;
-        require_tradable(&mut conn, symbol).await
+        require_tradable(&mut conn, symbol, self.nstar_only).await
     }
     pub async fn history(&self, name: &str) -> Result<Vec<Value>> {
         let mut conn = self.pool.acquire().await?;
@@ -416,8 +755,8 @@ impl Store {
         if !(1..=300).contains(&text.chars().count()) {
             return Err(invalid("聊天内容需为1至300字"));
         }
-        let _guard = self.gate.lock().await;
-        let mut tx = self.pool.begin().await?;
+        let mutation = self.writer.admit(&self.gate).await?;
+        let mut tx = self.begin().await?;
         load_user(&mut tx, name).await?;
         let previous: Option<i64> =
             sqlx::query_scalar("SELECT time FROM chat WHERE name=? ORDER BY id DESC LIMIT 1")
@@ -435,18 +774,11 @@ impl Store {
             .await?
             .last_insert_rowid();
         sqlx::query("DELETE FROM chat WHERE id <= (SELECT id FROM chat ORDER BY id DESC LIMIT 1 OFFSET 100)").execute(&mut *tx).await?;
-        tx.commit().await?;
+        self.commit(mutation, tx, Publication::default()).await?;
         Ok(json!({"id":id,"name":name,"time":now,"text":text}))
     }
     pub async fn deposit_totals(&self) -> Result<BTreeMap<String, f64>> {
-        Ok(
-            sqlx::query("SELECT name,SUM(amount) AS total FROM deposits GROUP BY name")
-                .fetch_all(&self.pool)
-                .await?
-                .into_iter()
-                .map(|r| (r.get("name"), r.get("total")))
-                .collect(),
-        )
+        Ok(self.cache.read().unwrap().deposits.clone())
     }
     pub async fn events(&self) -> Result<Vec<Value>> {
         let mut out = Vec::new();
@@ -480,8 +812,8 @@ impl Store {
         if !(16..=64).contains(&request_id.chars().count()) {
             return Err(invalid("充值请求编号无效"));
         }
-        let _guard = self.gate.lock().await;
-        let mut tx = self.pool.begin().await?;
+        let mutation = self.writer.admit(&self.gate).await?;
+        let mut tx = self.begin().await?;
         let mut user = load_user(&mut tx, name).await?;
         if let Some(row) =
             sqlx::query("SELECT name,amount,time,balance,actor FROM deposits WHERE request_id=?")
@@ -520,16 +852,25 @@ impl Store {
         .execute(&mut *tx)
         .await?;
         event(&mut tx, "deposit", name, now, Some(request_id), &row).await?;
-        tx.commit().await?;
-        self.cache.write().unwrap().users.insert(name.into(), user);
+        self.commit(
+            mutation,
+            tx,
+            Publication {
+                users: vec![user],
+                deposits: vec![(name.into(), amount)],
+                revision: true,
+                ..Publication::default()
+            },
+        )
+        .await?;
         Ok(row)
     }
     pub async fn delete(&self, name: &str, confirmation: &str, now: i64) -> Result<Value> {
         if name != confirmation {
             return Err(invalid("请准确输入要删除的账号名"));
         }
-        let _guard = self.gate.lock().await;
-        let mut tx = self.pool.begin().await?;
+        let mutation = self.writer.admit(&self.gate).await?;
+        let mut tx = self.begin().await?;
         let user = load_user(&mut tx, name).await?;
         let row = json!({"name":name,"time":now,"actor":"PSK管理员","balance":user.account.balance,"positions":user.account.positions.len()});
         event(&mut tx, "delete", name, now, None, &row).await?;
@@ -539,27 +880,31 @@ impl Store {
                 .execute(&mut *tx)
                 .await?;
         }
-        tx.commit().await?;
-        self.forget(name);
         // A deleted account's NSTAR book is unwound into the market like a stopout.
-        self.nstar_flow.lock().unwrap().1 -= nstar_units(&user.account);
-        self.login_aliases
-            .lock()
-            .await
-            .retain(|_, owner| owner != name);
+        self.commit(
+            mutation,
+            tx,
+            Publication {
+                deleted: vec![name.into()],
+                flow: (0.0, -nstar_units(&user.account)),
+                revision: true,
+                ..Publication::default()
+            },
+        )
+        .await?;
         Ok(row)
     }
     pub async fn settings(&self) -> Result<Value> {
         let mut conn = self.pool.acquire().await?;
-        settings(&mut conn).await
+        settings(&mut conn, self.nstar_only).await
     }
     pub async fn set_symbol(&self, symbol: &str, enabled: bool, now: i64) -> Result<Value> {
-        if symbols::provider(symbol).is_none() {
+        if symbols::provider(symbol).is_none() || (self.nstar_only && symbol != symbols::NSTAR) {
             return Err(invalid("币种对或启用状态无效"));
         }
-        let _guard = self.gate.lock().await;
-        let mut tx = self.pool.begin().await?;
-        let before = settings(&mut tx).await?;
+        let mutation = self.writer.admit(&self.gate).await?;
+        let mut tx = self.begin().await?;
+        let before = settings(&mut tx, self.nstar_only).await?;
         let current = before["rows"]
             .as_array()
             .unwrap()
@@ -578,8 +923,16 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         event(&mut tx, "symbol", symbol, version, None, &row).await?;
-        let after = settings(&mut tx).await?;
-        tx.commit().await?;
+        let after = settings(&mut tx, self.nstar_only).await?;
+        self.commit(
+            mutation,
+            tx,
+            Publication {
+                revision: true,
+                ..Publication::default()
+            },
+        )
+        .await?;
         Ok(after)
     }
     pub async fn five_minute_returns(
@@ -588,8 +941,8 @@ impl Store {
         totals: &BTreeMap<String, f64>,
         now: i64,
     ) -> Result<()> {
-        let _guard = self.gate.lock().await;
-        let mut tx = self.pool.begin().await?;
+        let mutation = self.writer.admit(&self.gate).await?;
+        let mut tx = self.begin().await?;
         for row in rows {
             let name = row["name"].as_str().unwrap().to_owned();
             let eq = row["equity"].as_f64().unwrap();
@@ -613,8 +966,7 @@ impl Store {
             .bind(now - 900)
             .execute(&mut *tx)
             .await?;
-        tx.commit().await?;
-        Ok(())
+        self.commit(mutation, tx, Publication::default()).await
     }
     pub async fn load_bars(&self, symbol: &str, sec: i64) -> Result<Vec<[f64; 5]>> {
         let rows = sqlx::query(
@@ -639,30 +991,20 @@ impl Store {
             .collect())
     }
     pub async fn save_bars(&self, symbol: &str, bars: &[(i64, [f64; 5], i64)]) -> Result<()> {
-        let _guard = self.gate.lock().await;
-        let mut tx = self.pool.begin().await?;
-        for (sec, b, oldest) in bars {
-            sqlx::query(
-                "INSERT OR REPLACE INTO sim_bars(symbol,sec,t,o,h,l,c) VALUES(?,?,?,?,?,?,?)",
-            )
-            .bind(symbol)
-            .bind(sec)
-            .bind(b[0] as i64)
-            .bind(b[1])
-            .bind(b[2])
-            .bind(b[3])
-            .bind(b[4])
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query("DELETE FROM sim_bars WHERE symbol=? AND sec=? AND t<?")
-                .bind(symbol)
-                .bind(sec)
-                .bind(oldest)
-                .execute(&mut *tx)
-                .await?;
+        let mutation = self.writer.admit(&self.gate).await?;
+        if bars.is_empty() {
+            self.writer.stats.noops.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
         }
-        tx.commit().await?;
-        Ok(())
+        self.writer
+            .submit(
+                mutation,
+                Work::Bars {
+                    symbol: symbol.into(),
+                    bars: bars.to_vec(),
+                },
+            )
+            .await
     }
 }
 
@@ -713,6 +1055,13 @@ fn nstar_units(account: &Account) -> f64 {
     perp + account.spot.get(symbols::NSTAR).map_or(0.0, |h| h.units)
 }
 async fn load_user(conn: &mut SqliteConnection, name: &str) -> Result<User> {
+    load_user_mode(conn, name, AccountLoad::Validated).await
+}
+async fn load_user_mode(
+    conn: &mut SqliteConnection,
+    name: &str,
+    load: AccountLoad,
+) -> Result<User> {
     let row = sqlx::query("SELECT symbol,account FROM users WHERE name=?")
         .bind(name)
         .fetch_optional(&mut *conn)
@@ -722,7 +1071,9 @@ async fn load_user(conn: &mut SqliteConnection, name: &str) -> Result<User> {
     // Leverage reductions are safe migrations: existing positions stay open, while future
     // margin checks and API edits immediately use the new ceiling.
     account.leverage = account.leverage.clamp(1, trading::MAX_LEVERAGE);
-    account.validate()?;
+    if matches!(load, AccountLoad::Validated) {
+        account.validate()?;
+    }
     let last_trade = history(conn, name, 1).await?.into_iter().next();
     Ok(User {
         name: name.into(),
@@ -775,7 +1126,26 @@ async fn event(
         .await?;
     Ok(())
 }
-async fn settings(conn: &mut SqliteConnection) -> Result<Value> {
+fn has_legacy_exposure(user: &User) -> bool {
+    user.symbol != symbols::NSTAR
+        || user
+            .account
+            .positions
+            .iter()
+            .any(|p| p.symbol != symbols::NSTAR)
+        || user
+            .account
+            .orders
+            .iter()
+            .any(|o| o.symbol != symbols::NSTAR)
+        || user
+            .account
+            .spot
+            .keys()
+            .any(|symbol| symbol != symbols::NSTAR)
+}
+
+async fn settings(conn: &mut SqliteConnection, nstar_only: bool) -> Result<Value> {
     let flags: BTreeMap<String, (bool, i64)> =
         sqlx::query("SELECT symbol,enabled,version FROM symbol_settings")
             .fetch_all(conn)
@@ -784,11 +1154,15 @@ async fn settings(conn: &mut SqliteConnection) -> Result<Value> {
             .map(|r| (r.get("symbol"), (r.get("enabled"), r.get("version"))))
             .collect();
     Ok(
-        json!({"version":flags.values().map(|(_,v)|*v).max().unwrap_or(0),"rows":symbols::all().iter().map(|s|json!({"symbol":s,"provider":symbols::provider(s),"enabled":flags.get(*s).map(|(e,_)|*e).unwrap_or(true)})).collect::<Vec<_>>()}),
+        json!({"version":flags.values().map(|(_,v)|*v).max().unwrap_or(0),"rows":symbols::all().iter().filter(|s| !nstar_only || **s == symbols::NSTAR).map(|s|json!({"symbol":s,"provider":symbols::provider(s),"enabled":flags.get(*s).map(|(e,_)|*e).unwrap_or(true)})).collect::<Vec<_>>()}),
     )
 }
-async fn require_tradable(conn: &mut SqliteConnection, symbol: &str) -> Result<()> {
-    if symbols::provider(symbol).is_none() {
+async fn require_tradable(
+    conn: &mut SqliteConnection,
+    symbol: &str,
+    nstar_only: bool,
+) -> Result<()> {
+    if symbols::provider(symbol).is_none() || (nstar_only && symbol != symbols::NSTAR) {
         return Err(invalid("不支持的币种对"));
     }
     let enabled: Option<bool> =

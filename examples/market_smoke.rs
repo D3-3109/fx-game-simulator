@@ -6,7 +6,7 @@ use std::{sync::Arc, time::Duration};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
-    let store = Arc::new(Store::open(&dir.path().join("smoke.db")).await?);
+    let store = Arc::new(Store::open_legacy(&dir.path().join("smoke.db")).await?);
     let market = Market::new(store).await.map_err(std::io::Error::other)?;
     let started = std::time::Instant::now();
     let (biquote, yahoo) =

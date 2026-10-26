@@ -13,8 +13,8 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{
-        Arc,
-        atomic::{AtomicI64, Ordering},
+        Arc, Mutex as SyncMutex,
+        atomic::{AtomicI64, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -61,13 +61,98 @@ impl Quote {
 
 pub struct Market {
     pub store: Arc<Store>,
-    client: reqwest::Client,
+    // NSTAR-only has no external client or legacy feed, even in production mode.
+    client: Option<reqwest::Client>,
     cache: RwLock<BTreeMap<String, Quote>>,
-    sim: Mutex<SimFeed>,
+    sim: Option<Mutex<SimFeed>>,
     nstar: Mutex<SimFeed>,
     offline: bool,
-    quote_gate: Mutex<()>,
+    // An accepted quote stays here until its risk batch commits. Cancellation or an
+    // unavailable writer must not let a later quote erase a crossed trigger price.
+    quote_gate: Mutex<Option<PendingQuote>>,
+    revision: AtomicU64,
+    dirty_bars: SyncMutex<DirtyBars>,
+    flush_gate: Mutex<()>,
     biquote_retry_at: AtomicI64,
+}
+
+struct PendingQuote {
+    symbol: String,
+    quotes: BTreeMap<String, Quote>,
+    now: i64,
+    // Own the in-flight batch across caller cancellation. Re-await success, never rerun a
+    // committed partial liquidation or a stop-limit transition against the same quote.
+    risk: Option<tokio::task::JoinHandle<Result<()>>>,
+}
+
+const MAX_DIRTY_BARS: usize = 36_000;
+type BarKey = (&'static str, i64, i64);
+#[derive(Clone)]
+struct DirtyBar {
+    bar: [f64; 5],
+    keep_from: i64,
+    version: u64,
+}
+#[derive(Default)]
+struct DirtyBars {
+    rows: BTreeMap<BarKey, DirtyBar>,
+    version: u64,
+}
+impl DirtyBars {
+    fn check_capacity(&self, symbol: &'static str, bars: &[(i64, [f64; 5], i64)]) -> Result<()> {
+        let added = bars
+            .iter()
+            .filter(|(sec, bar, _)| !self.rows.contains_key(&(symbol, *sec, bar[0] as i64)))
+            .count();
+        if self.rows.len() + added > MAX_DIRTY_BARS {
+            return Err("模拟K线待保存队列已满，暂停行情推进".into());
+        }
+        Ok(())
+    }
+    fn merge(&mut self, symbol: &'static str, bars: &[(i64, [f64; 5], i64)]) -> Result<()> {
+        self.check_capacity(symbol, bars)?;
+        self.version += 1;
+        for (sec, bar, keep_from) in bars {
+            self.rows.insert(
+                (symbol, *sec, bar[0] as i64),
+                DirtyBar {
+                    bar: *bar,
+                    keep_from: *keep_from,
+                    version: self.version,
+                },
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Taken flow belongs either to Store or to the authoritative feed, never a discarded
+/// candidate. In particular an error before assignment returns BOTH player and forced flow.
+struct FlowLease<'a> {
+    store: &'a Store,
+    flow: Option<(f64, f64)>,
+}
+impl<'a> FlowLease<'a> {
+    fn take(store: &'a Store) -> Self {
+        Self {
+            store,
+            flow: Some(store.take_nstar_flow()),
+        }
+    }
+    fn apply(&self, feed: &mut SimFeed) {
+        let (player, forced) = self.flow.unwrap();
+        feed.flow(player, forced);
+    }
+    fn commit(mut self) {
+        self.flow = None;
+    }
+}
+impl Drop for FlowLease<'_> {
+    fn drop(&mut self) {
+        if let Some((player, forced)) = self.flow.take() {
+            self.store.restore_nstar_flow(player, forced);
+        }
+    }
 }
 
 impl Market {
@@ -79,25 +164,39 @@ impl Market {
         Self::build(store, true, prices).await
     }
     async fn build(store: Arc<Store>, offline: bool, prices: Prices) -> Result<Self> {
-        let mut builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .user_agent("Mozilla/5.0");
-        if offline {
-            builder = builder.no_proxy();
-        } else if let Some(proxy) = [
-            "FX_PROXY",
-            "HTTPS_PROXY",
-            "https_proxy",
-            "HTTP_PROXY",
-            "http_proxy",
-        ]
-        .iter()
-        .find_map(|key| std::env::var(key).ok().filter(|s| !s.is_empty()))
-        {
-            builder = builder.proxy(reqwest::Proxy::all(proxy).map_err(|_| "代理设置无效")?);
+        let nstar_only = store.is_nstar_only();
+        if nstar_only {
+            store.ensure_nstar_only().await.map_err(|e| e.to_string())?;
         }
-        let client = builder.build().map_err(|_| "无法创建行情客户端")?;
-        let sim = SimFeed::load(&store, symbols::SIM, 1.1, now_ms()).await?;
+        let client = if nstar_only {
+            None
+        } else {
+            let mut builder = reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .user_agent("Mozilla/5.0");
+            if offline {
+                builder = builder.no_proxy();
+            } else if let Some(proxy) = [
+                "FX_PROXY",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "HTTP_PROXY",
+                "http_proxy",
+            ]
+            .iter()
+            .find_map(|key| std::env::var(key).ok().filter(|s| !s.is_empty()))
+            {
+                builder = builder.proxy(reqwest::Proxy::all(proxy).map_err(|_| "代理设置无效")?);
+            }
+            Some(builder.build().map_err(|_| "无法创建行情客户端")?)
+        };
+        let sim = if nstar_only {
+            None
+        } else {
+            Some(Mutex::new(
+                SimFeed::load(&store, symbols::SIM, 1.1, now_ms()).await?,
+            ))
+        };
         let nstar = SimFeed::load(&store, symbols::NSTAR, 100.0, now_ms()).await?;
         let now = now_ms();
         Ok(Self {
@@ -107,6 +206,7 @@ impl Market {
                 prices
                     .mid
                     .into_iter()
+                    .filter(|(s, _)| !nstar_only || s == symbols::NSTAR)
                     .map(|(s, price)| {
                         let mut q = Quote::single(price, now);
                         q.bid_ask = prices.bid_ask.get(&s).copied();
@@ -114,15 +214,83 @@ impl Market {
                     })
                     .collect(),
             ),
-            sim: Mutex::new(sim),
+            sim,
             nstar: Mutex::new(nstar),
             offline,
-            quote_gate: Mutex::new(()),
+            quote_gate: Mutex::new(None),
+            revision: AtomicU64::new(0),
+            dirty_bars: SyncMutex::new(DirtyBars::default()),
+            flush_gate: Mutex::new(()),
             biquote_retry_at: AtomicI64::new(0),
         })
     }
     pub fn is_offline(&self) -> bool {
         self.offline
+    }
+    /// Changes for every published quote, including mark, anchor and source time updates.
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+    pub fn pending_bar_count(&self) -> usize {
+        self.dirty_bars.lock().unwrap().rows.len()
+    }
+    /// Called once per second and during shutdown. No feed lock or dirty lock spans SQL.
+    /// A concurrent update of the same candle survives acknowledgement of an older version.
+    pub async fn flush_bars(&self) -> Result<()> {
+        let _flush = self.flush_gate.lock().await;
+        let snapshot = self.dirty_bars.lock().unwrap().rows.clone();
+        let mut groups = BTreeMap::<&'static str, Vec<(i64, [f64; 5], i64)>>::new();
+        for ((symbol, sec, _), row) in &snapshot {
+            groups
+                .entry(symbol)
+                .or_default()
+                .push((*sec, row.bar, row.keep_from));
+        }
+        for (symbol, bars) in groups {
+            self.store
+                .save_bars(symbol, &bars)
+                .await
+                .map_err(|_| "模拟行情保存失败")?;
+            let mut dirty = self.dirty_bars.lock().unwrap();
+            for (key, saved) in snapshot.iter().filter(|((s, _, _), _)| *s == symbol) {
+                if dirty
+                    .rows
+                    .get(key)
+                    .is_some_and(|current| current.version == saved.version)
+                {
+                    dirty.rows.remove(key);
+                }
+            }
+        }
+        Ok(())
+    }
+    /// Drain committed order flow without inventing a random tick, then persist all candles.
+    /// The caller stops request/runtime producers and drains Store's writer first.
+    pub async fn flush_pending(&self) -> Result<()> {
+        {
+            let mut feed = self.nstar.lock().await;
+            self.store
+                .flush_pending()
+                .await
+                .map_err(|_| "交易保存未完成")?;
+            self.reconcile_nstar(&mut feed, false).await?;
+            let _pending = self.quote_gate.lock().await;
+            let mut cache = self.cache.write().await;
+            self.publish_residual_flow(&mut feed, &mut cache)?;
+        }
+        self.flush_bars().await
+    }
+    fn require_symbol(&self, symbol: &str) -> Result<()> {
+        if self.store.is_nstar_only() && symbol != symbols::NSTAR {
+            return Err("仅支持 NSTAR".into());
+        }
+        Ok(())
+    }
+    fn require_upstream(&self) -> Result<()> {
+        if self.store.is_nstar_only() {
+            return Err("NSTAR-only 已禁用外部行情".into());
+        }
+        Ok(())
     }
     pub async fn snapshot(&self) -> BTreeMap<String, Quote> {
         self.cache.read().await.clone()
@@ -131,6 +299,8 @@ impl Market {
         Ok(self.quote(symbol).await?.price)
     }
     pub async fn quote(&self, symbol: &str) -> Result<Quote> {
+        // Enforce the deployment whitelist before even looking at a cached legacy quote.
+        self.require_symbol(symbol)?;
         let start = now_ms();
         let hit = self.cache.read().await.get(symbol).copied();
         if let Some(q) = hit
@@ -142,7 +312,8 @@ impl Market {
             return Err(format!("行情不可用: {symbol}"));
         }
         let result = if symbol == symbols::SIM {
-            Ok(Quote::single(self.sim.lock().await.price, start))
+            let sim = self.sim.as_ref().ok_or("仅支持 NSTAR")?;
+            Ok(Quote::single(sim.lock().await.price, start))
         } else if symbol == symbols::NSTAR {
             Ok(self.nstar.lock().await.quote())
         } else if symbols::FX.contains(&symbol) {
@@ -158,14 +329,8 @@ impl Market {
         };
         match result {
             Ok(q) => {
-                let mut cache = self.cache.write().await;
-                if let Some(latest) = cache.get(symbol)
-                    && latest.at > q.at
-                {
-                    return Ok(*latest);
-                }
-                cache.insert(symbol.into(), q);
-                Ok(q)
+                self.on_market_quote(symbol, q).await?;
+                Ok(self.cache.read().await[symbol])
             }
             // Retain the last price for display; trading_prices refuses stale/closed quotes.
             Err(e) => hit.ok_or(e),
@@ -208,11 +373,14 @@ impl Market {
         Ok(prices)
     }
     async fn get(&self, url: &str) -> Result<Value> {
+        // Final REST egress guard, including direct provider/history helper calls.
+        self.require_upstream()?;
+        let client = self.client.as_ref().ok_or("外部行情客户端未启用")?;
         let biquote = url.starts_with("https://biquote.io/");
         if biquote && now_ms() < self.biquote_retry_at.load(Ordering::Relaxed) {
             return Err("行情源退避中".into());
         }
-        let response = match self.client.get(url).send().await {
+        let response = match client.get(url).send().await {
             Ok(response) => response,
             Err(_) => {
                 if biquote {
@@ -261,6 +429,7 @@ impl Market {
             .collect())
     }
     async fn yahoo_chart(&self, symbol: &str, interval: &str) -> Result<Value> {
+        self.require_upstream()?;
         let ticker = symbols::yahoo(symbol).ok_or("不支持的币种对")?;
         let (iv, range) = match interval {
             "1m" => ("1m", "3d"),
@@ -283,6 +452,7 @@ impl Market {
         )
     }
     async fn fetch_price(&self, symbol: &str) -> Result<f64> {
+        self.require_upstream()?;
         for host in [
             "data-api.binance.vision",
             "api.binance.com",
@@ -301,6 +471,7 @@ impl Market {
         Err(format!("行情不可用: {symbol}"))
     }
     pub async fn klines(&self, symbol: &str, interval: &str, limit: usize) -> Result<Value> {
+        self.require_symbol(symbol)?;
         if symbols::provider(symbol).is_none() {
             return Err("不支持的币种对".into());
         }
@@ -317,7 +488,7 @@ impl Market {
         }
         if symbol == symbols::SIM || symbol == symbols::NSTAR {
             let feed = if symbol == symbols::SIM {
-                &self.sim
+                self.sim.as_ref().ok_or("仅支持 NSTAR")?
             } else {
                 &self.nstar
             };
@@ -388,11 +559,12 @@ impl Market {
         };
         Ok(json!({"ok":true,"klines":bars}))
     }
-    /// Update the shared cache then settle every affected account, even with no browsers.
+    /// Settle every affected account before publishing a quote, even with no browsers.
     pub async fn on_quote(&self, symbol: &str, price: f64, at: i64) -> Result<bool> {
         self.on_market_quote(symbol, Quote::single(price, at)).await
     }
     pub async fn on_market_quote(&self, symbol: &str, quote: Quote) -> Result<bool> {
+        self.require_symbol(symbol)?;
         valid(quote.price)?;
         if !self.offline && symbols::FX.contains(&symbol) && quote.bid_ask.is_none() {
             return Err("FX缺少源买卖报价".into());
@@ -404,29 +576,77 @@ impl Market {
                 return Err("买卖报价无效".into());
             }
         }
-        // Keep accepted quote order and risk settlement order identical across upstream tasks.
-        let _guard = self.quote_gate.lock().await;
-        let quotes = {
-            let mut cache = self.cache.write().await;
-            if cache.get(symbol).is_some_and(|q| q.at > quote.at) {
-                return Ok(false);
-            }
-            cache.insert(symbol.into(), quote);
-            cache.clone()
-        };
-        self.check_risk(symbol, &quotes, now_ms()).await?;
+        // A failed/cancelled batch retains its original trigger price and receipt clock.
+        // Retry it before accepting another quote, rather than skipping a crossed stop.
+        let mut pending = self.quote_gate.lock().await;
+        self.settle_pending(&mut pending).await?;
+        let mut cache = self.cache.write().await;
+        if cache.get(symbol).is_some_and(|q| q.at > quote.at) {
+            return Ok(false);
+        }
+        self.stage_quote(&mut pending, &cache, symbol, quote);
+        self.settle_with_cache(&mut pending, &mut cache).await?;
         Ok(true)
     }
-    async fn check_risk(
+    fn stage_quote(
         &self,
+        pending: &mut Option<PendingQuote>,
+        cache: &BTreeMap<String, Quote>,
+        symbol: &str,
+        quote: Quote,
+    ) {
+        let mut quotes = cache.clone();
+        quotes.insert(symbol.into(), quote);
+        *pending = Some(PendingQuote {
+            symbol: symbol.into(),
+            quotes,
+            now: now_ms(),
+            risk: None,
+        });
+    }
+    async fn settle_pending(&self, pending: &mut Option<PendingQuote>) -> Result<()> {
+        if pending.is_some() {
+            let mut cache = self.cache.write().await;
+            self.settle_with_cache(pending, &mut cache).await?;
+        }
+        Ok(())
+    }
+    async fn settle_with_cache(
+        &self,
+        pending: &mut Option<PendingQuote>,
+        cache: &mut BTreeMap<String, Quote>,
+    ) -> Result<()> {
+        if let Some(quote) = pending.as_mut() {
+            if quote.risk.is_none() {
+                let store = self.store.clone();
+                let symbol = quote.symbol.clone();
+                let quotes = quote.quotes.clone();
+                let now = quote.now;
+                let offline = self.offline;
+                quote.risk = Some(tokio::spawn(async move {
+                    Self::check_risk(&store, offline, &symbol, &quotes, now).await
+                }));
+            }
+            let result = quote.risk.as_mut().unwrap().await;
+            quote.risk = None;
+            result.map_err(|_| "风险批处理任务失败，报价保留待重试")??;
+            // No await between confirmed commit, cache publication and clearing the retry.
+            *cache = pending.take().unwrap().quotes;
+            self.revision.fetch_add(1, Ordering::Release);
+        }
+        Ok(())
+    }
+    async fn check_risk(
+        store: &Store,
+        offline: bool,
         symbol: &str,
         quotes: &BTreeMap<String, Quote>,
         now: i64,
     ) -> Result<()> {
-        let users = self.store.users().await.map_err(|_| "风险账户读取失败")?;
+        let names = store.risk_user_names(symbol);
         let mut live = Prices::new();
         for (s, q) in quotes.iter().filter(|(_, q)| q.fresh(now)) {
-            if !self.offline && symbols::FX.contains(&s.as_str()) && q.bid_ask.is_none() {
+            if !offline && symbols::FX.contains(&s.as_str()) && q.bid_ask.is_none() {
                 continue;
             }
             live.insert(s.clone(), q.price);
@@ -440,75 +660,85 @@ impl Market {
                 live.bid_ask.insert(s.clone(), book);
             }
         }
-        for user in users {
-            let acc = &user.account;
-            if acc.positions.is_empty() && acc.orders.is_empty() {
-                continue;
-            }
-            let needed = match trading::price_symbols(acc.symbols()) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            if !needed.contains(symbol) && !acc.orders.iter().any(|o| o.symbol == symbol) {
-                continue;
-            }
-            if needed.iter().any(|s| !live.contains_key(s)) {
-                continue;
-            }
-            // Re-load current holdings under Store's mutation lock; stale account snapshots
-            // cannot double-settle. Fills move `live` so the next account sees the moved book.
-            let mut moved = None;
-            let result = self
-                .store
-                .transaction(&user.name, |a, _, id| {
-                    let mut trades = a.check_triggers(&live, now)?;
-                    let mut after = live.clone();
-                    for t in &trades {
-                        trading::apply_fill(&mut after, t)?;
+        store
+            .transaction_batch(&names, |_, account, _, id| {
+                if account.positions.is_empty() && account.orders.is_empty() {
+                    return Ok(vec![]);
+                }
+                let Ok(needed) = trading::price_symbols(account.symbols()) else {
+                    return Ok(vec![]);
+                };
+                if (!needed.contains(symbol) && !account.orders.iter().any(|o| o.symbol == symbol))
+                    || needed.iter().any(|s| !live.contains_key(s))
+                {
+                    return Ok(vec![]);
+                }
+                // Invalid operations may mutate before failing. Neither their account candidate
+                // nor their tentative fills may leak into the next account of this batch.
+                let mut candidate = account.clone();
+                let mut after = live.clone();
+                let result: Result<Vec<trading::Trade>> = (|| {
+                    let mut trades = candidate.check_triggers(&after, now)?;
+                    for trade in &trades {
+                        trading::apply_fill(&mut after, trade)?;
                     }
-                    let fills = a.check_orders(&after, id, now)?;
-                    for t in &fills {
-                        trading::apply_fill(&mut after, t)?;
+                    let fills = candidate.check_orders(&after, id, now)?;
+                    for trade in &fills {
+                        trading::apply_fill(&mut after, trade)?;
                     }
                     trades.extend(fills);
-                    // Liquidations look at the smoothed mark, never at a momentary spike.
-                    let stops = a.check_stopout_at(&after.marked(), &after, now)?;
-                    for t in &stops {
-                        trading::apply_fill(&mut after, t)?;
+                    // Keep liquidation pricing on the smoothed mark and executions on live AMM.
+                    let stops = candidate.check_stopout_at(&after.marked(), &after, now)?;
+                    for trade in &stops {
+                        trading::apply_fill(&mut after, trade)?;
                     }
                     trades.extend(stops);
-                    moved = Some(after);
+                    candidate.validate()?;
                     Ok(trades)
-                })
-                .await;
-            match result {
-                Ok(()) => {
-                    if let Some(after) = moved {
+                })();
+                match result {
+                    Ok(trades) => {
+                        *account = candidate;
                         live = after;
+                        Ok(trades)
                     }
+                    Err(_) => Ok(vec![]),
                 }
-                Err(crate::storage::Error::Invalid(_)) => {}
-                Err(_) => return Err("强平保存失败，账户未改动".into()),
-            }
-        }
-        Ok(())
+            })
+            .await
+            .map_err(|_| "强平保存失败，报价保留待重试".into())
     }
     pub async fn record_sim(&self, price: f64, now: i64) -> Result<Value> {
-        let mut sim = self.sim.lock().await;
-        let mut next = sim.clone();
-        next.record(valid(price)?, now);
-        self.store
-            .save_bars(symbols::SIM, &next.pending())
-            .await
-            .map_err(|_| "模拟行情保存失败")?;
-        let packet = next.packet();
-        *sim = next;
-        drop(sim);
-        self.on_quote(symbols::SIM, price, now).await?;
+        self.require_symbol(symbols::SIM)?;
+        let price = valid(price)?;
+        let packet = {
+            let mut sim = self.sim.as_ref().ok_or("仅支持 NSTAR")?.lock().await;
+            let mut pending = self.quote_gate.lock().await;
+            self.settle_pending(&mut pending).await?;
+            let mut cache = self.cache.write().await;
+            let mut next = sim.clone();
+            next.record(price, now);
+            self.dirty_bars
+                .lock()
+                .unwrap()
+                .merge(next.symbol, &next.pending())?;
+            let packet = next.packet();
+            let quote = next.quote();
+            *sim = next;
+            self.stage_quote(&mut pending, &cache, symbols::SIM, quote);
+            self.settle_with_cache(&mut pending, &mut cache).await?;
+            packet
+        };
+        // Explicit record_sim retains its historical immediate-persistence contract.
+        self.flush_bars().await?;
         Ok(packet)
     }
     pub async fn tick_sim(&self) -> Result<Value> {
-        Ok(self.tick_feed(&self.sim).await?.0)
+        self.require_symbol(symbols::SIM)?;
+        Ok(self
+            .tick_feed(self.sim.as_ref().ok_or("仅支持 NSTAR")?)
+            .await?
+            .0)
     }
     /// One NSTAR tick: the packet, plus market events (rumors, news, whales) for everyone.
     pub async fn tick_nstar(&self) -> Result<(Value, Vec<Value>)> {
@@ -516,27 +746,31 @@ impl Market {
     }
     async fn tick_feed(&self, feed: &Mutex<SimFeed>) -> Result<(Value, Vec<Value>)> {
         let mut sim = feed.lock().await;
+        let mut pending = self.quote_gate.lock().await;
+        self.settle_pending(&mut pending).await?;
+        let mut cache = self.cache.write().await;
         let mut next = sim.clone();
-        if next.symbol == symbols::NSTAR {
-            // Liquidations and resets settled outside the desk land on the next tick.
-            let (player, forced) = self.store.take_nstar_flow();
-            next.flow(player, forced);
+        let lease = (next.symbol == symbols::NSTAR).then(|| FlowLease::take(&self.store));
+        if let Some(lease) = &lease {
+            lease.apply(&mut next);
         }
         let price = next.next_price();
-        let symbol = next.symbol;
-        let now = now_ms();
-        next.record(price, now);
-        self.store
-            .save_bars(symbol, &next.pending())
-            .await
-            .map_err(|_| "模拟行情保存失败")?;
-        let events = std::mem::take(&mut next.book.events);
-        let packet = next.packet();
+        next.record(price, now_ms());
+        // This bounded merge can fail; the RAII lease then restores the discarded flow.
+        self.dirty_bars
+            .lock()
+            .unwrap()
+            .merge(next.symbol, &next.pending())?;
         let quote = next.quote();
         *sim = next;
-        drop(sim);
-        self.on_market_quote(symbol, quote).await?;
-        Ok((packet, events))
+        if let Some(lease) = lease {
+            lease.commit();
+        }
+        // No cancellation point between consuming flow, assigning feed and staging recovery.
+        self.stage_quote(&mut pending, &cache, sim.symbol, quote);
+        self.settle_with_cache(&mut pending, &mut cache).await?;
+        let events = std::mem::take(&mut sim.book.events);
+        Ok((sim.packet(), events))
     }
     /// Current hourly funding rate per book symbol.
     pub async fn funding_rates(&self) -> BTreeMap<String, f64> {
@@ -552,20 +786,120 @@ impl Market {
     /// Lock the NSTAR book for one account operation. Orders are priced and applied one at a
     /// time, so splitting an order across requests cannot reuse a mid it already moved.
     pub async fn nstar_desk(&self) -> NstarDesk<'_> {
+        let mut feed = self.nstar.lock().await;
+        // A cancelled request may already have delegated its transaction to Store's writer.
+        // Wait for that publication before allowing the next request to reuse the AMM mid.
+        let error = match self.store.flush_pending().await {
+            Ok(()) => self.reconcile_nstar(&mut feed, false).await.err(),
+            Err(_) => Some("交易保存未完成，暂不可报价".into()),
+        };
         NstarDesk {
             market: self,
-            feed: self.nstar.lock().await,
+            feed,
+            error,
         }
+    }
+    fn apply_committed_flow(&self, feed: &mut SimFeed) -> Result<bool> {
+        let lease = FlowLease::take(&self.store);
+        if lease.flow == Some((0.0, 0.0)) {
+            lease.commit();
+            return Ok(false);
+        }
+        let mut next = feed.clone();
+        lease.apply(&mut next);
+        // Reserve room before moving the authoritative book. Do not print a provisional
+        // wick: resting liquidity must still get its original rounds to answer the flow.
+        let mut printed = next.clone();
+        printed.record(printed.book.published(), now_ms());
+        self.dirty_bars
+            .lock()
+            .unwrap()
+            .check_capacity(next.symbol, &printed.pending())?;
+        next.unprinted_flow = true;
+        *feed = next;
+        lease.commit();
+        Ok(true)
+    }
+    // A bounded matching pass can itself finish with one more committed fill. Absorb it
+    // before releasing the desk: the next order must never reuse an already moved AMM mid.
+    // This publishes existing trades only; it does not introduce extra matching rounds.
+    fn publish_residual_flow(
+        &self,
+        feed: &mut SimFeed,
+        cache: &mut BTreeMap<String, Quote>,
+    ) -> Result<()> {
+        if self.apply_committed_flow(feed)? || feed.unprinted_flow {
+            let mut next = feed.clone();
+            next.record(next.book.published(), now_ms());
+            self.dirty_bars
+                .lock()
+                .unwrap()
+                .merge(next.symbol, &next.pending())?;
+            next.unprinted_flow = false;
+            *feed = next;
+            cache.insert(symbols::NSTAR.into(), feed.quote());
+            self.revision.fetch_add(1, Ordering::Release);
+        }
+        Ok(())
+    }
+    async fn reconcile_nstar(&self, feed: &mut SimFeed, match_orders: bool) -> Result<()> {
+        let mut pending = self.quote_gate.lock().await;
+        self.settle_pending(&mut pending).await?;
+        let mut cache = self.cache.write().await;
+        let moved = self.apply_committed_flow(feed)?;
+        if !moved && !feed.unprinted_flow && !match_orders {
+            // Initial/offline state still needs an authoritative quote with mark + anchor.
+            if !cache.contains_key(symbols::NSTAR) {
+                self.stage_quote(&mut pending, &cache, symbols::NSTAR, feed.quote());
+                self.settle_with_cache(&mut pending, &mut cache).await?;
+                self.publish_residual_flow(feed, &mut cache)?;
+            }
+            return Ok(());
+        }
+        self.stage_quote(
+            &mut pending,
+            &cache,
+            symbols::NSTAR,
+            feed.live_quote(now_ms()),
+        );
+        // Preserve the original four matching rounds and post-round final risk check.
+        for _ in 0..MATCH_ROUNDS {
+            self.settle_with_cache(&mut pending, &mut cache).await?;
+            if !self.apply_committed_flow(feed)? {
+                break;
+            }
+            self.stage_quote(
+                &mut pending,
+                &cache,
+                symbols::NSTAR,
+                feed.live_quote(now_ms()),
+            );
+        }
+        let mut next = feed.clone();
+        next.record(next.book.published(), now_ms());
+        self.dirty_bars
+            .lock()
+            .unwrap()
+            .merge(next.symbol, &next.pending())?;
+        next.unprinted_flow = false;
+        *feed = next;
+        self.stage_quote(&mut pending, &cache, symbols::NSTAR, feed.quote());
+        self.settle_with_cache(&mut pending, &mut cache).await?;
+        self.publish_residual_flow(feed, &mut cache)
     }
 }
 
 pub struct NstarDesk<'a> {
     market: &'a Market,
     feed: tokio::sync::MutexGuard<'a, SimFeed>,
+    error: Option<String>,
 }
 impl NstarDesk<'_> {
     /// Price NSTAR from the live book: unrounded mid plus the AMM anchor fills are priced on.
     pub fn price(&self, prices: &mut Prices) -> Result<()> {
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
         prices.insert(symbols::NSTAR.into(), self.feed.book.log.exp());
         prices
             .anchor
@@ -577,38 +911,17 @@ impl NstarDesk<'_> {
     }
     /// Move the book by the committed flow and publish the new price before unlocking.
     pub async fn commit(self) -> Result<(Value, Vec<Value>)> {
-        let Self { market, mut feed } = self;
-        let (player, forced) = market.store.take_nstar_flow();
-        feed.flow(player, forced);
-        // Resting limit/stop orders answer the moved book before anything is printed, so a
-        // push that resting liquidity absorbs never shows up as a wick on the chart.
-        for _ in 0..MATCH_ROUNDS {
-            market
-                .on_market_quote(symbols::NSTAR, feed.live_quote(now_ms()))
-                .await?;
-            let (player, forced) = market.store.take_nstar_flow();
-            if player == 0.0 && forced == 0.0 {
-                break;
-            }
-            feed.flow(player, forced);
+        let Self {
+            market,
+            mut feed,
+            error,
+        } = self;
+        if let Some(error) = error {
+            return Err(error);
         }
-        let price = feed.book.published();
-        feed.record(price, now_ms());
-        if market
-            .store
-            .save_bars(feed.symbol, &feed.pending())
-            .await
-            .is_err()
-        {
-            // The book already moved in memory; the next tick persists the candle.
-            eprintln!("[nstar] order candle persistence failed; will retry on tick");
-        }
+        market.reconcile_nstar(&mut feed, true).await?;
         let events = std::mem::take(&mut feed.book.events);
-        let packet = feed.packet();
-        let quote = feed.quote();
-        drop(feed);
-        market.on_market_quote(symbols::NSTAR, quote).await?;
-        Ok((packet, events))
+        Ok((feed.packet(), events))
     }
 }
 
@@ -746,6 +1059,8 @@ struct SimFeed {
     rolled: std::collections::BTreeSet<i64>,
     stats_at: i64,
     sent_print: f64,
+    // Committed flow applied to the book but not yet printed after resting-order matching.
+    unprinted_flow: bool,
 }
 impl SimFeed {
     fn new(symbol: &'static str, base: f64, now: i64) -> Self {
@@ -777,6 +1092,7 @@ impl SimFeed {
             rolled: Default::default(),
             stats_at: 0,
             sent_print: 0.0,
+            unprinted_flow: false,
         }
     }
     async fn load(store: &Store, symbol: &'static str, base: f64, now: i64) -> Result<Self> {
@@ -832,7 +1148,14 @@ impl SimFeed {
     fn pending(&self) -> Vec<(i64, [f64; 5], i64)> {
         self.bars
             .iter()
-            .map(|(sec, bars)| (*sec, *bars.back().unwrap(), bars.front().unwrap()[0] as i64))
+            .flat_map(|(sec, bars)| {
+                // Include the complete newly closed candle, not merely the next opening tick.
+                // Its last correction may race a flush snapshot taken before this rollover.
+                let count = if self.rolled.contains(sec) { 2 } else { 1 };
+                bars.iter()
+                    .skip(bars.len().saturating_sub(count))
+                    .map(move |bar| (*sec, *bar, bars.front().unwrap()[0] as i64))
+            })
             .collect()
     }
     fn klines(&self, sec: i64, limit: usize) -> Vec<[f64; 5]> {
@@ -891,7 +1214,15 @@ impl SimFeed {
         let low = hours.iter().map(|b| b[3]).fold(self.price, f64::min);
         let volume: f64 = self.book.volume.iter().map(|(_, v)| v).sum();
         let tape: Vec<_> = self.book.tape.iter().rev().take(30).collect();
+        let today = (self.updated_at / 1000).div_euclid(86_400) * 86_400;
+        let prev_close = self.bars[&86_400]
+            .iter()
+            .rev()
+            .find(|bar| bar[0] < today as f64)
+            .map(|bar| bar[4])
+            .filter(|price| price.is_finite() && *price > 0.0);
         json!({
+            "prev_close": prev_close,
             "open_24h": open, "high_24h": high, "low_24h": low,
             "volume_24h": volume, "turnover_24h": volume * self.price,
             "fair": self.book.fair.exp(), "funding_rate": self.book.funding_rate(),

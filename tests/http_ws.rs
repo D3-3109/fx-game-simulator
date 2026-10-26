@@ -31,8 +31,19 @@ impl Harness {
         Self::limited(Limits::unlimited()).await
     }
     async fn limited(limits: Limits) -> Self {
+        Self::configured(limits, false).await
+    }
+    async fn nstar_only() -> Self {
+        Self::configured(Limits::unlimited(), true).await
+    }
+    async fn configured(limits: Limits, nstar_only: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::open(&dir.path().join("test.db")).await.unwrap());
+        let path = dir.path().join("test.db");
+        let store = Arc::new(if nstar_only {
+            Store::open(&path).await.unwrap()
+        } else {
+            Store::open_legacy(&path).await.unwrap()
+        });
         let key = dir.path().join("admin.json");
         let mut hash = [0u8; 32];
         pbkdf2::pbkdf2_hmac::<sha2::Sha256>(b"test-key", &[0xab; 16], 200000, &mut hash);
@@ -56,6 +67,9 @@ impl Harness {
             .await
             .unwrap(),
         );
+        if nstar_only {
+            market.tick_nstar().await.unwrap();
+        }
         Self::with(store, market, key, limits, dir).await
     }
     async fn with(
@@ -141,6 +155,146 @@ impl Harness {
         pool.close().await;
     }
 }
+#[tokio::test]
+async fn nstar_only_registration_whitelist_default_klines_and_rejections() {
+    let h = Harness::nstar_only().await;
+    let token = h.register("nstar-default").await;
+    let admin = h.admin().await;
+    let (status, state) = h.request("/api/state", None, &token).await;
+    assert_eq!(status, 200, "{state}");
+    assert_eq!(state["symbol"], "NSTAR");
+    assert_eq!(
+        h.app.store.user("nstar-default").await.unwrap().symbol,
+        "NSTAR"
+    );
+    assert_eq!(state["quote_valid"], true);
+    for (path, auth) in [("/api/symbols", ""), ("/api/admin/symbols", admin.as_str())] {
+        let (status, value) = h.request(path, None, auth).await;
+        assert_eq!(status, 200, "{value}");
+        let rows = value["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{value}");
+        assert_eq!(rows[0]["symbol"], "NSTAR");
+        assert_eq!(rows[0]["enabled"], true);
+    }
+    let (status, default) = h.request("/api/klines", None, "").await;
+    assert_eq!(status, 200, "{default}");
+    assert!(!default["klines"].as_array().unwrap().is_empty());
+    assert_eq!(
+        default,
+        h.request("/api/klines?symbol=NSTAR", None, "").await.1
+    );
+    assert_eq!(
+        h.request("/api/klines?symbol=nstar&interval=1s", None, "")
+            .await
+            .0,
+        200
+    );
+    for symbol in fx_sim_rust::symbols::all()
+        .into_iter()
+        .filter(|s| *s != "NSTAR")
+        .chain(["UNKNOWN"])
+    {
+        for (path, body, auth) in [
+            (
+                "/api/symbol".to_owned(),
+                Some(json!({"symbol":symbol})),
+                token.as_str(),
+            ),
+            (format!("/api/klines?symbol={symbol}"), None, ""),
+            (
+                "/api/admin/symbols".to_owned(),
+                Some(json!({"symbol":symbol,"enabled":true})),
+                admin.as_str(),
+            ),
+        ] {
+            let (status, value) = h.request(&path, body, auth).await;
+            assert_eq!(status, 400, "{path} {symbol}: {value}");
+            assert_eq!(value["ok"], false);
+        }
+    }
+    for (path, body) in [
+        (
+            "/api/trade",
+            json!({"symbol":"BTCUSDT","side":"buy","lots":1}),
+        ),
+        (
+            "/api/order",
+            json!({"symbol":"USDJPY","side":"buy","kind":"limit","lots":1,"price":1}),
+        ),
+        (
+            "/api/spot",
+            json!({"symbol":"FXSIM","side":"buy","units":1}),
+        ),
+    ] {
+        assert_eq!(h.request(path, Some(body), &token).await.0, 400);
+    }
+    let (_, after) = h.request("/api/state", None, &token).await;
+    assert_eq!(after["symbol"], "NSTAR");
+    assert_eq!(after["balance"], state["balance"]);
+    assert_eq!(after["positions"], json!([]));
+    assert_eq!(after["spot"], json!([]));
+    assert_eq!(after["orders"], json!([]));
+    assert_eq!(
+        h.request("/api/history", None, &token).await.1["rows"],
+        json!([])
+    );
+    assert_eq!(h.app.market.snapshot().await.len(), 1);
+    assert!(h.app.risk_symbols().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn nstar_only_spot_perpetual_and_websocket_are_tradeable_by_default() {
+    let h = Harness::nstar_only().await;
+    let token = h.register("nstar-trader").await;
+    let mut socket = h.ws(&token).await;
+    assert_eq!(packet(&mut socket, "state").await["symbol"], "NSTAR");
+    let (status, buy) = h
+        .request("/api/spot", Some(json!({"side":"buy","units":5})), &token)
+        .await;
+    assert_eq!(status, 200, "{buy}");
+    assert_eq!(buy["state"]["spot"][0]["sym"], "NSTAR");
+    near(&buy["state"]["spot"][0]["units"], 5.0);
+    // No symbol selection is needed before opening perpetual positions.
+    let (status, opened) = h
+        .request(
+            "/api/trade",
+            Some(json!({"side":"buy","lots":1000})),
+            &token,
+        )
+        .await;
+    assert_eq!(status, 200, "{opened}");
+    assert_eq!(opened["state"]["positions"][0]["sym"], "NSTAR");
+    assert_eq!(opened["state"]["positions"][0]["side"], "long");
+    let (status, closed) = h.request("/api/close", Some(json!({})), &token).await;
+    assert_eq!(status, 200, "{closed}");
+    assert_eq!(closed["state"]["positions"], json!([]));
+    let (status, sold) = h
+        .request("/api/spot", Some(json!({"side":"sell","units":5})), &token)
+        .await;
+    assert_eq!(status, 200, "{sold}");
+    assert_eq!(sold["state"]["spot"], json!([]));
+    let history = h.request("/api/history", None, &token).await.1;
+    let rows = history["rows"].as_array().unwrap();
+    assert!(rows.iter().all(|r| r["symbol"] == "NSTAR"));
+    for kind in ["spot", "open", "close"] {
+        assert!(rows.iter().any(|r| r["kind"] == kind), "{history}");
+    }
+    let tick = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Message::Text(text) = socket.next().await.unwrap().unwrap() {
+                let value: Value = serde_json::from_str(&text).unwrap();
+                if value.get("type").is_none() && value["sym"] == "NSTAR" {
+                    break value;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(tick["price"].as_f64().unwrap() > 0.0);
+    socket.close(None).await.unwrap();
+}
+
 #[tokio::test]
 async fn fx_source_sides_match_state_fills_marks_closes_and_closed_market_rejection() {
     let h = Harness::new().await;
@@ -1206,4 +1360,218 @@ async fn nstar_spot_wallet_tpsl_and_public_market_panel() {
     assert_eq!(status, 200, "{v}");
     let p = &h.request("/api/state", None, &token).await.1["positions"][0];
     assert!((p["tp"].as_f64().unwrap() - mid * 1.5).abs() < 1e-6);
+}
+
+#[tokio::test]
+async fn leaderboard_cold_and_warm_http_are_read_only_top50_self_and_bounded_pages() {
+    let mut h = Harness::new().await;
+    h.tasks.shutdown().await;
+    for index in 0..125 {
+        h.app
+            .store
+            .register(&format!("rank{index:03}"), "pw")
+            .await
+            .unwrap();
+    }
+    let token = h.app.store.login("rank124", "pw").await.unwrap();
+    h.sql("CREATE TRIGGER no_equity_insert BEFORE INSERT ON equity_samples BEGIN SELECT RAISE(ABORT,'GET must not sample'); END;
+        CREATE TRIGGER no_equity_update BEFORE UPDATE ON equity_samples BEGIN SELECT RAISE(ABORT,'GET must not sample'); END;
+        CREATE TRIGGER no_equity_delete BEFORE DELETE ON equity_samples BEGIN SELECT RAISE(ABORT,'GET must not prune'); END;").await;
+    let before = h.app.store.persistence_stats();
+    let responses = futures_util::future::join_all(
+        (0..16).map(|_| h.request("/api/leaderboard", None, &token)),
+    )
+    .await;
+    let first = &responses[0].1;
+    for (status, value) in &responses {
+        assert_eq!(*status, 200, "{value}");
+        assert_eq!(value, first, "cold concurrent readers share one snapshot");
+    }
+    assert_eq!(first["rows"].as_array().unwrap().len(), 50);
+    assert_eq!(first["total"], 125);
+    assert_eq!(first["me"]["name"], "rank124");
+    assert_eq!(first["me"]["rank"], 125);
+    assert_eq!(first["rows"][0]["rank"], 1);
+    assert!(first["as_of"].as_i64().unwrap() > 0);
+    let public = h.request("/api/leaderboard", None, "").await.1;
+    assert!(public["me"].is_null());
+    let page = h
+        .request("/api/leaderboard?offset=10&limit=999999", None, &token)
+        .await
+        .1;
+    assert_eq!(page["rows"].as_array().unwrap().len(), 100);
+    assert_eq!(page["rows"][0]["rank"], 11);
+    assert_eq!(page["as_of"], first["as_of"]);
+    assert_eq!(
+        h.request("/api/leaderboard?offset=999&limit=100", None, "")
+            .await
+            .1["rows"],
+        json!([])
+    );
+    for query in ["?offset=-1", "?limit=nope"] {
+        assert_eq!(
+            h.request(&format!("/api/leaderboard{query}"), None, "")
+                .await
+                .0,
+            400
+        );
+    }
+    assert_eq!(
+        h.app.store.persistence_stats()["commits"],
+        before["commits"]
+    );
+    // Warm GETs do not recalculate after account changes; only the producer refreshes.
+    h.app
+        .store
+        .transaction("rank124", |a, _, _| {
+            a.balance = 20000.0;
+            Ok(vec![])
+        })
+        .await
+        .unwrap();
+    assert_eq!(h.request("/api/leaderboard", None, &token).await.1, *first);
+    let refresh = h.app.refresh_leaderboard().await.unwrap();
+    assert_eq!(refresh["rows"][0]["name"], "rank124");
+    assert!(refresh["rows"][0]["ret_5m"].is_null());
+    let pool = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        h.dir.path().join("test.db").display()
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM equity_samples")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    pool.close().await;
+    // Exactly the explicit test transaction may write; display work never adds commits.
+    let after = h.app.store.persistence_stats();
+    assert_eq!(after["failures"], before["failures"]);
+}
+
+async fn view(ws: &mut Ws, visible: bool, leaderboard: bool, interval: &str, low_power: bool) {
+    ws.send(Message::Text(
+        json!({"type":"view","visible":visible,"leaderboard":leaderboard,
+        "interval":interval,"low_power":low_power})
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    ws.send(Message::Ping(vec![9, 8, 7].into())).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(Ok(Message::Pong(bytes))) = ws.next().await
+                && bytes.as_ref() == [9, 8, 7]
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+async fn quote_packet(ws: &mut Ws) -> Value {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(Ok(Message::Text(text))) = ws.next().await {
+                let value: Value = serde_json::from_str(&text).unwrap();
+                if value.get("type").is_none() && value.get("sym").is_some() {
+                    return value;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn websocket_hidden_restore_interval_low_power_and_auth_survive_quote_flood() {
+    let mut h = Harness::new().await;
+    h.tasks.shutdown().await;
+    let token = h.register("viewer").await;
+    let mut ws = h.ws(&token).await;
+    packet(&mut ws, "state").await;
+    view(&mut ws, false, true, "1m", false).await;
+    for price in 1..=2000 {
+        h.app.broadcast(
+            json!({"sym":"USDJPY","price":price,"klines":{"1m":[[1,2,3,4,5]],"5m":[[6,7,8,9,10]]}}),
+        );
+    }
+    h.app.refresh_leaderboard().await.unwrap();
+    // No market or leaderboard packets while hidden, even after overflowing the old ring.
+    let quiet = tokio::time::sleep(Duration::from_millis(350));
+    tokio::pin!(quiet);
+    loop {
+        tokio::select! {
+            _ = &mut quiet => break,
+            message = ws.next() => {
+                if let Some(Ok(Message::Text(text))) = message {
+                    let value: Value = serde_json::from_str(&text).unwrap();
+                    assert!(value.get("sym").is_none() && value["type"] != "lb", "hidden display: {value}");
+                }
+            }
+        }
+    }
+    h.app.broadcast(json!({"type":"symbols","rows":[]}));
+    assert_eq!(packet(&mut ws, "symbols").await["rows"], json!([]));
+    h.app
+        .store
+        .transaction("viewer", |a, _, _| {
+            a.balance += 100.0;
+            Ok(vec![])
+        })
+        .await
+        .unwrap();
+    assert_eq!(packet(&mut ws, "state").await["balance"], 10100.0);
+    view(&mut ws, true, true, "1m", true).await;
+    let tick = quote_packet(&mut ws).await;
+    assert_eq!(tick["price"], 2000);
+    assert_eq!(tick["klines"].as_object().unwrap().len(), 1);
+    assert!(tick["klines"]["1m"].is_array());
+    for price in 2001..=2200 {
+        h.app.broadcast(json!({"sym":"USDJPY","price":price}));
+    }
+    let start = tokio::time::Instant::now();
+    let tick = quote_packet(&mut ws).await;
+    assert_eq!(
+        tick["price"], 2200,
+        "latest quote wins instead of FIFO backlog"
+    );
+    assert!(
+        start.elapsed() >= Duration::from_millis(650),
+        "low power must limit quotes to 1Hz"
+    );
+    view(&mut ws, false, false, "1m", true).await;
+    // Deliberately omit App::deleted: periodic authentication is the independent safeguard.
+    h.app
+        .store
+        .delete("viewer", "viewer", now_ms())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn performance_endpoint_is_admin_only() {
+    let h = Harness::new().await;
+    assert_eq!(h.request("/api/admin/performance", None, "").await.0, 401);
+    let admin = h.admin().await;
+    let (status, value) = h.request("/api/admin/performance", None, &admin).await;
+    assert_eq!(status, 200);
+    assert!(value["persistence"].is_object());
+    assert!(value["pending_bars"].is_u64());
 }

@@ -5,7 +5,7 @@ use std::{path::PathBuf, sync::Arc};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
     let dir = PathBuf::from(args.get(1).ok_or("temporary fixture directory required")?);
-    let store = Arc::new(Store::open(&dir.join("fixture.db")).await?);
+    let store = Arc::new(Store::open_legacy(&dir.join("fixture.db")).await?);
     let prices = [
         ("USDJPY".into(), 150.0),
         ("EURJPY".into(), 165.0),
@@ -26,7 +26,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _tasks = runtime::start(app.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     println!("http://{}", listener.local_addr()?);
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("static");
+    let root = fx_sim_rust::web::validate_static(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("static"),
+    )
+    .await?;
     axum::serve(
         listener,
         api::router(app, root).into_make_service_with_connect_info::<std::net::SocketAddr>(),

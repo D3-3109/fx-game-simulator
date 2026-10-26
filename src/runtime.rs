@@ -4,7 +4,9 @@
 mod tests;
 use crate::{app::App, storage::now_ms, symbols};
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use tokio::{task::JoinSet, time::sleep};
 
@@ -14,29 +16,41 @@ pub fn start(app: Arc<App>) -> JoinSet<()> {
     tasks.spawn(async move {
         loop {
             sleep(Duration::from_secs(5)).await;
-            if let Ok(mut value) = a.leaderboard().await {
-                value["type"] = json!("lb");
-                value.as_object_mut().unwrap().remove("ok");
-                a.broadcast(value);
+            match a.refresh_leaderboard().await {
+                Ok(_) => a.broadcast_leaderboard(),
+                Err(e) => eprintln!("[leaderboard] {e}; will retry"),
             }
         }
     });
     let a = app.clone();
     tasks.spawn(async move {
+        let mut clock = tokio::time::interval(Duration::from_secs(1));
+        clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            if let Ok(symbols) = a.risk_symbols().await {
-                for symbol in symbols {
-                    let _ = a.market.price(&symbol).await;
-                    if let Some(q) = a.market.snapshot().await.get(&symbol)
-                        && a.market.on_market_quote(&symbol, *q).await.is_err()
-                    {
-                        eprintln!("[risk] quote/settlement failed; will retry");
-                    }
-                }
+            clock.tick().await;
+            if let Err(e) = a.market.flush_bars().await {
+                eprintln!("[bars] {e}; dirty bars retained for retry");
             }
-            sleep(Duration::from_secs(2)).await;
         }
     });
+    if !app.store.is_nstar_only() {
+        let a = app.clone();
+        tasks.spawn(async move {
+            loop {
+                if let Ok(symbols) = a.risk_symbols().await {
+                    for symbol in symbols {
+                        let _ = a.market.price(&symbol).await;
+                        if let Some(q) = a.market.snapshot().await.get(&symbol)
+                            && a.market.on_market_quote(&symbol, *q).await.is_err()
+                        {
+                            eprintln!("[risk] quote/settlement failed; will retry");
+                        }
+                    }
+                }
+                sleep(Duration::from_secs(2)).await;
+            }
+        });
+    }
     let a = app.clone();
     tasks.spawn(async move {
         loop {
@@ -77,16 +91,6 @@ pub fn start(app: Arc<App>) -> JoinSet<()> {
         let a = app.clone();
         tasks.spawn(async move {
             loop {
-                match a.market.tick_sim().await {
-                    Ok(packet) => a.broadcast(packet),
-                    Err(_) => eprintln!("[sim] tick persistence/settlement failed; will retry"),
-                }
-                sleep(Duration::from_millis(200)).await;
-            }
-        });
-        let a = app.clone();
-        tasks.spawn(async move {
-            loop {
                 match a.market.tick_nstar().await {
                     Ok((packet, events)) => {
                         a.broadcast(packet);
@@ -97,22 +101,37 @@ pub fn start(app: Arc<App>) -> JoinSet<()> {
                 sleep(Duration::from_millis(200)).await;
             }
         });
-        let a = app.clone();
-        tasks.spawn(async move {
-            fx_loop(a).await;
-        });
-        let a = app.clone();
-        tasks.spawn(async move {
-            stock_loop(a).await;
-        });
-        tasks.spawn(async move {
-            binance_loop(app, "wss://data-stream.binance.vision").await;
-        });
+        if !app.store.is_nstar_only() {
+            let a = app.clone();
+            tasks.spawn(async move {
+                loop {
+                    match a.market.tick_sim().await {
+                        Ok(packet) => a.broadcast(packet),
+                        Err(_) => eprintln!("[sim] tick persistence/settlement failed; will retry"),
+                    }
+                    sleep(Duration::from_millis(200)).await;
+                }
+            });
+            let a = app.clone();
+            tasks.spawn(async move {
+                fx_loop(a).await;
+            });
+            let a = app.clone();
+            tasks.spawn(async move {
+                stock_loop(a).await;
+            });
+            tasks.spawn(async move {
+                binance_loop(app, "wss://data-stream.binance.vision").await;
+            });
+        }
     }
     tasks
 }
 
 async fn stock_loop(app: Arc<App>) {
+    if app.store.is_nstar_only() {
+        return;
+    }
     loop {
         let active = app.active_symbols().await.unwrap_or_default();
         for symbol in active
@@ -128,6 +147,9 @@ async fn stock_loop(app: Arc<App>) {
 }
 
 async fn fx_loop(app: Arc<App>) {
+    if app.store.is_nstar_only() {
+        return;
+    }
     let mut clock = tokio::time::interval(Duration::from_millis(500));
     clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -185,6 +207,10 @@ pub fn binance_stream(symbols: impl IntoIterator<Item = String>) -> Option<Strin
     }
 }
 async fn binance_loop(app: Arc<App>, endpoint: &str) {
+    // WebSockets bypass Market::get, so this must also guard direct invocations.
+    if app.store.is_nstar_only() {
+        return;
+    }
     loop {
         let Some(url) = binance_stream(app.active_symbols().await.unwrap_or_default()) else {
             sleep(Duration::from_secs(1)).await;

@@ -1,3 +1,6 @@
+#[path = "leaderboard.rs"]
+mod leaderboard;
+
 use crate::{
     limits::{Limiter, Limits, Net},
     market::Market,
@@ -5,6 +8,7 @@ use crate::{
     symbols, trading,
 };
 use serde_json::{Value, json};
+use std::time::{Duration, Instant};
 use std::{
     collections::{BTreeMap, VecDeque},
     path::PathBuf,
@@ -15,6 +19,23 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 use tokio::sync::broadcast;
+
+#[derive(Clone)]
+pub(crate) struct StatePacket {
+    pub value: Value,
+    pub text: Arc<str>,
+    pub key: Arc<str>,
+}
+struct StateCache {
+    revision: (u64, u64, u64),
+    expires: Instant,
+    packet: Arc<StatePacket>,
+}
+struct QuotePacket {
+    sequence: u64,
+    full: Arc<str>,
+    intervals: BTreeMap<String, Arc<str>>,
+}
 
 #[derive(Clone, Debug)]
 pub enum Event {
@@ -29,6 +50,12 @@ pub struct App {
     pub store: Arc<Store>,
     pub market: Arc<Market>,
     pub events: broadcast::Sender<Event>,
+    // Quote traffic never occupies the reliable/control subscriber's event ring.
+    controls: broadcast::Sender<Event>,
+    quotes: Mutex<BTreeMap<String, QuotePacket>>,
+    quote_seq: AtomicU64,
+    leaderboard: leaderboard::Leaderboard,
+    states: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<Option<StateCache>>>>>,
     pub admin_key: PathBuf,
     admin_sessions: Mutex<BTreeMap<String, i64>>,
     admin_attempts: Mutex<VecDeque<i64>>,
@@ -53,10 +80,16 @@ impl Drop for Presence {
 impl App {
     pub fn new(store: Arc<Store>, market: Arc<Market>, admin_key: PathBuf) -> Self {
         let (events, _) = broadcast::channel(256);
+        let (controls, _) = broadcast::channel(256);
         Self {
             store,
             market,
             events,
+            controls,
+            quotes: Mutex::new(BTreeMap::new()),
+            quote_seq: AtomicU64::new(1),
+            leaderboard: leaderboard::Leaderboard::default(),
+            states: Mutex::new(BTreeMap::new()),
             admin_key,
             admin_sessions: Mutex::new(BTreeMap::new()),
             admin_attempts: Mutex::new(VecDeque::new()),
@@ -102,14 +135,70 @@ impl App {
     pub fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
         let _ = self.events.send(Event::Shutdown);
+        let _ = self.controls.send(Event::Shutdown);
     }
     pub fn broadcast(&self, message: Value) {
-        let symbol = (message.get("type").is_none())
+        let symbol: Option<Arc<str>> = (message.get("type").is_none())
             .then(|| message["sym"].as_str().map(Arc::from))
             .flatten();
-        let _ = self
-            .events
-            .send(Event::Message(message.to_string().into(), symbol));
+        let text: Arc<str> = message.to_string().into();
+        if let Some(symbol) = &symbol {
+            let mut intervals = BTreeMap::new();
+            if let Some(bars) = message["klines"].as_object() {
+                // Serialize once per shared tick/interval, never parse or recode at each socket.
+                let mut variant = message.clone();
+                variant["klines"] = json!({});
+                for (interval, _) in symbols::INTERVALS {
+                    if let Some(rows) = bars.get(*interval) {
+                        variant["klines"] = json!({*interval:rows});
+                        intervals.insert((*interval).to_owned(), Arc::from(variant.to_string()));
+                    }
+                }
+            }
+            let mut quotes = self.quotes.lock().unwrap();
+            // Only known market symbols enter this bounded latest-value map.
+            if symbols::all().contains(&symbol.as_ref()) {
+                quotes.insert(
+                    symbol.to_string(),
+                    QuotePacket {
+                        sequence: self.quote_seq.fetch_add(1, Ordering::Relaxed),
+                        full: text.clone(),
+                        intervals,
+                    },
+                );
+            }
+        } else if message["type"] != "lb" {
+            let _ = self.controls.send(Event::Message(text.clone(), None));
+        }
+        let _ = self.events.send(Event::Message(text, symbol));
+    }
+    pub(crate) fn control_events(&self) -> broadcast::Receiver<Event> {
+        self.controls.subscribe()
+    }
+    pub(crate) fn latest_quote(
+        &self,
+        symbol: &str,
+        interval: Option<&str>,
+    ) -> Option<(u64, Arc<str>)> {
+        self.quotes.lock().unwrap().get(symbol).map(|q| {
+            (
+                q.sequence,
+                interval
+                    .and_then(|i| q.intervals.get(i))
+                    .unwrap_or(&q.full)
+                    .clone(),
+            )
+        })
+    }
+    pub(crate) fn leaderboard_packet(&self) -> Option<(u64, Arc<str>)> {
+        self.leaderboard
+            .current()
+            .map(|s| (s.generation, s.packet.clone()))
+    }
+    pub(crate) fn broadcast_leaderboard(&self) {
+        if let Some((_, text)) = self.leaderboard_packet() {
+            let _ = self.events.send(Event::Message(text, None));
+        }
     }
     pub fn connected(&self, name: &str) -> Presence {
         let id = self.connection_seq.fetch_add(1, Ordering::Relaxed);
@@ -127,7 +216,10 @@ impl App {
             .lock()
             .unwrap()
             .retain(|_, owner| owner != name);
+        self.leaderboard.remove(name);
+        self.states.lock().unwrap().remove(name);
         let _ = self.events.send(Event::Deleted(name.into()));
+        let _ = self.controls.send(Event::Deleted(name.into()));
     }
     pub fn admin_authorized(&self, token: &str, now: i64) -> bool {
         self.admin_sessions
@@ -179,6 +271,69 @@ impl App {
         Ok(token)
     }
     pub async fn state(&self, name: &str) -> Result<Value, String> {
+        Ok(self.state_packet(name).await?.value.clone())
+    }
+    pub(crate) async fn state_packet(&self, name: &str) -> Result<Arc<StatePacket>, String> {
+        let slot = {
+            let mut states = self.states.lock().unwrap();
+            if !states.contains_key(name) && states.len() >= 1024 {
+                // One version per account, bounded even under one-shot HTTP readers.
+                if let Some(oldest) = states.keys().next().cloned() {
+                    states.remove(&oldest);
+                }
+            }
+            states.entry(name.to_owned()).or_default().clone()
+        };
+        let mut cache = slot.lock().await;
+        let board = self.leaderboard.current();
+        let revision = (
+            self.store.revision(),
+            self.market.revision(),
+            board.as_ref().map_or(0, |s| s.generation),
+        );
+        if let Some(hit) = &*cache
+            && hit.revision == revision
+            && Instant::now() < hit.expires
+        {
+            return Ok(hit.packet.clone());
+        }
+        let mut value = self.compute_state(name).await?;
+        value["leaderboard_me"] = board.map(|s| s.me(name)).unwrap_or(Value::Null);
+        let mut key = value.clone();
+        if let Some(object) = key.as_object_mut() {
+            for field in [
+                "price",
+                "bid",
+                "ask",
+                "quote_at",
+                "quote_valid",
+                "nstar_price",
+            ] {
+                object.remove(field);
+            }
+        }
+        // The cache expires at the quote's freshness boundary, even without a market revision.
+        let ttl = if value["quote_valid"] == true {
+            value["quote_at"]
+                .as_i64()
+                .map(|at| (at + 30001 - storage::now_ms()).clamp(0, 500) as u64)
+                .unwrap_or(500)
+        } else {
+            500
+        };
+        let packet = Arc::new(StatePacket {
+            text: value.to_string().into(),
+            key: key.to_string().into(),
+            value,
+        });
+        *cache = Some(StateCache {
+            revision,
+            expires: Instant::now() + Duration::from_millis(ttl),
+            packet: packet.clone(),
+        });
+        Ok(packet)
+    }
+    async fn compute_state(&self, name: &str) -> Result<Value, String> {
         let user = self.store.user(name).await.map_err(|_| "账户读取失败")?;
         let prices = self
             .market
@@ -273,35 +428,25 @@ impl App {
             json!({"ok":true,"type":"state","name":name,"symbol":user.symbol,"price":prices[&user.symbol],"bid":bid,"ask":ask,"quote_valid":quote_valid,"quote_at":if self.market.is_offline(){None}else{Some(quote.at)},"balance":acc.balance,"loan":acc.loan,"debt":acc.debt(),"debt_since":acc.debt_since,"debt_limit":trading::DEBT_LIMIT,"equity":equity,"used":used,"free":equity-used,"margin_level":if used==0.0 {None} else {Some(equity/used)},"leverage":acc.leverage,"positions":positions,"spot":spot,"nstar_price":nstar,"spot_fee":trading::SPOT_FEE,"contract":trading::contract(&user.symbol),"symbol_leverage":trading::leverage_for(&user.symbol,acc.leverage),"funding_at":acc.funding_at,"stopout_level":trading::STOPOUT,"currency":"USD","last_trade":user.last_trade,"limits":limits,"mark":prices.mark.get(&user.symbol),"orders":acc.orders}),
         )
     }
+    /// Default public Top50. HTTP reads do not sample, refresh a warm cache, or write SQL.
     pub async fn leaderboard(&self) -> Result<Value, String> {
-        let totals = self
-            .store
-            .deposit_totals()
-            .await
-            .map_err(|_| "充值记录读取失败")?;
-        let online = self.online();
-        let mut rows = Vec::new();
-        for user in self.store.users().await.map_err(|_| "账户读取失败")? {
-            let Ok(prices) = self.market.prices(user.account.symbols()).await else {
-                continue;
-            };
-            let Ok(eq) = user.account.equity(&prices) else {
-                continue;
-            };
-            let deposited = totals.get(&user.name).copied().unwrap_or(0.0);
-            rows.push(json!({"name":user.name,"equity":(eq*100.0).round()/100.0,"ret":((eq/(10000.0+deposited)-1.0)*1e4).round()/1e4,"pos":user.account.positions.len(),"sym":user.symbol,"online":online.contains(&user.name)}));
-        }
-        self.store
-            .five_minute_returns(&mut rows, &totals, storage::now_ms() / 1000)
-            .await
-            .map_err(|_| "收益记录保存失败")?;
-        rows.sort_by(|a, b| {
-            b["ret"]
-                .as_f64()
-                .unwrap()
-                .total_cmp(&a["ret"].as_f64().unwrap())
-        });
-        Ok(json!({"ok":true,"rows":rows}))
+        self.leaderboard_page(None, 0, 50).await
+    }
+    pub async fn leaderboard_page(
+        &self,
+        name: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Value, String> {
+        Ok(self
+            .leaderboard
+            .get(self, false)
+            .await?
+            .page(name, offset, limit))
+    }
+    /// Background-only producer. Five-minute history is intentionally reset on restart.
+    pub async fn refresh_leaderboard(&self) -> Result<Value, String> {
+        Ok(self.leaderboard.get(self, true).await?.page(None, 0, 50))
     }
     /// Settle due hourly funding on every account holding a perpetual book position. Each
     /// account is re-read under the store lock, so a settlement is never applied twice.
@@ -344,9 +489,16 @@ impl App {
                     .filter(|s| !s.is_empty()),
             );
         }
-        Ok(out.into_iter().collect())
+        Ok(out
+            .into_iter()
+            .filter(|s| !self.store.is_nstar_only() || s == symbols::NSTAR)
+            .collect())
     }
     pub async fn risk_symbols(&self) -> Result<Vec<String>, String> {
+        // NSTAR ticks already settle risk; external conversion/position refresh is legacy-only.
+        if self.store.is_nstar_only() {
+            return Ok(Vec::new());
+        }
         let users = self.store.users().await.map_err(|_| "账户读取失败")?;
         let needed = trading::price_symbols(
             users

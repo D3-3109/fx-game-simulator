@@ -1,7 +1,45 @@
-# FX simulator — Rust Web backend
+# NSTAR simulator — Rust Web backend
 
 Axum/Tokio + SQLx SQLite。单 crate，使用同目录 `static/`，无需前端构建。
 原 Python Web/CLI/GUI 实现已在切换后删除（见 git 历史与 [ACCEPTANCE.md](ACCEPTANCE.md)）。
+
+## NSTAR-only 与旧库迁移
+
+生产入口现在只提供 **NSTAR 现货与永续**：注册默认 NSTAR、公共行情/交易接口只允许 NSTAR，不启动 FXSIM、FX、股票或 Binance 行情任务，也不为这些品种按需请求外网。NSTAR 行情、撮合、强平、资金费和债务检查保留。
+
+旧品种规格、历史成交与旧代码暂时保留。`Store::open_legacy` 仅供显式兼容测试/工具使用，生产命令没有多品种开关。容器部署本次修改需自行构建镜像；现有上游 `latest` 不包含本地未发布改动。
+
+**含非 NSTAR 选中币种、持仓或挂单的旧库会拒绝启动，不会自动删除数据。** 先停止所有访问该数据库的服务，然后执行一次性迁移（以下为仓库根目录 Linux/Git Bash 示例）：
+
+```sh
+cargo build --release --locked
+./target/release/fx-sim-rust \
+  --db "$PWD/data/fx_sim.db" \
+  --migrate-nstar-only \
+  --migration-backup "$PWD/data/before-nstar-only.db"
+```
+
+Windows 二进制名为 `fx-sim-rust.exe`。迁移不需要管理员密钥或静态目录、不监听端口，完成后输出 JSON 摘要并退出。
+
+- 备份目标必须是新文件，父目录须存在；不覆盖已有文件。SQLite `VACUUM INTO` 备份包含已提交 WAL 内容，不是简单复制主 `.db`。备份创建即限制权限：Unix 为 `0600`，Windows 使用仅当前用户与 SYSTEM 的受保护 ACL；Windows 目标卷必须支持 ACL，权限验证失败则拒绝写入备份内容。
+- 先备份并同步备份文件，再在一个事务内删除所有非 NSTAR 永续仓位、挂单和现货资产条目，将选中币种改为 NSTAR。
+- **直接删除，不按市价平仓、不结算浮盈浮亏、不退还现货成本，不改变账户现金余额、借款/债务或 NSTAR 仓位。** 保证金占用随被删仓位消失。删除的非 NSTAR 现货资产不会兑换成现金。
+- 保留账户、密码/token、历史成交、充值记录、旧K线及旧品种定义；每个修改账户写入 `nstar_migration` 管理审计。受仓位/资产删除影响的短期收益样本清空，避免制造虚假的5分钟涨跌。
+- 迁移失败会回滚账户与审计更新，保留备份；没有待迁移账户时返回零计数，不创建新备份。迁移期间必须保持停服，不能与其他写库进程并行。
+- 恢复时停服并使用备份副本和兼容的旧版本，不能把备份直接交给 NSTAR-only 生产入口而跳过迁移检查。备份含账号凭据，按生产数据库同等权限保护。
+
+## 内存热路径与持久化
+
+- 风险检查从已提交内存账户计算，完整账户/选中币种均未变化且没有成交时不执行 SQL；同一轮真实变化的多个账户与成交在一笔事务中提交。仍按原账户顺序处理价格冲击，不并行改变同一 NSTAR AMM。
+- 唯一后台写入者使用有界 admission/队列；入队后即使 HTTP 请求取消，也完成提交与缓存发布。交易成功等待提交完成，不采用未落库先确认。队列满或等待超时返回服务不可用，客户端应刷新账户/历史确认结果，不能盲目重发订单。
+- 生产 SQLite 使用 WAL + `synchronous=FULL`；显式 `open_legacy` 工具仍为 NORMAL。FULL 依赖操作系统/存储正确实现 flush，并不等同于实测断电保证；本项目仍只支持单进程写同一数据库。
+- K线按 `(symbol,周期,时间)` 在有界内存中合并完整 OHLC，每秒批量保存；失败保留待写版本重试，成功只清除已提交版本。过期清理只在窗口前进时执行。未刷新的K线在进程崩溃时可能丢失，积压超过容量会明确拒绝推进，不无限增长。
+- NSTAR 已提交订单流量在取消/失败后保留，下一次交易定价前或 tick 重试恢复；正常停机先停止生产者、排空账户写入，再恢复待处理流量并刷K线。支持 Ctrl+C，Unix 也处理 SIGTERM。强制 kill 无法走正常排空。
+- 排行榜后台每5秒生成共享快照，GET不写数据库。默认Top50，响应含 `total/as_of`，认证请求另含本人 `me`（带rank）；`offset/limit`按需分页，单页最多100。5分钟收益基线使用每账户181槽内存环形缓冲，**服务重启后需重新积累约5分钟**；旧 `equity_samples` 历史暂保留但生产不再逐轮写入。
+- WebSocket 客户端可发送 `{"type":"view","visible":true,"leaderboard":false,"interval":"1m","low_power":false}`。后台标签暂停展示行情/榜单，低耗模式降频，账户认证和控制事件仍保留。行情/账户/榜单使用最新值槽，慢客户端不会累积无限展示帧；重连需要重新同步。
+- 前端使用增量蜡烛、持仓线/盘口节点复用与可见性合并渲染，低耗设置在浏览器保存。图表库优先本地同版本资源，保留固定版本/SRI兜底。
+- 静态白名单资源首次加载后驻留内存，支持 ETag/304；**更新静态文件需与服务一起重启**。静态 gzip/Brotli 可在反向代理配置；不默认压缩每个高频 WS 帧。
+- 管理员可用已登录的管理 Bearer token 请求 `GET /api/admin/performance`，查看持久化队列/提交/无变化跳过/失败计数及待保存K线数量。计数不是物理磁盘IOPS；线上仍需结合系统磁盘指标。
 
 ## 独立启动
 
@@ -57,7 +95,7 @@ docker run -d --name fx-sim -p 8000:8000 -v "$PWD/data:/data" \
 - 首次启动从 `FX_ADMIN_PSK` 生成管理员配置（PBKDF2 20 万轮，与 `App::admin_login` 同一实现）。未设置时随机生成并**只在启动日志打印一次**，用 `docker logs fx-sim` 查看。已有 `admin-key.json` 时不覆盖，改口令须先删该文件。
 - 无参数时入口脚本自动拼出 `--listen 0.0.0.0:8000 --db /data/fx_sim.db --static-dir /app/static --admin-key /data/admin-key.json`；显式传参则原样覆盖。
 - 容器以 `fxsim`（uid 10001）运行；以 root 启动时入口脚本先把 `/data` 交付给该用户，再降权 `exec`。
-- 镜像内 `ca-certificates` 供 Binance WebSocket 校验 TLS（该连接走系统信任库、不读代理变量）；FX REST 走 `FX_PROXY`。容器内的 `127.0.0.1` 是容器自身，代理应写宿主机名，例如 `FX_PROXY=http://host.docker.internal:7890`。
+- NSTAR-only 生产运行不连接外部行情，也不需要 `FX_PROXY`；旧行情依赖及证书包暂时保留供兼容工具使用。
 - 镜像自带 `HEALTHCHECK`，探测无需鉴权的 `/api/symbols`。
 - 按 IP 限流（IPv6 按 /64）：接口每秒 200 次（突发 1000），登录每秒 5 次（突发 60），WebSocket 每 IP 最多 500 个；注册每 IP 每小时 20 个、每天 100 个，全站每小时 500 个。注册配额可用 `FX_REGISTER_PER_IP_HOUR` / `FX_REGISTER_PER_IP_DAY` / `FX_REGISTER_GLOBAL_HOUR` 调整（填 `0` 关闭该项），接口速率用 `FX_API_RATE`（每 IP 每秒次数，`0` 关闭）。放在 Caddy/nginx 后面时**必须**设置 `FX_TRUSTED_PROXY`（地址或网段，如 `172.16.0.0/12` 覆盖 Docker 默认网络），否则所有玩家共用代理那一份额度；此时不要再把 8000 端口暴露到公网。
 
@@ -78,7 +116,7 @@ cargo build --locked --example fixture_server
 
 所有测试使用临时数据库/回环临时端口/测试管理员配置，不读取真实用户数据或 Tiingo key。`fixture_server` 是测试工具，不是生产入口。
 
-外部行情 smoke test **单独**执行，不能用网络故障替代确定性回归结论：
+保留的旧多品种外部行情 smoke test 仅用于兼容验证，**不属于 NSTAR-only 生产路径，且需单独执行**，不能用网络故障替代确定性回归结论：
 
 ```sh
 cargo run --locked --example market_smoke
@@ -87,6 +125,8 @@ cargo run --locked --example market_smoke
 最新验收记录见 [ACCEPTANCE.md](ACCEPTANCE.md)。
 
 ## 兼容与边界
+
+以下 FX、股票、Binance 等说明仅描述暂时保留的 `open_legacy` 兼容路径，生产入口不启用这些行情。
 
 - NSTAR 使用多时间尺度行情：3–7 天周级方向、2–6 小时日内波段、5–36 分钟局部震荡/高波动/趋势，以及 1–3 分钟短线冲锋。周级方向会移动长期基准，不再被回归固定 100 抵消；周内仍有独立多空波段。短线冲锋同时移动公允价值和震荡中心，配合 Student-t(4) 厚尾噪声，满仓 10x 在强行情中可在 5 分钟内触及强平，但行情生成不读取玩家持仓，低杠杆面对同一走势仍有更高生存率。模型思路参考 [CKLS/OU 外汇生成器](https://github.com/kasna-cloud/dataflow-fsi-example/blob/main/app/python/src/forexgenerator/forexgenerator.py) 与 [多因子市场模拟](https://github.com/Jackson-Wozniak/Stock-Market-Simulation)，参数按本项目的游戏速度重新标定。
 - NSTAR 现货与永续共用同一弹性 AMM 价格、流动性和订单流：偏离锚价 x（对数）处流动性为 `depth·(1+x²/w²)`（`depth`=50,000，`w`=0.08），锚价约 5 分钟半衰跟随价格。同一锚价下拆单与一次扫单同价、往返回到原价。现货全款买入、不会强平；永续使用保证金、资金费与强平。玩家自愿订单立即影响盘口，且 35% 冲击转化为公允价值；强平只产生临时执行冲击，不改写公允价值。

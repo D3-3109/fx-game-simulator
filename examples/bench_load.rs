@@ -9,7 +9,7 @@ async fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(200);
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(Store::open(&dir.path().join("b.db")).await.unwrap());
+    let store = Arc::new(Store::open_legacy(&dir.path().join("b.db")).await.unwrap());
     let q = [("FXSIM".to_string(), 1.1)].into();
     for i in 0..n {
         let name = format!("u{i:04}");

@@ -1,6 +1,6 @@
 CREATE TABLE IF NOT EXISTS users (
     name TEXT PRIMARY KEY, salt TEXT, hash TEXT, token TEXT,
-    symbol TEXT DEFAULT 'USDJPY', account TEXT, created INTEGER
+    symbol TEXT DEFAULT 'NSTAR', account TEXT, created INTEGER
 );
 CREATE TABLE IF NOT EXISTS trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,

@@ -22,24 +22,63 @@ function observePrices(symbol,values){
 // Exchange-style display names; the stored symbol id stays NSTAR / FXSIM.
 const pairName=s=>s==='NSTAR'?'NSTAR/USDT':s==='FXSIM'?'FXSIM/USD':/USDT$/.test(s)?s.replace(/USDT$/,'/USDT'):s;
 const priceText=(value,symbol=cur.sym)=>Number.isFinite(value)?value.toFixed(pricePrecisions.get(symbol)??decimalPlaces(value)):'—';
-let TOKEN=localStorage.fx_token||'',ME='',cur={sym:'USDJPY',itv:'15m'};
-let chart=null,series=null,lastBar=null,priceLines=[],curPos=[],symSynced=false,lastSym=null,lastItv=null;
+let TOKEN=localStorage.fx_token||'',ME='',cur={sym:'NSTAR',itv:'15m'};
+let chart=null,series=null,lastBar=null,priceLines=new Map(),curPos=[],lastSym=null,lastItv=null;
 let levDirty=false,levSaving=false,accountLeverage=10,orderBusy=false,authBusy=false;
 let quoteSymbol='',quoteLast=null,quoteReady=false,quoteTimer=null,quoteBid=NaN,quoteAsk=NaN;
 let mode='perp',spotSide='buy',spotType='market',lastState=null,market=null,tpslId=0,lotsFor='',otype='market';
 const quoteReferences=new Map();
+/* One visual queue: network ingestion/safety stays live, DOM work waits for a visible frame. */
+let lowPower=false,frame=null,frameTimer=null,lastFrame=-Infinity;
+try{lowPower=localStorage.fx_low_power==='true'}catch(_){}
+const visuals=new Map(),flights=new Map();
+const visible=id=>!document.hidden&&!$(id)?.closest('[hidden]');
+const paneVisible=(attr,key)=>!document.hidden&&!document.querySelector(`[data-${attr}-pane="${key}"]`)?.hidden;
+function singleflight(key,work){
+ if(flights.has(key))return flights.get(key);
+ const promise=work().finally(()=>{if(flights.get(key)===promise)flights.delete(key)});
+ flights.set(key,promise);return promise;
+}
+function scheduleVisual(key,paint){visuals.set(key,paint);requestRender()}
+function requestRender(){
+ if(document.hidden||frame!==null||frameTimer!==null)return;
+ const wait=lowPower?Math.max(0,500-(Date.now()-lastFrame)):0;
+ if(wait){frameTimer=setTimeout(()=>{frameTimer=null;requestRender()},wait);return}
+ frame=requestAnimationFrame(()=>{
+  frame=null;if(document.hidden)return;lastFrame=Date.now();
+  const pending=[...visuals];visuals.clear();
+  for(const [key,paint] of pending)if(paint()===false&&!visuals.has(key))visuals.set(key,paint);
+ });
+}
+function htmlIfChanged(node,html){if(node.innerHTML!==html)node.innerHTML=html}
+const signatures=new Map();
+function changed(key,value){const signature=JSON.stringify(value);if(signatures.get(key)===signature)return false;signatures.set(key,signature);return true}
+function tableVisible(id,attr,key){return visible(id)&&paneVisible(attr,key)}
+let latestQuote=null,quoteStamp=0,quoteExpires=Infinity;
+const usableQuote=()=>quoteReady&&Date.now()<=quoteExpires;
+function acceptQuote(price,symbol,bid,ask,valid=true,at){
+ if(symbol!==cur.sym||Number.isFinite(at)&&symbol===latestQuote?.symbol&&at<quoteStamp)return;
+ quoteStamp=Number.isFinite(at)?at:0;
+ latestQuote={price,symbol,bid,ask,valid,at};
+ // Never wait for rAF to revoke an expired/invalid trading quote.
+ quoteReady=valid&&Number.isFinite(bid)&&Number.isFinite(ask)&&bid>0&&ask>=bid&&(!Number.isFinite(at)||Date.now()-at<=30000);
+ quoteBid=bid;quoteAsk=ask;quoteExpires=Number.isFinite(at)?at+30000:Infinity;
+ scheduleVisual('quote',()=>{const q=latestQuote;renderQuote(q.price,q.symbol,q.bid,q.ask,q.valid,q.at);updateLast(q.price);renderBook(q.price)});
+}
 function renderQuote(price,symbol,bid,ask,valid=true,at){
+ if(document.hidden){acceptQuote(price,symbol,bid,ask,valid,at);return}
  if(symbol!==cur.sym)return;
  const fx=symbol!=='FXSIM'&&!symbol.endsWith('USDT');
  observePrices(symbol,fx?[price,bid,ask]:[price]);
  const sideText=value=>fx||symbol in FIXED_PRECISION?priceText(value,symbol):value.toFixed(Math.max(pricePrecisions.get(symbol)??0,4));
  clearTimeout(quoteTimer);
  quoteReady=valid&&Number.isFinite(bid)&&Number.isFinite(ask)&&bid>0&&ask>=bid&&(!Number.isFinite(at)||Date.now()-at<=30000);
- quoteBid=bid;quoteAsk=ask;
+ quoteBid=bid;quoteAsk=ask;quoteExpires=Number.isFinite(at)?at+30000:Infinity;
  $('buy-price').textContent=quoteReady?sideText(ask):'—';
  $('sell-price').textContent=quoteReady?sideText(bid):'—';
  if(quoteReady&&Number.isFinite(at))quoteTimer=setTimeout(()=>{
-  quoteReady=false;$('buy-price').textContent=$('sell-price').textContent='—';syncOrderControls();
+  quoteReady=false;
+  scheduleVisual('quote-expiry',()=>{if(!quoteReady){$('buy-price').textContent=$('sell-price').textContent='—';syncOrderControls()}});
  },Math.max(0,at+30000-Date.now()));
  syncOrderControls();
  const node=$('price');
@@ -63,6 +102,7 @@ function renderQuoteChange(){
  node.className+=' '+(delta===0?'muted':delta>0?'green':'red');
 }
 async function loadQuoteReference(symbol){
+ if(document.hidden||symbol==='NSTAR')return; // NSTAR uses the quote's market baseline, not a second K request.
  const previous=quoteReferences.get(symbol);
  if(previous&&(previous.pending||Date.now()-previous.at<60000))return;
  const reference={at:Date.now(),pending:true};quoteReferences.set(symbol,reference);
@@ -71,9 +111,10 @@ async function loadQuoteReference(symbol){
   if(!j.ok||!Array.isArray(j.klines)||j.klines.length<2)return;
   const close=j.klines.at(-2)[4];if(Number.isFinite(close)&&close>0)reference.close=close;
  }catch(_){}  // 没有前日收盘数据时留空，不用当前价或开盘价冒充。
- finally{reference.pending=false;if(symbol===cur.sym)renderQuoteChange()}
+ finally{reference.pending=false;if(symbol===cur.sym)scheduleVisual('quote-change',renderQuoteChange)}
 }
 function panelStatus(id,state='ready',text=''){
+ if(document.hidden){scheduleVisual('status-'+id,()=>panelStatus(id,state,text));return}
  const status=$(id+'-status');status.hidden=state==='ready';
  status.dataset.state=state;status.querySelector('.status-text').textContent=text;
  $(id).setAttribute('aria-busy',state==='loading');
@@ -140,6 +181,7 @@ try{
  const chat=Number(localStorage.fx_chat_ratio);if(chat>=.15&&chat<=.85)chatRatio=chat;
 }catch(_){}
 function resizeSides(){
+ if(document.hidden)return;
  const wrap=$('wrap');if(wrap.clientWidth<=800)return;
  const budget=wrap.clientWidth-340;
  sideWidths.left=Math.max(160,Math.min(520,sideWidths.left,budget-160));
@@ -187,7 +229,7 @@ bindPaneResize('chat-splitter','y',()=>$('lbbar').clientHeight,
  ()=>{try{localStorage.fx_chat_ratio=chatRatio}catch(_){}},()=>setChatRatio(.5));
 setHistoryRatio(historyRatio);setChatRatio(chatRatio);resizeSides();
 
-/* 版本与SRI固定；CDN失败/5秒超时用同版本本地文件，旧charts.js保留兼容旧页面。 */
+/* Local pinned 5.2.1 first, original CDN + SRI as a bounded fallback. */
 let chartLibraryPromise=null;
 function loadChartLibrary(){
  const ready=()=>typeof LightweightCharts!=='undefined'&&typeof LightweightCharts.version==='function'&&LightweightCharts.version()==='5.2.1'&&LightweightCharts.CandlestickSeries;
@@ -206,8 +248,8 @@ function loadChartLibrary(){
    script.onerror=()=>finish(Error('图表组件加载失败'));
    document.head.append(script);
   });
-  try{await load('https://unpkg.com/lightweight-charts@5.2.1/dist/lightweight-charts.standalone.production.js')}
-  catch(_){await load('/assets/lightweight-charts-5.2.1.js')}
+  try{await load('/assets/lightweight-charts-5.2.1.js')}
+  catch(_){await load('https://unpkg.com/lightweight-charts@5.2.1/dist/lightweight-charts.standalone.production.js')}
  })().catch(error=>{chartLibraryPromise=null;throw error});
  return chartLibraryPromise;
 }
@@ -228,20 +270,25 @@ function initChart(){
  series=chart.addSeries(LightweightCharts.CandlestickSeries,{upColor:UP,downColor:DOWN,borderVisible:false,
   wickUpColor:UP,wickDownColor:DOWN,
   priceFormat:priceFormat(cur.sym)});
- new ResizeObserver(()=>{
+ new ResizeObserver(()=>scheduleVisual('chart-size',()=>{
   const cv=$('cv');if(cv.clientWidth&&cv.clientHeight)chart.applyOptions({width:cv.clientWidth,height:cv.clientHeight});
- }).observe($('cv'));
+ })).observe($('cv'));
 }
 function drawPosLines(){
- if(!series)return;priceLines.forEach(l=>series.removePriceLine(l));priceLines=[];
- for(const p of curPos.filter(p=>p.sym===cur.sym))priceLines.push(series.createPriceLine({
-  price:p.entry,color:p.side=='long'?UP:DOWN,lineWidth:1,lineStyle:2,
-  axisLabelVisible:true,title:(p.side=='long'?'多 ':'空 ')+p.lots}));
+ if(!series||!visible('chartpane'))return;
+ const keep=new Set();
+ for(const p of curPos.filter(p=>(p.sym||lastState?.symbol)===cur.sym)){
+  const id=p.id,options={price:p.entry,color:p.side=='long'?UP:DOWN,lineWidth:1,lineStyle:2,
+   axisLabelVisible:true,title:(p.side=='long'?'多 ':'空 ')+p.lots},signature=JSON.stringify(options);
+  keep.add(id);const old=priceLines.get(id);
+  if(!old)priceLines.set(id,{line:series.createPriceLine(options),signature});
+  else if(old.signature!==signature){old.line.applyOptions(options);old.signature=signature}
+ }
+ for(const [id,{line}] of priceLines)if(!keep.has(id)){series.removePriceLine(line);priceLines.delete(id)}
 }
 const STOCKS=['AAPL','TSLA','NVDA','MSFT','AMZN','GOOGL','META','AMD'];
 const symSel=$('sym'),itvSel=$('itv');
 const symbolLabel=s=>s==='NSTAR'?'NSTAR/USDT · 北极星币':s==='FXSIM'?'FXSIM · 模拟币':pairName(s);
-'NSTAR EURUSDT BTCUSDT ETHUSDT SOLUSDT XRPUSDT BNBUSDT DOGEUSDT ADAUSDT TRXUSDT AVAXUSDT LINKUSDT EURUSD GBPUSD USDJPY USDCHF USDCAD AUDUSD NZDUSD EURJPY GBPJPY USDCNY USDCNH FXSIM'.split(' ').forEach(s=>symSel.add(new Option(symbolLabel(s),s)));
 function syncSecondOption(){
  const fx=cur.sym==='FXSIM'||cur.sym==='NSTAR';
  if(!fx&&cur.itv==='1s')cur.itv='1m';
@@ -254,29 +301,27 @@ function syncSecondOption(){
 function pickItv(i){itvSel.value=i;itvSel.onchange()}
 syncSecondOption();
 symSel.value=cur.sym;itvSel.value=cur.itv;
-let tradableSymbols=null,symbolsVersion=-1,symbolSaving=false;
+let tradableSymbols=null,symbolsVersion=-1;
 function syncSymbolChoices(){
- if(tradableSymbols!==null){
-  symSel.replaceChildren();tradableSymbols.forEach(s=>symSel.add(new Option(symbolLabel(s),s)));
-  if(!tradableSymbols.includes(cur.sym)){
-   const option=new Option(cur.sym+' · 已禁用（仅查看）',cur.sym);option.disabled=true;symSel.add(option);
-  }
-  symSel.value=cur.sym;
- }
+ const disabled=tradableSymbols!==null&&!tradableSymbols.includes('NSTAR');
+ const option=new Option(symbolLabel('NSTAR')+(disabled?' · 已禁用（仅查看）':''),'NSTAR');
+ option.disabled=disabled;
+ symSel.replaceChildren();symSel.add(option);symSel.value='NSTAR';
  syncSecondOption();
  syncOrderControls();
 }
 function syncOrderControls(){
+ if(document.hidden){scheduleVisual('controls',syncOrderControls);return}
  const allowed=tradableSymbols!==null&&tradableSymbols.includes(cur.sym);
- symSel.disabled=orderBusy||symbolSaving||tradableSymbols?.length===0;
+ symSel.disabled=true;  // NSTAR-only：保留只读币对展示，不提供切换入口。
  $('order-symbol').textContent=pairName(cur.sym)+(cur.sym==='NSTAR'?' 永续':'');
  const whole=STOCKS.includes(cur.sym),star=cur.sym==='NSTAR';
  $('lots').min=whole?1:0.01;$('lots').step=whole?1:0.01;
  // NSTAR: 1 手 = 0.01 枚 ≈ $1。
  if(lotsFor!==cur.sym){lotsFor=cur.sym;$('lots').value=star?'1000':whole?'1':'0.10'}
  syncLotPresets();renderOrderEstimate();
- $('trade-buy').disabled=$('trade-sell').disabled=orderBusy||symbolSaving||!allowed||!quoteReady;
- $('spot-submit').disabled=orderBusy||symbolSaving||!allowed||!quoteReady;
+ $('trade-buy').disabled=$('trade-sell').disabled=orderBusy||!allowed||!quoteReady;
+ $('spot-submit').disabled=orderBusy||!allowed||!quoteReady;
  $('close-all').disabled=orderBusy||curPos.length===0;
  $('close-all').textContent=orderBusy?'正在处理…':'全部平仓';
  document.querySelectorAll('.close-position').forEach(button=>button.disabled=orderBusy);
@@ -286,23 +331,15 @@ function syncOrderControls(){
 }
 function applySymbols(settings){
  if(settings.version<symbolsVersion)return;
- symbolsVersion=settings.version;tradableSymbols=settings.rows.filter(row=>row.enabled).map(row=>row.symbol);
- syncSymbolChoices();
+ symbolsVersion=settings.version;tradableSymbols=settings.rows.filter(row=>row.symbol==='NSTAR'&&row.enabled).map(row=>row.symbol);
+ scheduleVisual('symbols',syncSymbolChoices);
 }
-async function loadSymbols(){
+function loadSymbols(){return singleflight('symbols',async()=>{
  try{const r=await fetch('/api/symbols',{signal:AbortSignal.timeout(20000)}),j=await r.json();
   if(!j.ok)throw j.err||'币种配置不可用';applySymbols(j);
- }catch(e){$('symbol-status').textContent='币种配置加载失败，请刷新重试'}
-}
-symSel.onchange=async()=>{
- const previous=cur.sym,next=symSel.value;if(symbolSaving||next===previous)return;
- symbolSaving=true;syncSymbolChoices();
- try{const j=await api('symbol',{symbol:next});
-  if(j.ok){cur.sym=next;syncSecondOption();renderQuote(NaN,next);renderMarket(market);renderBook(NaN);if(series)series.applyOptions({priceFormat:priceFormat(next)});lastBar=null;kLoaded=false;drawPosLines();loadK();await settle(j)}
- }catch(e){msg('币对切换失败：'+e)}
- finally{symbolSaving=false;syncSymbolChoices()}
-};
-itvSel.onchange=()=>{cur.itv=itvSel.value;lastBar=null;kLoaded=false;syncSecondOption();drawPosLines();loadK()};
+ }catch(e){scheduleVisual('symbols-error',()=>{$('symbol-status').textContent='币种配置加载失败，请刷新重试'})}
+})}
+itvSel.onchange=()=>{cur.itv=itvSel.value;lastBar=null;kLoaded=false;pendingSim.clear();syncSecondOption();drawPosLines();sendView();loadK()};
 syncSymbolChoices();
 
 async function api(path,body){const r=await fetch('/api/'+path,{method:'POST',headers:authH({'Content-Type':'application/json'}),body:JSON.stringify(body||{})});
@@ -310,7 +347,11 @@ async function api(path,body){const r=await fetch('/api/'+path,{method:'POST',he
 // Mutations return the new account; only fall back to a GET when the reply lacks it.
 const settle=j=>j.state?(connOk(),render(j.state)):refresh();
 let messageTimer=null;
-function msg(t){clearTimeout(messageTimer);$('msg').textContent=t;messageTimer=setTimeout(()=>$('msg').textContent='',6000)}
+const pendingMessages=[];
+function msg(t){
+ if(document.hidden){pendingMessages.push(t);scheduleVisual('messages',()=>{const text=pendingMessages.splice(0).join('\n');if(text)msg(text)});return}
+ clearTimeout(messageTimer);$('msg').textContent=t;messageTimer=setTimeout(()=>{if(!document.hidden)$('msg').textContent=''},6000);
+}
 /* 数量滑块: 100% = 服务器按真实保证金/档位/冲击成本算出的最大可开（多空取小）。 */
 const fmtLots=n=>STOCKS.includes(cur.sym)||cur.sym==='NSTAR'&&n>=1?String(+n.toFixed(2)):n.toFixed(2);
 /* NSTAR 预估成交：与后端 amm_shift/amm_avg 同一公式。冲击超过 5% 标红提醒，建议改用限价单。 */
@@ -356,14 +397,13 @@ $('lots-slider').addEventListener('input',e=>setLotsPct(Number(e.target.value)))
 let nstarFeed=[];
 function nstarEvent(e){
  nstarFeed=[...nstarFeed,e].slice(-4);
- $('nstar-feed').innerHTML=nstarFeed.map(x=>`<li data-kind="${escapeHtml(x.kind)}"><time>${escapeHtml(new Date(x.time).toLocaleTimeString())}</time>${escapeHtml(x.text)}</li>`).join('');
- syncOrderControls();
+ scheduleVisual('feed',()=>{$('nstar-feed').innerHTML=nstarFeed.map(x=>`<li data-kind="${escapeHtml(x.kind)}"><time>${escapeHtml(new Date(x.time).toLocaleTimeString())}</time>${escapeHtml(x.text)}</li>`).join('')});
 }
 $('lots').addEventListener('input',syncLotPresets);syncLotPresets();
 async function trade(side){
  if(orderBusy)return;
- if(symbolSaving||tradableSymbols===null||!tradableSymbols.includes(cur.sym)){msg('该币对暂不可新开仓');return}
- if(!quoteReady){msg('报价不可用，请等待更新');return}
+ if(tradableSymbols===null||!tradableSymbols.includes(cur.sym)){msg('该币对暂不可新开仓');return}
+ if(!usableQuote()){quoteReady=false;syncOrderControls();msg('报价不可用，请等待更新');return}
  if(!$('lots').reportValidity())return;
  orderBusy=true;syncOrderControls();
  const lots=Number($('lots').value),tp=Number($('entry-tp').value)||0,sl=Number($('entry-sl').value)||0;
@@ -390,6 +430,7 @@ function setOrderType(t){
 document.querySelectorAll('[data-otype]').forEach(b=>b.addEventListener('click',()=>setOrderType(b.dataset.otype)));
 function renderOrders(s){
  const rows=s.orders||[];$('order-count').textContent=rows.length;
+ if(!tableVisible('ordersT','lower','orders')||!changed('orders',[rows,[...pricePrecisions]]))return;
  $('ordersT').querySelector('tbody').innerHTML=rows.map(o=>{
   const kind=(o.kind==='limit'?'限价':o.limit>0?'条件限价':'条件市价')+(o.spot?' · 现货':' · 永续'),side=o.spot?(o.side==='buy'?'买入':'卖出'):(o.side==='long'?'买入开多':'卖出开空');
   const px=o.kind==='stop'?`${priceText(o.price,o.symbol)} → ${o.limit>0?priceText(o.limit,o.symbol):'市价'}`:priceText(o.price,o.symbol);
@@ -466,61 +507,112 @@ async function setLev(){
 
 const SEC={'1s':1,'1m':60,'5m':300,'15m':900,'30m':1800,'1h':3600,'4h':14400,'1d':86400,'1w':604800};
 let kLoaded=false,lastBarLive=false;
-let kSeq=0,simBars=[],simStamp=0;
+let kSeq=0,simBars=[],simStamp=0,kFlight=null,needsK=false;
+const BAR_LIMIT=500,BAR_SLACK=64,pendingSim=new Map();
+let pendingSimStamp=0;
+const toBar=k=>({time:k[0]/1000,open:k[1],high:k[2],low:k[3],close:k[4]});
+const sameBar=(a,b)=>a&&a.time===b.time&&a.open===b.open&&a.high===b.high&&a.low===b.low&&a.close===b.close;
+const preserveWicks=(old,b)=>old?{...b,open:old.open,high:Math.max(old.high,b.high),low:Math.min(old.low,b.low)}:b;
 function mergeSimBars(data,stamp){
- if(stamp<simStamp)return false;  // 慢轮询不能覆盖较新的实时OHLC。
- const bars=new Map(simBars.map(b=>[b.time,b]));
- data.forEach(b=>bars.set(b.time,b));
- simBars=[...bars.values()].sort((a,b)=>a.time-b.time).slice(-500);simStamp=stamp;
- lastBar={...simBars[simBars.length-1]};lastBarLive=false;return true;
+ const bars=new Map(simBars.map(b=>[b.time,b]));let changed=false;
+ for(const b of data){
+  const old=bars.get(b.time),next=old&&stamp<simStamp?old:preserveWicks(old,b);
+  if(!sameBar(old,next)){bars.set(b.time,next);changed=true}
+ }
+ if(changed)simBars=[...bars.values()].sort((a,b)=>a.time-b.time).slice(-BAR_LIMIT);
+ simStamp=Math.max(simStamp,stamp);lastBar=simBars.at(-1);lastBarLive=false;return changed;
 }
 const isSim=sym=>sym==='FXSIM'||sym==='NSTAR';
-function updateSim(rows,stamp){
- if(!rows||!series||!kLoaded||!isSim(cur.sym)||lastSym!==cur.sym||lastItv!==cur.itv)return;
- const data=rows.map(k=>({time:k[0]/1000,open:k[1],high:k[2],low:k[3],close:k[4]}));
- if(mergeSimBars(data,stamp))series.setData(simBars);
-}
-async function loadK(){
- const my=++kSeq,sym=cur.sym,itv=cur.itv;  // 请求守卫: 慢响应过期即弃
- if(!kLoaded||sym!==lastSym||itv!==lastItv)panelStatus('chartpane','loading','Loading...');
- try{const r=await fetch(`/api/klines?symbol=${sym}&interval=${itv}&limit=500`,{signal:AbortSignal.timeout(20000)});
-  const j=await r.json();if(!j.ok)throw j.err;
-  if(my!==kSeq||sym!==cur.sym||itv!==cur.itv)return;  // 已切走, 丢包
-  if(!chart)await loadChartLibrary();
-  if(my!==kSeq||sym!==cur.sym||itv!==cur.itv)return;
-  initChart();if(!series)throw '图表组件未加载';
-  const data=j.klines.map(k=>({time:k[0]/1000,open:k[1],high:k[2],low:k[3],close:k[4]}));
-  const reset=!kLoaded||cur.sym!==lastSym||cur.itv!==lastItv,latest=data[data.length-1];
-  if(!latest)throw '无K线数据';
-  observePrices(sym,j.klines.flatMap(k=>k.slice(1,5)));
-  series.applyOptions({priceFormat:priceFormat(sym)});
-  if(isSim(sym)){
-   if(reset){simBars=[];simStamp=0}
-   if(!mergeSimBars(data,j.updated_at||0))return;
-   series.setData(simBars);  // 后端完整OHLC含闭合前一根，不从抽样价格猜影线。
+function updateSim(rows,stamp=0){
+ if(!rows||!series||!kLoaded||!isSim(cur.sym)||lastSym!==cur.sym||lastItv!==cur.itv||stamp<simStamp)return;
+ if(!visible('chartpane')){queueSim(rows,stamp);return}
+ const data=rows.map(toBar);let reset=false;
+ for(const b of data){
+  const end=simBars.at(-1);
+  if(!end||b.time>end.time){
+   simBars.push(b);if(!reset)series.update(b);
+   if(end&&b.time-end.time>SEC[cur.itv])needsK=true;
+  }else if(b.time===end.time){
+   const next=preserveWicks(end,b);
+   if(!sameBar(end,next)){simBars[simBars.length-1]=next;if(!reset)series.update(next)}
   }else{
-   // 保留当前蜡烛完整OHLC；慢轮询不能抹掉已观察的影线或回退最新tick。
-   if(!reset&&lastBar&&lastBar.time>=latest.time){
-    if(lastBar.time===latest.time){
-     lastBar={...latest,open:lastBar.open,high:Math.max(latest.high,lastBar.high),
-      low:Math.min(latest.low,lastBar.low),close:lastBarLive?lastBar.close:latest.close};
-     data[data.length-1]=lastBar;
-    }
-   }else{lastBar={...latest};lastBarLive=false}
-   if(reset)series.setData(data);
-   else data.slice(-2).forEach(b=>{try{series.update(b)}catch(_){}});
+   // Only corrections to a closed bar / hole filling use the full-history path.
+   let lo=0,hi=simBars.length;
+   while(lo<hi){const mid=(lo+hi)>>>1;if(simBars[mid].time<b.time)lo=mid+1;else hi=mid}
+   const i=lo,old=simBars[i];
+   if(i===0&&b.time<old.time&&simBars.length>=BAR_LIMIT)continue;
+   const next=preserveWicks(old?.time===b.time?old:null,b);
+   if(!sameBar(old,next)){
+    if(old?.time===b.time)simBars[i]=next;else simBars.splice(i,0,next);
+    reset=true;
+   }
   }
-  if(reset){
-   chart.priceScale('right').applyOptions({autoScale:true});
-   const n=data.length;chart.timeScale().setVisibleLogicalRange({from:n-60,to:n+3});
-   lastSym=cur.sym;lastItv=cur.itv;kLoaded=true;
-  }
-  drawPosLines();panelStatus('chartpane');
- }catch(e){
-  if(my!==kSeq||sym!==cur.sym||itv!==cur.itv)return;
-  if(!kLoaded)panelStatus('chartpane','error','K线加载失败，请重试');
-  msg('K线: '+e);
  }
+ if(simBars.length>BAR_LIMIT+BAR_SLACK){simBars=simBars.slice(-BAR_LIMIT);reset=true}
+ if(reset)series.setData(simBars);
+ simStamp=stamp;lastBar=simBars.at(-1);lastBarLive=false;
+ if(needsK){needsK=false;loadK()}
+}
+function queueSim(rows,stamp=0){
+ if(!rows||stamp<Math.max(simStamp,pendingSimStamp))return;
+ pendingSimStamp=stamp;
+ for(const k of rows){const b=preserveWicks(pendingSim.get(k[0]),toBar(k));pendingSim.set(k[0],b)}
+ while(pendingSim.size>BAR_LIMIT+BAR_SLACK)pendingSim.delete(pendingSim.keys().next().value);
+ scheduleVisual('candles',()=>{
+  if(!visible('chartpane')||!kLoaded)return false;
+  const data=[...pendingSim.values()].sort((a,b)=>a.time-b.time).map(b=>[b.time*1000,b.open,b.high,b.low,b.close]);
+  const stamp=pendingSimStamp;pendingSim.clear();pendingSimStamp=0;updateSim(data,stamp);
+ });
+}
+function loadK(){
+ const sym=cur.sym,itv=cur.itv,key=sym+'/'+itv;
+ if(kFlight?.key===key)return kFlight.promise;
+ if(document.hidden){needsK=true;return Promise.resolve()}
+ kFlight?.controller.abort();
+ const my=++kSeq,controller=new AbortController();
+ const current=()=>my===kSeq&&sym===cur.sym&&itv===cur.itv;
+ if(!kLoaded||sym!==lastSym||itv!==lastItv)panelStatus('chartpane','loading','Loading...');
+ const promise=(async()=>{
+  try{
+   const [j]=await Promise.all([
+    fetch(`/api/klines?symbol=${sym}&interval=${itv}&limit=500`,{signal:AbortSignal.any([controller.signal,AbortSignal.timeout(20000)])}).then(r=>r.json()),
+    chart?Promise.resolve():loadChartLibrary()
+   ]);
+   if(!current())return;if(!j.ok)throw j.err;
+   const paint=()=>{if(current())applyK(j,sym,itv)};
+   if(document.hidden)scheduleVisual('history-k',paint);else paint();
+  }catch(e){
+   if(!current()||controller.signal.aborted)return;
+   if(!kLoaded)panelStatus('chartpane','error','K线加载失败，请重试');msg('K线: '+e);
+  }finally{if(kFlight?.controller===controller)kFlight=null}
+ })();
+ kFlight={key,controller,promise};return promise;
+}
+function applyK(j,sym,itv){
+ initChart();if(!series)throw '图表组件未加载';
+ const data=j.klines.map(toBar),reset=!kLoaded||sym!==lastSym||itv!==lastItv,latest=data.at(-1);
+ if(!latest)throw '无K线数据';
+ observePrices(sym,j.klines.flatMap(k=>k.slice(1,5)));series.applyOptions({priceFormat:priceFormat(sym)});
+ if(isSim(sym)){
+  if(reset){simBars=[];simStamp=0;mergeSimBars(data,j.updated_at||0);series.setData(simBars)}
+  else if((j.updated_at||0)>=simStamp)updateSim(j.klines,j.updated_at||0);
+  else if(mergeSimBars(data,j.updated_at||0))series.setData(simBars); // Stale snapshot may only fill missing history.
+ }else{
+  // Preserve authoritative OHLC and observed live extremes, never rewind a newer bar.
+  if(!reset&&lastBar&&lastBar.time>=latest.time){
+   if(lastBar.time===latest.time){
+    lastBar={...latest,open:lastBar.open,high:Math.max(latest.high,lastBar.high),low:Math.min(latest.low,lastBar.low),close:lastBarLive?lastBar.close:latest.close};
+    data[data.length-1]=lastBar;
+   }
+  }else{lastBar={...latest};lastBarLive=false}
+  if(reset)series.setData(data);else data.slice(-2).forEach(b=>{try{series.update(b)}catch(_){}});
+ }
+ if(reset){
+  chart.priceScale('right').applyOptions({autoScale:true});
+  const n=data.length;chart.timeScale().setVisibleLogicalRange({from:n-60,to:n+3});
+  lastSym=sym;lastItv=itv;kLoaded=true;
+ }
+ drawPosLines();panelStatus('chartpane');requestRender();
 }
 function updateLast(price){
  if(isSim(cur.sym)||!series||!kLoaded||lastSym!==cur.sym||lastItv!==cur.itv||!price)return;
@@ -531,15 +623,22 @@ function updateLast(price){
  lastBarLive=true;series.update(lastBar);
 }
 function render(s){
+ if(!Array.isArray(s.positions))throw Error('账户数据不可用');
+ lastState=s;curPos=s.positions;accountLeverage=s.leverage;observeTrade(s.last_trade);
+ if(s.leaderboard_me!==undefined){lbMe=s.leaderboard_me;scheduleVisual('lb',paintLeaderboard)}
+ if(s.symbol===cur.sym&&s.price!==undefined)acceptQuote(s.price,s.symbol,s.bid,s.ask,s.quote_valid,s.quote_at);
+ scheduleVisual('state',()=>paintState(lastState));
+}
+function paintState(s){
  const ml=s.margin_level,stopout=s.stopout_level??.5;
  const mls=ml==null?'-':Math.round(ml*100)+'%',mlc=ml==null?'':(ml>=1?'green':(ml>=stopout?'':'red'));
- $('acct').innerHTML=`<div class="account-stats">`+
+ htmlIfChanged($('acct'),`<div class="account-stats">`+
   `<div class="account-stat"><span>账户余额 / USD</span><b>${money(s.balance)}</b></div>`+
   `<div class="account-stat"><span>账户净值 / USD</span><b class="${s.equity>=s.balance?'green':'red'}">${money(s.equity)}</b></div>`+
   `<div class="account-stat"><span>已用保证金 / USD</span><b>${money(s.used)}</b></div>`+
   `<div class="account-stat"><span>可用保证金 / USD</span><b>${money(s.equity-s.used)}</b></div></div>`+
   `<div class="account-meta"><span>保证金比例 <strong class="${mlc}">${mls}</strong></span>`+
-  `<span>强平线 <strong>${Math.round(stopout*100)}%</strong></span><span>杠杆 <strong>1:${s.leverage}</strong></span></div>`;
+  `<span>强平线 <strong>${Math.round(stopout*100)}%</strong></span><span>杠杆 <strong>1:${s.leverage}</strong></span></div>`);
  renderDebt(s);
  accountLeverage=s.leverage;
  if(!levSaving&&(!levDirty||s.positions.length)){$('lev').value=s.leverage;levDirty=false}
@@ -549,7 +648,7 @@ function render(s){
  observePrices(s.symbol,[s.price]);
  for(const p of s.positions)observePrices(p.sym||s.symbol,[p.now]);
  curPos=s.positions;drawPosLines();$('position-count').textContent=curPos.length;
- $('pos').querySelector('tbody').innerHTML=s.positions.map(p=>{
+ if(tableVisible('pos','lower','pos')&&changed('positions',[s.positions,s.leverage,[...pricePrecisions]]))$('pos').querySelector('tbody').innerHTML=s.positions.map(p=>{
   const sym=p.sym||s.symbol,long=p.side=='long',roe=Number.isFinite(p.roe)?` (${(p.roe*100).toFixed(2)}%)`:'';
   return `<tr><td class="pos-sym"><b>${escapeHtml(pairName(sym))}</b><span class="lev-badge">${p.leverage??s.leverage}x</span><small>#${p.id} 永续</small></td>`+
   `<td><span class="side-badge ${long?'long':'short'}">${long?'多':'空'}</span></td>`+
@@ -560,9 +659,8 @@ function render(s){
   `<td><span class="tpsl">${p.tp?priceText(p.tp,sym):'—'} / ${p.sl?priceText(p.sl,sym):'—'}</span> <button type="button" aria-label="设置 #${p.id} 止盈止损" onclick="openTpsl(${p.id})">设置</button></td>`+
   `<td><button class="close-position" aria-label="平仓 ${escapeHtml(sym)} 持仓 #${p.id}" onclick="closePos(${p.id})">平仓</button></td></tr>`;
  }).join('')||'<tr><td colspan="10" class="empty">暂无持仓，去下单吧</td></tr>';
- lastState=s;renderAssets(s);renderOrders(s);renderOrderEstimate();renderSpotForm();
- syncOrderControls();panelStatus('positions');observeTrade(s.last_trade);
- if(s.symbol===cur.sym){renderQuote(s.price,s.symbol,s.bid,s.ask,s.quote_valid,s.quote_at);updateLast(s.price)}
+ renderAssets(s);renderOrders(s);renderOrderEstimate();renderSpotForm();
+ syncOrderControls();panelStatus('positions');
 }
 let seenTrade=0,historySeq=0;
 let tradeCursor=false;
@@ -573,89 +671,176 @@ function observeTrade(trade){
  if(!trade||trade.id<=seenTrade)return;
  seenTrade=trade.id;
  if(trade.kind==='stopout'&&trade.currency!=='LEGACY')msg(`已触发强平 #${trade.position_id} ${trade.symbol}：保证金比例 ${(trade.margin_level*100).toFixed(1)}%，已实现盈亏 ${money(trade.pnl)}。详情见成交记录。`);
- if(!(first&&historyLoaded))loadHistory();
+ if(!(first&&(historyLoaded||flights.has('history'))))loadHistory();
 }
 function escapeHtml(value){
  return String(value).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
-let historyLoaded=false;
-async function loadHistory(){
+let historyLoaded=false,historyDirty=false;
+function loadHistory(){
+ if(document.hidden){historyDirty=true;return Promise.resolve()}
+ if(flights.has('history')){historyDirty=true;return flights.get('history')}
+ return singleflight('history',fetchHistory).finally(()=>{if(historyDirty&&!document.hidden)loadHistory()});
+}
+async function fetchHistory(){
+ historyDirty=false;
  const my=++historySeq;panelStatus('history','loading','Loading...');
  try{
   const r=await fetch('/api/history',{headers:authH(),signal:AbortSignal.timeout(20000)});
+  if(r.status===401){logout();return}
   const j=await r.json();if(!j.ok)throw j.err||'成交记录不可用';if(my!==historySeq)return;
+  scheduleVisual('history',()=>{
   $('historyT').querySelector('tbody').innerHTML=j.rows.map(t=>
    `<tr><td>${escapeHtml(new Date(t.time).toLocaleString())}</td><td class="${t.kind==='stopout'?'red':''}">${({open:'开仓',close:'平仓',stopout:'强平',tp:'止盈',sl:'止损',cancel:'撤单',void:'委托失效',spot:t.side==='buy'?'现货买入':'现货卖出',funding:'资金费',reset:'重置',borrow:'借款',repay:'还款'})[t.kind]??t.kind}${t.currency==='LEGACY'?' · 旧口径':''}</td>`+
    `<td>${t.position_id||'—'}</td><td>${escapeHtml(pairName(t.symbol))}</td><td>${({long:'多',short:'空',buy:'买',sell:'卖'})[t.side]??'—'}</td>`+
    `<td>${t.kind==='spot'?units(t.lots*.01)+' NSTAR':t.lots}</td><td>${t.entry>0?priceText(t.entry,t.symbol):'—'}</td><td>${priceText(t.price,t.symbol)}</td><td class="${t.pnl==null?'':t.pnl>=0?'green':'red'}">${t.pnl==null?'-':t.currency==='LEGACY'&&!/USD(T)?$/.test(t.symbol)&&t.symbol!=='FXSIM'?'旧口径 '+amountFormat.format(t.pnl):money(t.pnl)}</td><td>${money(t.balance)}</td></tr>`).join('')||'<tr><td colspan="10" class="empty">暂无成交记录</td></tr>';
   historyLoaded=true;panelStatus('history');
+  });
  }catch(e){if(my===historySeq)panelStatus('history','error','成交记录加载失败，请重试')}
 }
 let connWasDown=false;
-function connDown(){connWasDown=true;$('connection').dataset.state='down';$('connection').textContent='重连中';$('connection').title='与服务器的连接暂时中断，正在重试'}
-function connOk(){connWasDown=false;$('connection').dataset.state='ready';$('connection').textContent='已连接';$('connection').title='服务器连接正常'}
-async function refresh(){
+function connDown(){connWasDown=true;scheduleVisual('connection',()=>{$('connection').dataset.state='down';$('connection').textContent='重连中';$('connection').title='与服务器的连接暂时中断，正在重试'})}
+function connOk(){connWasDown=false;scheduleVisual('connection',()=>{$('connection').dataset.state='ready';$('connection').textContent='已连接';$('connection').title='服务器连接正常'})}
+function refresh(){return singleflight('state',fetchState)}
+async function fetchState(){
  if(!$('positions-status').hidden)panelStatus('positions','loading','Loading...');
  try{const r=await fetch('/api/state',{headers:authH(),signal:AbortSignal.timeout(20000)});
   if(r.status===401){logout();return}
   const s=await r.json();if(!s.ok)throw s.err||'行情不可用';
   connOk();
-  if(!symSynced&&s.symbol){symSynced=true;cur.sym=s.symbol;syncSymbolChoices();lastSym=null;loadK()}
   render(s);
  }catch(e){
   if(!$('positions-status').hidden)panelStatus('positions','error','持仓加载失败，请重试');
   connDown();
  }
 }
-/* ws */
-let ws=null,wsTimer=null,wsLive=false;
+/* ws: all packets count as liveness, including the quiet 15s server heartbeat. */
+let ws=null,wsTimer=null,wsLive=false,wsAttempts=0,wsEverOpened=false,wsLastMessage=0,wsOpenedAt=0;
 const pollNeeded=()=>!wsLive&&!document.hidden;
+function sendView(){
+ if(ws?.readyState!==1)return;
+ ws.send(JSON.stringify({type:'view',visible:!document.hidden,leaderboard:paneVisible('upper','rank'),interval:cur.itv,low_power:lowPower}));
+}
+function reconnectLater(){
+ if(wsTimer!==null)return;
+ const delay=Math.min(30000,1000*2**Math.min(wsAttempts++,5))*(.75+Math.random()*.5);
+ wsTimer=setTimeout(()=>{wsTimer=null;wsConnect()},delay);
+}
+function checkSocket(){
+ if(document.hidden||!wsLive)return;
+ if(Date.now()-wsOpenedAt>30000)wsAttempts=0;
+ if(Date.now()-wsLastMessage>60000)ws.close();
+}
 function wsConnect(){
- try{ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws?token=${TOKEN}`)}catch(e){return}
- ws.onmessage=e=>{const d=JSON.parse(e.data);
+ if(ws&&(ws.readyState===0||ws.readyState===1))return;
+ let socket;
+ try{socket=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws?token=${encodeURIComponent(TOKEN)}`);ws=socket}catch(e){connDown();reconnectLater();return}
+ socket.onmessage=e=>{
+  if(socket!==ws)return;wsLastMessage=Date.now();
+  let d;try{d=JSON.parse(e.data)}catch(_){return}
+  if(d.type==='auth_expired'||d.type==='unauthorized'){logout();return}
+  if(d.type==='resync'){
+   if(d.history)loadHistory();
+   if(d.chat){if(document.hidden)chatDirty=true;else loadChat()}
+   return;
+  }
   if(d.type==='symbols'){applySymbols(d);return}
   if(d.type==='chat'){renderChat([d.row]);return}
-  if(d.type==='lb'){renderLb(d.rows);return}
+  if(d.type==='lb'){renderLb(d.rows,d);return}
   if(d.type==='nstar'){nstarEvent(d);return}
   if(d.sym==='NSTAR'&&d.market)renderMarket(d.market);
   if(d.type==='state'){connOk();render(d);return}
   if(d.sym!==cur.sym)return;
-  renderQuote(d.price,d.sym,d.bid,d.ask,d.quote_valid,d.quote_at);renderBook(d.price);
-  if(isSim(d.sym)){updateSim(d.klines&&d.klines[cur.itv],d.time);return}
-  updateLast(d.price)};
- ws.onopen=()=>{wsLive=true;connOk();loadChat();loadSymbols()};
- ws.onclose=()=>{wsLive=false;connDown();wsTimer=setTimeout(wsConnect,2000)};
+  acceptQuote(d.price,d.sym,d.bid,d.ask,d.quote_valid,d.quote_at??d.time);
+  if(isSim(d.sym))queueSim(d.klines&&d.klines[cur.itv],d.time);
+ };
+ socket.onopen=()=>{
+  if(socket!==ws)return;const recovering=wsEverOpened;wsEverOpened=true;wsLive=true;wsLastMessage=wsOpenedAt=Date.now();connOk();sendView();
+  if(recovering){needsK=true;chatDirty=true;if(!document.hidden){needsK=false;loadK();loadChat();loadSymbols()}}
+ };
+ socket.onclose=e=>{
+  if(socket!==ws)return;wsLive=false;quoteReady=false;connDown();syncOrderControls();
+  if(e?.code===4001||e?.code===4401){logout();return}
+  // A removed/expired account must be checked even if visuals are paused.
+  refresh();reconnectLater();
+ };
+ socket.onerror=()=>socket.close();
 }
-/* rank: ws推送渲染 */
-function renderLb(rows){
- $('rankT').querySelector('tbody').innerHTML=rows.map((p,i)=>
-  `<tr class="${p.name==ME?'me':''}"><td>${i+1}</td><td class="${p.online?'online':'offline'}" title="${p.online?'在线':'离线'}">${escapeHtml(p.name)}</td>`+
+/* Top 50 push + independent personal rank; full standings are requested one page at a time. */
+let lbTop=[],lbRows=[],lbMe=null,lbTotal=0,lbAsOf=0,lbOffset=0,lbLoaded=false,lbSeq=0;
+function renderLb(rows,meta={}){
+ const stamp=meta.as_of??0;if(stamp&&stamp<lbAsOf)return;
+ lbAsOf=Math.max(lbAsOf,stamp);lbTop=(rows||[]).slice(0,50);
+ if(lbOffset===0)lbRows=lbTop;
+ lbTotal=meta.total??rows.length;
+ if(meta.me!==undefined)lbMe=meta.me;
+ else if(!lbMe){const mine=rows.find(p=>p.name===ME);if(mine)lbMe={...mine,rank:mine.rank??rows.indexOf(mine)+1}}
+ lbLoaded=true;scheduleVisual('lb',paintLeaderboard);
+}
+function paintLeaderboard(){
+ if(!paneVisible('upper','rank'))return false;
+ htmlIfChanged($('rankT').querySelector('tbody'),lbRows.map((p,i)=>
+  `<tr class="${p.name==ME?'me':''}"><td>${p.rank??lbOffset+i+1}</td><td class="${p.online?'online':'offline'}" title="${p.online?'在线':'离线'}">${escapeHtml(p.name)}</td>`+
   `<td>${money(p.equity)}</td><td class="${p.ret>=0?'green':'red'}">${amountFormat.format(p.ret*100)}%</td>`+
-  `<td class="${p.pnl_5m==null?'':p.pnl_5m>=0?'green':'red'}">${p.pnl_5m==null?'—':money(p.pnl_5m)+(p.ret_5m==null?'':`<br>${amountFormat.format(p.ret_5m*100)}%`)}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">暂无排名</td></tr>';
+  `<td class="${p.pnl_5m==null?'':p.pnl_5m>=0?'green':'red'}">${p.pnl_5m==null?'—':money(p.pnl_5m)+(p.ret_5m==null?'':`<br>${amountFormat.format(p.ret_5m*100)}%`)}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">暂无排名</td></tr>');
+ $('rank-me').textContent=lbMe?.rank?`我的排名 #${lbMe.rank} · ${money(lbMe.equity)}`:'我的排名：等待账户更新';
+ $('rank-page').textContent=`${lbOffset+1}–${lbOffset+lbRows.length} / ${lbTotal}`;
+ $('rank-prev').disabled=lbOffset===0;$('rank-next').disabled=lbOffset+50>=lbTotal;
  panelStatus('lbbar');
 }
-async function loadLeaderboard(){
- if(!$('lbbar-status').hidden)panelStatus('lbbar','loading','Loading...');
- try{const r=await fetch('/api/leaderboard',{signal:AbortSignal.timeout(20000)});
-  const j=await r.json();if(!j.ok)throw j.err||'排行不可用';renderLb(j.rows);
- }catch(e){if(!$('lbbar-status').hidden)panelStatus('lbbar','error','排行加载失败，请重试')}
+function leaderboardPage(step){lbOffset=Math.max(0,lbOffset+step*50);loadLeaderboard()}
+function loadLeaderboard(){
+ if(!paneVisible('upper','rank'))return Promise.resolve();
+ const offset=lbOffset;
+ return singleflight('lb-'+offset,async()=>{
+  const my=++lbSeq,stamp=lbAsOf;
+  if(!lbLoaded)panelStatus('lbbar','loading','Loading...');
+  try{
+   const r=await fetch(`/api/leaderboard?offset=${offset}&limit=50`,{headers:authH(),signal:AbortSignal.timeout(20000)});
+   if(r.status===401){logout();return}
+   const j=await r.json();if(!j.ok)throw j.err||'排行不可用';
+   if(my!==lbSeq||offset!==lbOffset)return;
+   if(offset===0){if(!j.as_of&&lbAsOf>stamp)return;renderLb(j.rows,j)}
+   else{lbRows=j.rows.slice(0,50);lbTotal=j.total??lbTotal;if(j.me!==undefined)lbMe=j.me;lbLoaded=true;scheduleVisual('lb',paintLeaderboard)}
+  }catch(e){if(my===lbSeq&&!$('lbbar-status').hidden)panelStatus('lbbar','error','排行加载失败，请重试')}
+ });
 }
 
 /* chat: 复用WS广播，首屏/重连读取历史，无定时轮询。 */
-let chatRows=[],chatSending=false;
+let chatRows=[],chatSending=false,chatDirty=false;
+const chatNodes=new Map();
 function renderChat(rows){
+ const known=new Set(chatRows.map(row=>row.id));let added=false;
+ for(const row of rows||[])if(row&&!known.has(row.id)){chatRows.push(row);known.add(row.id);added=true}
+ if(added)chatRows.sort((a,b)=>a.id-b.id);
+ chatRows=chatRows.slice(-100);scheduleVisual('chat',paintChat);
+}
+function paintChat(){
+ if(!paneVisible('chat','chat'))return false;
  const list=$('chat-messages'),stick=list.scrollHeight-list.scrollTop-list.clientHeight<50;
- const merged=new Map(chatRows.map(row=>[row.id,row]));rows.forEach(row=>merged.set(row.id,row));
- chatRows=[...merged.values()].sort((a,b)=>a.id-b.id).slice(-100);
- list.innerHTML=chatRows.map(row=>`<div class="chat-item"><b>${escapeHtml(row.name)}</b><time>${escapeHtml(new Date(row.time).toLocaleTimeString())}</time><div>${escapeHtml(row.text)}</div></div>`).join('')||'<div class="empty">暂无消息，聊聊吧</div>';
- if(stick)list.scrollTop=list.scrollHeight;panelStatus('chatpane');
+ const keep=new Set(chatRows.map(row=>row.id));let changed=false;
+ for(const [id,node] of chatNodes)if(!keep.has(id)){node.remove();chatNodes.delete(id);changed=true}
+ if(chatRows.length){
+  if(!chatNodes.size)list.replaceChildren();
+  for(let i=0;i<chatRows.length;i++){
+   const row=chatRows[i];let node=chatNodes.get(row.id);
+   if(!node){
+    node=document.createElement('div');node.className='chat-item';node.dataset.id=row.id;
+    node.innerHTML=`<b>${escapeHtml(row.name)}</b><time>${escapeHtml(new Date(row.time).toLocaleTimeString())}</time><div>${escapeHtml(row.text)}</div>`;
+    chatNodes.set(row.id,node);list.insertBefore(node,list.children[i]||null);changed=true;
+   }
+  }
+ }else htmlIfChanged(list,'<div class="empty">暂无消息，聊聊吧</div>');
+ if(changed&&stick)list.scrollTop=list.scrollHeight;panelStatus('chatpane');
 }
-async function loadChat(){
- if(!$('chatpane-status').hidden)panelStatus('chatpane','loading','Loading...');
+function loadChat(){return singleflight('chat',async()=>{
+ chatDirty=false;
+ if(paneVisible('chat','chat')&&!$('chatpane-status').hidden)panelStatus('chatpane','loading','Loading...');
  try{const r=await fetch('/api/chat',{headers:authH(),signal:AbortSignal.timeout(20000)});
+  if(r.status===401){logout();return}
   const j=await r.json();if(!j.ok)throw j.err||'聊天不可用';renderChat(j.rows);
- }catch(e){if(!$('chatpane-status').hidden)panelStatus('chatpane','error','聊天加载失败，请重试')}
-}
+ }catch(e){if(paneVisible('chat','chat')&&!$('chatpane-status').hidden)panelStatus('chatpane','error','聊天加载失败，请重试')}
+})}
 async function sendChat(){
  if(chatSending)return;
  const text=$('chat-text').value.trim();if(!text)return;
@@ -676,9 +861,7 @@ function setMode(next){
  for(const m of ['perp','spot'])$('mode-'+m).setAttribute('aria-selected',m===mode);
  $('perp-form').hidden=$('lev-form').hidden=$('close-box').hidden=mode!=='perp';
  $('spot-form').hidden=mode!=='spot';
- // 现货只有 NSTAR：沿用币对下拉框的切换流程（保存选择、重载行情与图表）。
- if(mode==='spot'&&cur.sym!=='NSTAR'&&!symbolSaving){symSel.value='NSTAR';symSel.onchange()}
- setSpotType(spotType);
+ setSpotType(spotType);if(lastState)scheduleVisual('state',()=>paintState(lastState));sendView();
 }
 function setSpotSide(side){
  spotSide=side;
@@ -697,6 +880,7 @@ document.querySelectorAll('[data-spot-otype]').forEach(b=>b.addEventListener('cl
 function nstarMid(){return cur.sym==='NSTAR'&&Number.isFinite(quoteLast)?quoteLast:lastState?.nstar_price??NaN}
 function heldNstar(){return (lastState?.spot||[]).find(h=>h.sym==='NSTAR')?.units??0}
 function renderSpotForm(){
+ if(!visible('spot-form'))return;
  const px=nstarMid(),n=Number($('spot-units').value),price=Number($('spot-price').value)||0,trigger=Number($('spot-trigger').value)||0;
  const reference=spotType==='market'?NaN:spotType==='limit'?price:(price||trigger);
  const avg=n>0?(Number.isFinite(reference)?reference:bookFill(spotSide==='buy'?n:-n)):NaN,est=Number.isFinite(avg)?avg:px;
@@ -727,6 +911,8 @@ function renderTierHint(s){
 }
 async function spotTrade(){
  if(orderBusy||!$('spot-units').reportValidity())return;
+ if(!tradableSymbols?.includes(cur.sym)){msg('该币对暂不可新开仓');return}
+ if(!usableQuote()){quoteReady=false;syncOrderControls();msg('报价不可用，请等待更新');return}
  const units=Number($('spot-units').value),price=Number($('spot-price').value)||0,trigger=Number($('spot-trigger').value)||0;
  if(spotType==='limit'&&!(price>0)){msg('请填写现货委托价');return}
  if(spotType==='stop'&&!(trigger>0)){msg('请填写现货触发价');return}
@@ -739,9 +925,10 @@ async function spotTrade(){
  finally{orderBusy=false;syncOrderControls();renderSpotForm()}
 }
 $('spot-units').addEventListener('input',renderSpotForm);
-function renderOrderEstimate(){
 $('spot-price').addEventListener('input',renderSpotForm);
 $('spot-trigger').addEventListener('input',renderSpotForm);
+function renderOrderEstimate(){
+ if(!visible('perp-form'))return;
  const s=lastState,lots=Number($('lots').value);
  if(!s||s.symbol!==cur.sym||!(lots>0)){$('order-notional').textContent=$('order-margin').textContent='—';return}
  const notional=lots*(s.contract??1)*s.price,tiers=s.limits?.tiers||[];
@@ -760,6 +947,7 @@ $('spot-trigger').addEventListener('input',renderSpotForm);
 $('lots').addEventListener('input',renderOrderEstimate);
 function renderAssets(s){
  const rows=s.spot||[];$('spot-count').textContent=rows.length;
+ if(!tableVisible('spotT','lower','spot')||!changed('assets',rows))return;
  $('spotT').querySelector('tbody').innerHTML=rows.map(h=>
   `<tr><td><b>${escapeHtml(h.sym)}</b></td><td>${units(h.units)}</td><td>${units(h.cost,4)}</td><td>${units(h.price,4)}</td>`+
   `<td>${units(h.value,2)}</td><td class="${h.pnl>=0?'green':'red'}">${money(h.pnl)}</td></tr>`).join('')||
@@ -777,8 +965,11 @@ async function saveTpsl(){
  if(j.ok){closeTpsl();msg('止盈止损已更新');await settle(j)}
 }
 /* 盘口: NSTAR 的弹性 AMM 曲线可精确推算每一档；其他币对按点差画示意盘口。 */
+const bookNodes=new Map();
 function renderBook(mid){
- if(!Number.isFinite(mid)){$('book-asks').innerHTML=$('book-bids').innerHTML='';$('book-last').textContent='—';return}
+ if(!paneVisible('upper','book')){scheduleVisual('book',()=>{if(!paneVisible('upper','book'))return false;renderBook(latestQuote?.price??mid)});return}
+ if(!Number.isFinite(mid)){$('book-last').textContent='—';return}
+ if(!changed('book',[mid,cur.sym,market?.depth,market?.amm_width,market?.anchor,market?.fair,pricePrecisions.get(cur.sym)]))return;
  const star=cur.sym==='NSTAR',depth=market?.depth||50000,dp=pricePrecisions.get(cur.sym)??decimalPlaces(mid);
  // 锚价偏离 x 处流动性 = depth·(1+x²/w²)，库存 U(x)=depth·(x+x³/3w²)，与后端 amm_shift 一致。
  const w=market?.amm_width||0,x0=star&&w&&market?.anchor>0?Math.log(mid/market.anchor):0;
@@ -791,21 +982,42 @@ function renderBook(mid){
   asks.push([up,star?cumAt(up):sumA]);bids.push([dn,star?cumAt(dn):sumB]);
  }
  const max=Math.max(asks.at(-1)[1],bids.at(-1)[1]);
- const row=(cls,[p,cum],prev)=>`<div class="book-row ${cls}" style="--depth:${(cum/max*100).toFixed(1)}%" onclick="pickPrice(${p})">`+
-  `<span>${priceText(p,cur.sym)}</span><span>${units(cum-prev,star?2:0)}</span><span>${units(cum,star?2:0)}</span></div>`;
- $('book-asks').innerHTML=asks.map((a,i)=>row('ask',a,i?asks[i-1][1]:0)).reverse().join('');
- $('book-bids').innerHTML=bids.map((b,i)=>row('bid',b,i?bids[i-1][1]:0)).join('');
+ for(const [side,values] of [['ask',asks],['bid',bids]]){
+  const container=$('book-'+side+'s');let nodes=bookNodes.get(side);
+  if(!nodes){
+   nodes=Array.from({length:11},()=>{
+    const node=document.createElement('div');node.className='book-row '+side;
+    for(let i=0;i<3;i++)node.append(document.createElement('span'));
+    node.onclick=()=>pickPrice(Number(node.dataset.price));container.append(node);return node;
+   });bookNodes.set(side,nodes);
+  }
+  values.forEach(([p,cum],i)=>{
+   const node=nodes[side==='ask'?10-i:i],prev=i?values[i-1][1]:0;
+   node.dataset.price=p;node.style.setProperty('--depth',(cum/max*100).toFixed(1)+'%');
+   [priceText(p,cur.sym),units(cum-prev,star?2:0),units(cum,star?2:0)].forEach((text,j)=>{if(node.children[j].textContent!==text)node.children[j].textContent=text});
+  });
+ }
  const node=$('book-last');node.textContent=priceText(mid,cur.sym);node.className=$('price').dataset.direction==='down'?'red':'green';
  $('book-spread').textContent=star&&market?`公允 ${units(market.fair,2)}`:'';
 }
 function pickPrice(p){if(mode==='spot')renderSpotForm();msg(`档位价格 ${priceText(p,cur.sym)}`)}
-function renderTape(rows){
+function renderTape(rows,seq){
+ if(!paneVisible('chat','tape')){scheduleVisual('tape',()=>{if(!paneVisible('chat','tape'))return false;renderTape(market?.tape??rows,market?.tape_seq??seq)});return}
+ if(!changed('tape',seq===undefined?rows:seq))return;
  $('tape-rows').innerHTML=(rows||[]).map(([t,p,u])=>`<div class="tape-row"><span class="${u>=0?'t-buy':'t-sell'}">${priceText(p,'NSTAR')}</span>`+
   `<span>${units(Math.abs(u),2)}</span><span>${escapeHtml(new Date(t).toLocaleTimeString())}</span></div>`).join('')||
   '<div class="empty">NSTAR 暂无成交，来做第一笔吧</div>';
 }
 function renderMarket(m){
- market=m;const star=cur.sym==='NSTAR';
+ market=m;
+ if(m&&Object.prototype.hasOwnProperty.call(m,'prev_close')){
+  quoteReferences.set('NSTAR',{close:Number.isFinite(m.prev_close)&&m.prev_close>0?m.prev_close:undefined,at:Date.now()});
+  scheduleVisual('quote-change',renderQuoteChange);
+ }
+ scheduleVisual('market',()=>paintMarket(market));
+}
+function paintMarket(m){
+ const star=cur.sym==='NSTAR';
  document.querySelectorAll('[data-nstar]').forEach(el=>el.hidden=!star);
  if(!m)return;
  if(star){
@@ -814,9 +1026,12 @@ function renderMarket(m){
   $('stat-vol').textContent=compact(m.volume_24h);$('stat-turnover').textContent=compact(m.turnover_24h);
   const f=$('stat-funding');f.textContent=`${(m.funding_rate*100).toFixed(4)}%`;f.className=m.funding_rate>=0?'green':'red';
  }
- renderTape(m.tape);
+ renderTape(m.tape,m.tape_seq);renderBook(latestQuote?.price??quoteLast);
+ if(paneVisible('upper','book'))panelStatus('lbbar');
+ if(paneVisible('chat','tape'))panelStatus('chatpane');
 }
 function fundingCountdown(){
+ if(document.hidden)return;
  const left=3600000-(Date.now()%3600000),node=$('stat-countdown');
  if(node)node.textContent=new Date(left).toISOString().slice(11,19);
 }
@@ -828,21 +1043,44 @@ function bindTabs(attr){
   const key=btn.dataset[attr];
   document.querySelectorAll(`[data-${attr}]`).forEach(b=>b.setAttribute('aria-selected',b===btn));
   document.querySelectorAll(`[data-${attr}-pane]`).forEach(p=>p.hidden=p.dataset[attr+'Pane']!==key);
+  sendView();if(lastState)scheduleVisual('state',()=>paintState(lastState));
+  if(attr==='upper'&&key==='rank'){if(lbLoaded)scheduleVisual('lb',paintLeaderboard);else loadLeaderboard()}
+  if(attr==='upper'&&key==='book'){panelStatus('lbbar');renderBook(latestQuote?.price??quoteLast)}
+  if(attr==='chat'){panelStatus('chatpane');if(key==='chat')scheduleVisual('chat',paintChat);else renderTape(market?.tape,market?.tape_seq)}
+  requestRender();
  });
 }
 ['lower','upper','chat'].forEach(bindTabs);
-/* boot */
+/* boot: HTTP seeds once; the first WS open only sends the subscription. */
+let booted=false;
+$('low-power').checked=lowPower;
+$('low-power').onchange=()=>{
+ lowPower=$('low-power').checked;try{localStorage.fx_low_power=String(lowPower)}catch(_){}
+ clearTimeout(frameTimer);frameTimer=null;sendView();requestRender();
+};
+function visibilityChanged(){
+ sendView();
+ if(document.hidden){
+  if(frame!==null)cancelAnimationFrame(frame);frame=null;clearTimeout(frameTimer);frameTimer=null;
+  needsK=true;return;
+ }
+ // Reset the silence clock after OS/browser suspension; a 500ms quote is not a heartbeat deadline.
+ wsLastMessage=Date.now();lastFrame=-Infinity;
+ refresh();needsK=false;loadK();if(historyDirty)loadHistory();if(chatDirty)loadChat();
+ if(paneVisible('upper','rank'))loadLeaderboard();requestRender();
+}
 async function boot(){
- if(!await me()){$('auth').style.display='flex';$('shell').hidden=true;return}
+ if(booted)return;
+ booted=true;
+ if(!await me()){booted=false;$('auth').style.display='flex';$('shell').hidden=true;return}
  $('auth').style.display='none';$('shell').hidden=false;
  resizeSides();new ResizeObserver(resizeSides).observe($('wrap'));
- await loadSymbols();refresh();loadK();loadLeaderboard();loadHistory();loadChat();loadMarket();wsConnect();
- // WS pushes state, quotes, candles and market data; HTTP polling only covers a dropped
- // socket, and nothing polls while the tab is hidden.
+ loadSymbols();refresh();loadK();loadHistory();loadChat();loadMarket();wsConnect();
+ if(paneVisible('upper','rank'))loadLeaderboard();
  setInterval(()=>{if(pollNeeded())refresh()},5000);
- setInterval(()=>{if(pollNeeded()||!isSim(cur.sym)&&!document.hidden)loadK()},30000);
- setInterval(fundingCountdown,1000);
- setInterval(()=>{if(!document.hidden&&cur.sym!=='NSTAR'&&$('chatpane').querySelector('[data-chat-pane="tape"]')?.hidden===false)loadMarket()},15000);
- document.addEventListener('visibilitychange',()=>{if(!document.hidden){refresh();if(!wsLive)loadK()}});
+ setInterval(()=>{if(pollNeeded())loadK()},30000);
+ setInterval(()=>{if(!document.hidden)scheduleVisual('countdown',fundingCountdown)},1000);
+ setInterval(checkSocket,10000);
+ document.addEventListener('visibilitychange',visibilityChanged);
 }
 if(TOKEN)boot();else{$('auth').style.display='flex'}

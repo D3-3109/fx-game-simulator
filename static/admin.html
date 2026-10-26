@@ -2,11 +2,11 @@
 <html lang="zh">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>FXSIM · 管理员</title>
+<title>NSTAR · 管理员</title>
 <link rel="stylesheet" href="/admin.css">
 </head>
 <body><main>
-<div class="toolbar"><h1>FXSIM 管理员</h1><a href="/">返回交易</a><button id="logout" hidden>退出管理</button></div>
+<div class="toolbar"><h1>NSTAR 管理员</h1><a href="/">返回交易</a><button id="logout" hidden>退出管理</button></div>
 <p class="muted">仅操作模拟资金，无真实支付。HTTP 未加密，请仅在本机或可信 VPN 网络使用。</p>
 <div id="message" role="status" aria-live="polite"></div>
 <section id="login">
@@ -21,8 +21,8 @@
    <button id="fund-button">确认充值</button></form>
   <p class="muted">充值不会计为交易盈利；排行榜收益以初始资金＋累计充值为基数。单次最多 $1,000,000,000.00。</p>
  </section>
- <section><h2>币种白名单</h2>
-  <p class="muted">关闭后禁止新开仓；已有持仓仍可平仓、强平。Provider 为数据源策略，外汇主源失败会使用备用源。</p>
+ <section><h2>NSTAR 交易开关</h2>
+  <p class="muted">仅提供 NSTAR/USDT 模拟交易。关闭后禁止新开仓；已有持仓仍可平仓、强平。</p>
   <div class="scroll"><table><thead><tr><th>币种对</th><th>Provider</th><th>启用</th></tr></thead><tbody id="symbols"></tbody></table></div>
  </section>
  <section><div class="toolbar"><h2>账号管理</h2><button id="refresh">刷新</button></div>

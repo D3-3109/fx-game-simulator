@@ -3,6 +3,32 @@ const assert = require('node:assert/strict');
 const vm = require('node:vm');
 const script = require('node:fs').readFileSync(0, 'utf8');
 const elements = {};
+let domWrites=0;
+const frames=new Map();let frameId=0;
+function mockNode(tag='div',id=''){
+ const node={tag,id,children:[],parentElement:null,style:{setProperty(key,value){this[key]=value;domWrites++;}},dataset:{},hidden:false,value:'',className:'',
+  clientHeight:id==='workspace'?600:400,clientWidth:1000,offsetHeight:10,scrollHeight:0,scrollTop:0,attributes:{},options:[],listeners:{},html:'',text:'',htmlWrites:0,
+  addEventListener(type,fn){(this.listeners[type]||=[]).push(fn);},reportValidity(){return true;},
+  setAttribute(key,value){this.attributes[key]=String(value);domWrites++;},removeAttribute(key){delete this.attributes[key];domWrites++;},
+  setPointerCapture(id){this.capture=id;},add(option){this.options.push(option);},
+  append(...children){for(const child of children)this.insertBefore(child,null);},
+  insertBefore(child,before){if(child.parentElement)child.remove();const i=before?this.children.indexOf(before):-1;this.children.splice(i<0?this.children.length:i,0,child);child.parentElement=this;this.html='';domWrites++;},
+  remove(){if(this.parentElement){const a=this.parentElement.children;a.splice(a.indexOf(this),1);this.parentElement=null;domWrites++;}},
+  replaceChildren(...children){this.children.forEach(n=>n.parentElement=null);this.children=[];this.options=[];this.html='';this.text='';domWrites++;this.append(...children);},
+  closest(){for(let n=this;n;n=n.parentElement)if(n.hidden)return n;return null;},
+  querySelector(){return this;},
+ };
+ Object.defineProperties(node,{
+  textContent:{get(){return this.text;},set(v){this.text=v;this.html='';domWrites++;}},
+  innerHTML:{get(){return this.html||this.children.map(n=>n.outerHTML).join('')||String(this.text);},set(v){this.html=v;this.children=[];this.text='';this.htmlWrites++;domWrites++;}},
+  outerHTML:{get(){return `<${this.tag}${this.className?' class="'+this.className+'"':''}>${this.innerHTML}</${this.tag}>`;}}
+ });return node;
+}
+const panels={};
+const documentMock={hidden:false,querySelectorAll(){return [];},querySelector(selector){return panels[selector]??null;},
+ getElementById(id){return elements[id]||=mockNode('div',id);},createElement:tag=>mockNode(tag),addEventListener(){},head:{append(){}},title:''};
+function flushFrames(){const pending=[...frames.values()];frames.clear();for(const fn of pending)fn(now);}
+
 let autoScale = false, sets = 0, updates = [], removed = [], ranges = [];
 let response = [], displayed = [], now = Date.now(), requests = [], responseStamp = 0;
 const series = {
@@ -16,7 +42,7 @@ const series = {
     updates.push(bar);
   },
   removePriceLine(line) { removed.push(line); },
-  createPriceLine(options) { return options; },
+  createPriceLine(options) { return {...options,changes:0,applyOptions(next){Object.assign(this,next);this.changes++;}}; },
 };
 const scale = { applyOptions(options) { autoScale = options.autoScale; } };
 const chart = {
@@ -24,20 +50,13 @@ const chart = {
   timeScale() { return {setVisibleLogicalRange(range) { ranges.push(range); }}; },
 };
 const context = vm.createContext({
-  document: {querySelectorAll() { return []; },getElementById(id) {
-    return elements[id] ||= {style: {setProperty(key,value){this[key]=value;}}, dataset: {}, hidden:false, value: '', textContent: '', innerHTML: '',
-      clientHeight:id==='workspace'?600:400,clientWidth:1000,offsetHeight:10,scrollHeight:0,scrollTop:0,attributes:{},
-      addEventListener() {}, reportValidity() { return true; },
-      setAttribute(key,value) { this.attributes[key]=String(value); },
-      removeAttribute(key) { delete this.attributes[key]; },
-      setPointerCapture(id) { this.capture=id; },
-      options:[],add(option) { this.options.push(option); },replaceChildren(){this.options=[];},
-      querySelector() { return this; }};
-  }},
+  document:documentMock,
   localStorage: {},
-  location: {host:'localhost:8000'},
-  WebSocket: class {},
-  AbortSignal,
+  location: {host:'localhost:8000',reload(){this.reloaded=true;}},
+  WebSocket: class {constructor(){this.sent=[];}send(text){this.sent.push(JSON.parse(text));}close(){this.closed=true;this.readyState=3;}},
+  AbortSignal,AbortController,
+  requestAnimationFrame(callback){frames.set(++frameId,callback);return frameId;},cancelAnimationFrame(id){frames.delete(id);},
+  setInterval(){},ResizeObserver:class {observe(){}},
   Date: class extends Date {static now(){return now;} },
   Option: class {constructor(text,value){this.text=text;this.value=value??text;} },
   fetch: async url => { requests.push(url); return {json: async () => ({ok: true, klines: response, updated_at: responseStamp})}; },
@@ -47,7 +66,8 @@ const context = vm.createContext({
 vm.runInContext(script, context);
 Object.assign(context, {testSeries: series, testChart: chart});
 vm.runInContext('series=testSeries;chart=testChart;', context);
-const run = code => vm.runInContext(code, context);
+const raw = code => vm.runInContext(code, context);
+const run = code => {const result=raw(code);flushFrames();return result?.then?result.then(value=>{flushFrames();return value;}):result;};
 const candle = price => {
   const time = Math.floor(Date.now() / 1000 / 300) * 300;
   return [[(time-300)*1000,price,price+1,price-1,price],
@@ -59,8 +79,8 @@ const candle = price => {
   const makeLoader=()=>{
     const scripts=[],timers=new Map(),loaderElements={};let clock=0;
     const sandbox=vm.createContext({...context,LightweightCharts:undefined,localStorage:{},
-      document:{querySelectorAll() { return []; },getElementById(id){return loaderElements[id]||={...context.document.getElementById(id),
-          style:{setProperty(key,value){this[key]=value;}},attributes:{},dataset:{},options:[],value:''};},
+      document:{...documentMock,querySelectorAll() { return []; },getElementById(id){return loaderElements[id]||={...context.document.getElementById(id),
+          style:{setProperty(key,value){this[key]=value;}},attributes:{},dataset:{},options:[],listeners:{},value:''};},
         head:{append(node){scripts.push(node);}},
         createElement(tag){assert.equal(tag,'script');return {remove(){this.removed=true;}};}},
       setTimeout(callback,ms){assert.equal(ms,5000);timers.set(++clock,callback);return clock;},
@@ -70,11 +90,11 @@ const candle = price => {
     return {sandbox,scripts,timers,load:()=>vm.runInContext('loadChartLibrary()',sandbox),
       ready(){sandbox.LightweightCharts={version:()=> '5.2.1',CandlestickSeries:{type:'Candlestick'}};}};
   };
-  const tick=()=>new Promise(resolve=>setImmediate(resolve));
+  const tick=()=>new Promise(resolve=>setImmediate(()=>{flushFrames();resolve();}));
   const cdn=makeLoader(),cdnLoad=cdn.load();
   assert.equal(cdn.load(),cdnLoad,'parallel chart requests downloaded library twice');
   assert.equal(cdn.scripts.length,1);
-  assert.equal(cdn.scripts[0].src,'https://unpkg.com/lightweight-charts@5.2.1/dist/lightweight-charts.standalone.production.js');
+  assert.equal(cdn.scripts[0].src,'/assets/lightweight-charts-5.2.1.js');
   assert.equal(cdn.scripts[0].crossOrigin,'anonymous');
   assert.equal(cdn.scripts[0].integrity,'sha256-4hzFyqAibvML2FScULnvkmYV8qTua05IY1NHelX1mM8=');
   cdn.ready();cdn.scripts[0].onload();await cdnLoad;
@@ -82,7 +102,7 @@ const candle = price => {
   const fallback=makeLoader(),fallbackLoad=fallback.load();
   fallback.scripts[0].onerror();await tick();
   assert.equal(fallback.scripts[0].removed,true);
-  assert.equal(fallback.scripts[1].src,'/assets/lightweight-charts-5.2.1.js');
+  assert.equal(fallback.scripts[1].src,'https://unpkg.com/lightweight-charts@5.2.1/dist/lightweight-charts.standalone.production.js');
   assert.equal(fallback.scripts[1].integrity,fallback.scripts[0].integrity);
   fallback.ready();fallback.scripts[1].onload();await fallbackLoad;
   const timeout=makeLoader(),timeoutLoad=timeout.load();
@@ -101,48 +121,83 @@ const candle = price => {
 
   // First selection, request and live aggregation must agree before any change event.
   assert.equal(run('cur.itv'), '15m', 'default K-line state is not 15m');
-  assert.equal(run('cur.sym'), 'USDJPY');
+  assert.equal(run('cur.sym'), 'NSTAR');
   assert.equal(run('itvSel.value'), '15m', 'initial selector disagrees with default');
   assert.equal(run('symSel.value'), run('cur.sym'));
-  response = candle(1.1);
+  assert.deepEqual(elements.sym.options.map(option=>option.value),['NSTAR'],'startup exposed legacy pairs');
+  assert.equal(elements.sym.disabled,true,'NSTAR display offered a symbol switch');
+  assert.equal(typeof elements.sym.onchange,'undefined','legacy symbol switch handler is still installed');
+  assert.deepEqual(elements.itv.options.map(option=>option.value),['1s','1m','5m','15m','30m','1h','4h','1d','1w']);
+  response = candle(100);
   await run('loadK()');
-  assert.match(requests[0], /symbol=USDJPY&interval=15m(?:&|$)/, 'initial request used wrong symbol/timeframe');
+  assert.match(requests[0], /symbol=NSTAR&interval=15m(?:&|$)/, 'initial request used wrong symbol/timeframe');
   assert.equal(run('lastItv'), '15m');
   sets = 0; updates = []; ranges = [];
   assert.equal(elements['chartpane-status'].hidden, true, 'chart loader stayed after HTTP candles');
   assert.equal(elements.chartpane.attributes['aria-busy'], 'false');
 
-  // Whitelist changes arrive over WS. A disabled selected chart is viewable, not tradable.
+  // New NSTAR-only HTTP settings and older mixed WS settings expose the same single pair.
   assert.equal(elements['trade-buy'].disabled,true,'trade enabled before whitelist loaded');
-  context.symbolSettings={version:10,rows:[{symbol:'USDJPY',enabled:true},{symbol:'FXSIM',enabled:true}]};
-  run('applySymbols(symbolSettings)');
+  const originalFetch=context.fetch;
+  context.fetch=async url=>{assert.equal(url,'/api/symbols');return {json:async()=>({ok:true,version:8,rows:[{symbol:'NSTAR',enabled:true}]})};};
+  await run('loadSymbols()');context.fetch=originalFetch;
+  assert.deepEqual([...run('tradableSymbols')],['NSTAR'],'NSTAR-only API did not load');
   assert.equal(elements['trade-buy'].disabled,true,'trade enabled before any quote');
-  run("renderQuote(150,'USDJPY',149.99,150.01,true)");
-  assert.equal(elements['trade-buy'].disabled,false);
-  context.symbolSettings={version:11,rows:[{symbol:'USDJPY',enabled:false},{symbol:'FXSIM',enabled:true}]};
+  run("renderQuote(100,'NSTAR',99.97,100.03,true)");
+  assert.equal(elements['trade-buy'].disabled,false);assert.equal(elements['spot-submit'].disabled,false);
+  context.symbolSettings={version:10,rows:[{symbol:'USDJPY',enabled:true},{symbol:'NSTAR',enabled:true},{symbol:'BTCUSDT',enabled:true},{symbol:'FXSIM',enabled:true}]};
   context.symbolPacket=JSON.stringify({type:'symbols',...context.symbolSettings});
   run('wsConnect();ws.onmessage({data:symbolPacket})');
+  assert.deepEqual([...run('tradableSymbols')],['NSTAR'],'mixed API enabled legacy trading');
+  assert.deepEqual(elements.sym.options.map(option=>option.value),['NSTAR'],'mixed API exposed legacy choices');
+  assert.equal(elements.sym.disabled,true);
+  context.symbolSettings={version:11,rows:[{symbol:'NSTAR',enabled:false},{symbol:'FXSIM',enabled:true}]};
+  context.symbolPacket=JSON.stringify({type:'symbols',...context.symbolSettings});
+  run('ws.onmessage({data:symbolPacket})');
   assert.equal(elements['trade-buy'].disabled,true);assert.equal(elements['trade-sell'].disabled,true);
-  assert.equal(run('cur.sym'),'USDJPY','disable silently changed selected pair');
-  const disabledOption=elements.sym.options.find(option=>option.value==='USDJPY');
+  assert.equal(elements['spot-submit'].disabled,true);
+  assert.equal(run('cur.sym'),'NSTAR','disable silently changed selected pair');
+  assert.deepEqual(elements.sym.options.map(option=>option.value),['NSTAR']);
+  const disabledOption=elements.sym.options[0];
   assert.equal(disabledOption.disabled,true);assert.match(disabledOption.text,/仅查看/);
-  run('applySymbols({version:9,rows:[{symbol:"USDJPY",enabled:true}]})');
+  run('applySymbols({version:9,rows:[{symbol:"NSTAR",enabled:true}]})');
   assert.equal(elements['trade-buy'].disabled,true,'stale configuration re-enabled trading');
   const beforeOrders=requests.length;await run("trade('buy')");
   assert.equal(requests.length,beforeOrders,'disabled order still submitted');
   let resolveSymbols;
-  const originalFetch=context.fetch;context.fetch=()=>new Promise(resolve=>{resolveSymbols=resolve;});
+  context.fetch=()=>new Promise(resolve=>{resolveSymbols=resolve;});
   const loadingSymbols=run('loadSymbols()');
   run('applySymbols({version:12,rows:[{symbol:"FXSIM",enabled:true}]})');
-  resolveSymbols({json:async()=>({ok:true,version:10,rows:[{symbol:'USDJPY',enabled:true}]})});await loadingSymbols;
+  assert.deepEqual([...run('tradableSymbols')],[],'legacy-only settings enabled a hidden pair');
+  resolveSymbols({json:async()=>({ok:true,version:10,rows:[{symbol:'NSTAR',enabled:true}]})});await loadingSymbols;
   assert.equal(elements['trade-buy'].disabled,true,'late HTTP enabled disabled symbol');
-  context.fetch=async()=>({json:async()=>({ok:false,err:'禁用'})});
-  elements.sym.value='FXSIM';await run('symSel.onchange()');
-  assert.equal(run('cur.sym'),'USDJPY','failed switch changed chart pair');
-  assert.equal(elements.sym.value,'USDJPY','failed switch did not restore selector');
   run('applySymbols({version:13,rows:[]})');
   assert.equal(elements.sym.disabled,true);assert.match(elements['symbol-status'].textContent,/暂无启用/);
+  assert.equal(elements.sym.value,'NSTAR');assert.equal(elements.sym.options.length,1);
   context.fetch=originalFetch;
+
+  // Account state may contain legacy records, but must never replace the production pair/query.
+  const startupState={ok:true,symbol:'NSTAR',price:100,bid:99.97,ask:100.03,quote_valid:true,balance:10000,equity:10000,used:0,leverage:10,positions:[]};
+  context.startupState=startupState;
+  const startupRequests=[];
+  context.fetch=async url=>{startupRequests.push(url);assert.equal(url,'/api/state');return {json:async()=>startupState};};
+  await run('refresh()');
+  assert.equal(elements['positions-status'].hidden,true,'NSTAR-only account did not load');
+  startupState.symbol='USDJPY';startupState.price=150;
+  await run('refresh()');
+  assert.equal(run('cur.sym'),'NSTAR','legacy account replaced NSTAR default');
+  assert.equal(elements.sym.value,'NSTAR');
+  assert.deepEqual(startupRequests,['/api/state','/api/state'],'state refresh requested legacy chart data');
+  run('ws.onmessage({data:JSON.stringify({type:"state",...startupState})})');
+  assert.equal(run('cur.sym'),'NSTAR','legacy WS state replaced NSTAR default');
+  context.fetch=originalFetch;
+  run("setMode('spot')");assert.equal(elements['spot-form'].hidden,false);assert.equal(elements['perp-form'].hidden,true);
+  run("setMode('perp')");assert.equal(elements['spot-form'].hidden,true);assert.equal(elements['perp-form'].hidden,false);
+  assert.equal(run('cur.sym'),'NSTAR');
+  const beforeInterval=requests.length;run("pickItv('1s')");await tick();
+  assert.match(requests[beforeInterval],/symbol=NSTAR&interval=1s(?:&|$)/);
+  assert.equal(run('cur.itv'),'1s');
+  sets=0;updates=[];ranges=[];
 
   // Incoming data cannot alter old chart while new history is loading.
   run("cur={sym:'BTCUSDT',itv:'5m'};kLoaded=false;");
@@ -315,7 +370,6 @@ const candle = price => {
   assert.equal(elements['lbbar-status'].dataset.state,'error');
   context.fetch=async()=>({json:async()=>({ok:true,rows:[]})});await run('loadLeaderboard()');
   assert.equal(elements['lbbar-status'].hidden,true,'HTTP leaderboard success stayed loading');
-  run('symSynced=true;');
   context.fetch=async()=>({json:async()=>JSON.parse(context.statePacket)});await run('refresh()');
   assert.equal(elements['positions-status'].hidden,true,'HTTP state success stayed loading');
   context.fetch=normalFetch;
@@ -352,8 +406,9 @@ const candle = price => {
   await run('setLev()');assert.equal(blocked.length,0,'in-position leverage changed');
   context.levState.positions=[];run('render(levState)');context.fetch=normalFetch;
 
-  // Order UX: validate lots, block duplicates and symbol switches, always unlock on errors.
-  run('applySymbols({version:100,rows:[{symbol:"FXSIM",enabled:true}]});cur.sym="FXSIM";render(levState);setLots(.01);syncOrderControls()');
+  // NSTAR order UX: validate lots, block duplicates, keep pair read-only and unlock on errors.
+  context.levState={...context.levState,symbol:'NSTAR',price:100,bid:99.97,ask:100.03,contract:.01};
+  run('applySymbols({version:100,rows:[{symbol:"NSTAR",enabled:true}]});cur.sym="NSTAR";render(levState)');run('setLots(.01);syncOrderControls()');
   assert.equal(elements.lots.value,'0.01');assert.equal(elements['close-all'].disabled,true);
   let finishOrder,orderCalls=0;
   context.fetch=()=>{orderCalls++;return new Promise(resolve=>{finishOrder=resolve;});};
@@ -396,12 +451,16 @@ const candle = price => {
   context.fetch=normalFetch;
 
   // Realized history distinguishes forced close, escapes symbols and handles empty/error/retry.
-  const ledger=[{id:10,time:1800000000000,kind:'stopout',position_id:9,symbol:'<img onerror="bad">',side:'long',lots:.1,entry:1,price:.9998,pnl:-2,balance:48,margin_level:.49}];
+  const ledger=[{id:10,time:1800000000000,kind:'stopout',position_id:9,symbol:'<img onerror="bad">',side:'long',lots:.1,entry:1,price:.9998,pnl:-2,balance:48,margin_level:.49},
+    {id:9,time:1800000000000,kind:'close',position_id:8,symbol:'USDJPY',currency:'LEGACY',side:'long',lots:.1,entry:149,price:150,pnl:100,balance:50},
+    {id:8,time:1800000000000,kind:'close',position_id:7,symbol:'BTCUSDT',side:'short',lots:.01,entry:60000,price:59900,pnl:1,balance:49}];
   context.fetch=async()=>({json:async()=>({ok:true,rows:ledger})});
   await run('loadHistory()');
   assert.equal(elements['history-status'].hidden,true);
   assert.match(elements.historyT.innerHTML,/强平/);assert.match(elements.historyT.innerHTML,/-\$2\.00/);
   assert.match(elements.historyT.innerHTML,/&lt;img/);assert.doesNotMatch(elements.historyT.innerHTML,/<img/);
+  assert.match(elements.historyT.innerHTML,/USDJPY/);assert.match(elements.historyT.innerHTML,/旧口径 100\.00/);
+  assert.match(elements.historyT.innerHTML,/BTC\/USDT/,'NSTAR-only UI filtered historical symbols');
   context.fetch=async()=>({json:async()=>({ok:true,rows:[]})});await run('loadHistory()');
   assert.match(elements.historyT.innerHTML,/暂无成交记录/);
   context.fetch=async()=>{throw Error('offline')};await run('loadHistory()');
@@ -512,7 +571,7 @@ const candle = price => {
   const saved=context.localStorage;
   const otherElements={};
   const fresh=vm.createContext({...context,localStorage:{...saved,fx_sidebar_widths:'{"left":300,"right":260}',fx_history_ratio:.7},
-    document:{querySelectorAll() { return []; },getElementById(id){return otherElements[id]||=( {...elements.splitter,style:{setProperty(key,value){this[key]=value;}},attributes:{},clientWidth:1000,clientHeight:600});}}});
+    document:{...documentMock,querySelectorAll() { return []; },getElementById(id){return otherElements[id]||=( {...elements.splitter,style:{setProperty(key,value){this[key]=value;}},attributes:{},clientWidth:1000,clientHeight:600});}}});
   vm.runInContext(script,fresh);
   assert.equal(vm.runInContext('sideWidths.left',fresh),300);
   assert.equal(vm.runInContext('sideWidths.right',fresh),260);
@@ -529,17 +588,16 @@ const candle = price => {
     ResizeObserver:class {constructor(callback){this.callback=callback;}observe(el){observe=this.callback;assert.equal(el,elements.cv);}},
   });
   run('chart=null;initChart()');
-  elements.cv.clientHeight=250;elements.cv.clientWidth=700;observe();
+  elements.cv.clientHeight=250;elements.cv.clientWidth=700;observe();flushFrames();
   assert.equal(applied.height,250);assert.equal(applied.width,700);
-  elements.cv.clientHeight=0;observe();assert.equal(applied.height,250, 'hidden chart was resized to zero');
+  elements.cv.clientHeight=0;observe();flushFrames();assert.equal(applied.height,250, 'hidden chart was resized to zero');
   run('chart=testChart');
 
-  // Switching clears former symbol's position lines immediately.
+  // Legacy position lines remain filtered by the current chart without a UI switch entry.
   removed=[];
-  run("realApi=api;realRefresh=refresh;realLoadK=loadK;loadK=()=>{};refresh=()=>{};api=async()=>({ok:true});cur.sym='BTCUSDT';priceLines=[{price:60000}];curPos=[{sym:'BTCUSDT',entry:60000,side:'long',lots:.1}];symSel.value='FXSIM';itvSel.value='5m';");
-  await run('symSel.onchange()');
-  assert.equal(removed.length, 1, 'old position line survives symbol switch');
-  assert.equal(run('priceLines.length'), 0);
+  run("cur.sym='NSTAR';priceLines=new Map([[99,{line:{price:60000}}]]);curPos=[{sym:'BTCUSDT',entry:60000,side:'long',lots:.1}];drawPosLines()");
+  assert.equal(removed.length, 1, 'legacy position line survives on NSTAR chart');
+  assert.equal(run('priceLines.size'), 0);
   // Quote styling uses native precision; tick direction and daily change are independent.
   context.fetch=async url=>{assert.match(url,/interval=1d&limit=2$/);return {json:async()=>({ok:true,klines:[[0,158,159,157,158.091],[86400000,158.091,159,157,158.290]]})};};
   run("cur.sym='USDJPY';pricePrecisions.set(cur.sym,3);quoteReferences.clear();renderQuote(158.290,cur.sym)");
@@ -580,7 +638,14 @@ const candle = price => {
   assert.equal(displayed.length,1,'live tick created Thursday candle beside Monday week');now=savedNow;
 
   const fs=require('node:fs');
-  assert.match(fs.readFileSync('static/index.html','utf8'),/id="chartpane"[^]*?id="msg"[^]*?id="chartpane-status"/);
+  const html=fs.readFileSync('static/index.html','utf8');
+  assert.match(html,/<title>— \| NSTAR\/USDT<\/title>/);
+  assert.match(html,/<select id="sym" disabled><option value="NSTAR">NSTAR\/USDT · 北极星币<\/option><\/select>/);
+  assert.match(html,/<b id="order-symbol">NSTAR\/USDT 永续<\/b>/);
+  assert.doesNotMatch(html,/USDJPY|BTCUSDT|FXSIM|真实行情/,'production HTML advertised legacy markets');
+  assert.match(html,/id="mode-perp"/);assert.match(html,/id="mode-spot"/);
+  assert.match(html,/id="stat-funding"/);assert.match(html,/id="tier-hint"/);
+  assert.match(html,/id="chartpane"[^]*?id="msg"[^]*?id="chartpane-status"/);
   assert.match(fs.readFileSync('static/app.css','utf8'),/#msg\{position:absolute;/,'toast must not occupy chart layout space');
   assert.match(fs.readFileSync('static/index.html','utf8'),/id="trade-buy"[^>]*>BUY<small id="buy-price">—<\/small><\/button>/);
   assert.match(fs.readFileSync('static/index.html','utf8'),/id="trade-sell"[^>]*>SELL<small id="sell-price">—<\/small><\/button>/);
@@ -589,7 +654,8 @@ const candle = price => {
   run("cur.sym='USDCNH';applySymbols({version:200,rows:[{symbol:'USDCNH',enabled:true}]});renderQuote(6.706195,cur.sym,6.70493,6.70746,true)");
   assert.equal(elements['buy-price'].textContent,'6.707460');
   assert.equal(elements['sell-price'].textContent,'6.704930');
-  assert.equal(elements['trade-buy'].disabled,false);
+  assert.equal(elements['trade-buy'].disabled,true,'legacy quote must not enable new trading');
+  assert.equal(run('quoteReady'),true,'compatibility quote validation was lost');
   run("renderQuote(158,'USDJPY',157.99,158.01,true)");
   assert.equal(elements['buy-price'].textContent,'6.707460','old symbol changed active ask');
   run("renderQuote(6.706195,'USDCNH',6.70493,6.70746,false)");
@@ -598,7 +664,7 @@ const candle = price => {
   const savedTimers={set:context.setTimeout,clear:context.clearTimeout};let expire;
   context.setTimeout=(callback,ms)=>{assert.equal(ms,30000);expire=callback;return 1;};
   run("renderQuote(6.706195,'USDCNH',6.70493,6.70746,true,Date.now())");
-  expire();assert.equal(elements['buy-price'].textContent,'—');assert.equal(elements['trade-sell'].disabled,true);
+  expire();flushFrames();assert.equal(elements['buy-price'].textContent,'—');assert.equal(elements['trade-sell'].disabled,true);
   context.setTimeout=savedTimers.set;context.clearTimeout=savedTimers.clear;
   run("cur.sym='BTCUSDT';pricePrecisions.set(cur.sym,2);renderQuote(60000.25,cur.sym,60000.249900000004,60000.2501,true)");
   assert.equal(elements['buy-price'].textContent,'60000.2501');assert.equal(elements['sell-price'].textContent,'60000.2499');
@@ -624,8 +690,6 @@ const candle = price => {
   assert.match(elements['tape-rows'].innerHTML,/t-buy">100\.50/);assert.match(elements['tape-rows'].innerHTML,/t-sell">99\.50/);
   run("renderTape([])");assert.match(elements['tape-rows'].innerHTML,/暂无成交/);
   // Mutations render the state embedded in their reply instead of issuing GET /api/state.
-  // An earlier block stubbed api/refresh/loadK; restore the shipped implementations.
-  run('api=realApi;refresh=realRefresh;loadK=realLoadK');
   const before=requests.length;
   context.fetch=async url=>{requests.push(url);return {status:200,json:async()=>({ok:true,state:{...JSON.parse(context.exState),balance:4321}})};};
   run("orderBusy=false;applySymbols({version:300,rows:[{symbol:'NSTAR',enabled:true}]});cur.sym='NSTAR';renderQuote(100,'NSTAR',99.97,100.03,true)");
@@ -654,5 +718,217 @@ const candle = price => {
   run('wsLive=true');assert.equal(run('pollNeeded()'),false);
   run('wsLive=false');assert.equal(run('pollNeeded()'),true);
   context.fetch=normalFetch;
-  console.log('PASS: chart scales/OHLC, stale-state guards, layout/loading, trading controls, v5 loading, split quotes/daily changes, out-of-flow toasts and exchange panels');
+
+  // Incremental simulated candles: 50 current-bar ticks are updates, not 500-bar resets.
+  context.fetch=normalFetch;now=t*1000;
+  run("cur={sym:'NSTAR',itv:'1m'};kLoaded=false;pendingSim.clear();pendingSimStamp=0;simStamp=0");
+  response=[[t*1000,100,101,99,100]];responseStamp=now;await run('loadK()');
+  const initialSets=sets;
+  for(let i=1;i<=50;i++)run(`updateSim([[${t*1000},100,${101+i/100},99,${100+i/100}]],${now+i})`);
+  assert.equal(sets,initialSets,'50 live updates invoked setData');
+  assert.equal(displayed.at(-1).close,100.5);
+  run(`updateSim([[${(t+60)*1000},101,102,100,101]],${now+60000})`);
+  assert.equal(sets,initialSets,'new consecutive bar invoked setData');
+  const staleSnapshot=JSON.stringify(displayed);
+  run(`updateSim([[${t*1000},100,999,1,999]],${now-1})`);
+  assert.equal(JSON.stringify(displayed),staleSnapshot,'old packet bypassed timestamp guard');
+  run(`updateSim([[${t*1000},100,105,95,100.5],[${(t+60)*1000},101,102,100,101]],${now+60001})`);
+  assert.equal(sets,initialSets+1,'closed-bar correction did not refresh history');
+  assert.equal(displayed[0].high,105);assert.equal(displayed[0].low,95);
+  const beforeTrim=sets;
+  for(let i=2;i<=700;i++)run(`updateSim([[${(t+i*60)*1000},101,102,100,101]],${now+i*60000})`);
+  assert.ok(run('simBars.length')<=564,'simulated history grew without bound');
+  assert.ok(sets-beforeTrim<=4,'bar retention reset data every new candle');
+
+  // Full-history fetches are singleflight; changing interval aborts the old fetch.
+  let resolveK,oldSignal;const kCalls=[];
+  context.fetch=(url,options)=>{kCalls.push(url);oldSignal=options.signal;return new Promise(resolve=>{resolveK=resolve;});};
+  const oneK=raw('loadK()'),sameK=raw('loadK()');assert.equal(oneK,sameK);assert.equal(kCalls.length,1);
+  const finishK=resolveK,signalK=oldSignal;
+  raw("cur.itv='5m';kLoaded=false");const newK=raw('loadK()');assert.equal(signalK.aborted,true,'superseded K fetch was not aborted');
+  resolveK({json:async()=>({ok:true,klines:response,updated_at:now+1})});await newK;
+  finishK({json:async()=>({ok:true,klines:response,updated_at:now})});await oneK;flushFrames();
+  assert.equal(run('lastItv'),'5m');context.fetch=normalFetch;
+
+  // Same state does not rebuild tables/account or position lines. Price lines use stable IDs.
+  run('cur.sym="NSTAR";render(JSON.parse(exState))');
+  const tableWrites=[elements.pos,elements.ordersT,elements.spotT,elements.acct].map(n=>n.htmlWrites);
+  const line=raw('priceLines.get(7).line'),removedBefore=removed.length;
+  run('render(JSON.parse(exState))');
+  assert.deepEqual([elements.pos,elements.ordersT,elements.spotT,elements.acct].map(n=>n.htmlWrites),tableWrites);
+  assert.equal(raw('priceLines.get(7).line'),line);assert.equal(removed.length,removedBefore);
+  run('render({...JSON.parse(exState),positions:[{...JSON.parse(exState).positions[0],entry:98}]})');
+  assert.equal(raw('priceLines.get(7).line'),line);assert.equal(line.changes,1);
+  run('render({...JSON.parse(exState),positions:[]})');assert.equal(removed.length,removedBefore+1);
+  run('renderBook(100)');const asks=[...elements['book-asks'].children],bids=[...elements['book-bids'].children];
+  run('renderBook(101)');assert.equal(asks.length,11);assert.equal(bids.length,11);
+  assert.deepEqual(elements['book-asks'].children,asks);assert.deepEqual(elements['book-bids'].children,bids);
+  run('renderTape([[1800000000000,100,1]],42)');const tapeWrites=elements['tape-rows'].htmlWrites;
+  run('renderTape([[1800000000000,101,2]],42)');assert.equal(elements['tape-rows'].htmlWrites,tapeWrites,'same tape sequence repainted');
+  run('renderTape([[1800000000001,101,2]],43)');assert.equal(elements['tape-rows'].htmlWrites,tapeWrites+1);
+  assert.equal(elements['spot-price'].listeners.input.length,1,'estimate rebound spot input listener');
+
+  // Chat only inserts new IDs, preserves existing nodes, crops at 100, and respects scroll position.
+  run('chatRows=[];chatNodes.clear();renderChat([{id:201,name:"a",time:Date.now(),text:"one"}])');
+  const firstChat=elements['chat-messages'].children[0],chatHtmlWrites=elements['chat-messages'].htmlWrites;
+  elements['chat-messages'].scrollHeight=1000;elements['chat-messages'].clientHeight=200;elements['chat-messages'].scrollTop=50;
+  run('renderChat([{id:202,name:"b",time:Date.now(),text:"two"}])');
+  assert.equal(elements['chat-messages'].children[0],firstChat);assert.equal(elements['chat-messages'].scrollTop,50);
+  assert.equal(elements['chat-messages'].htmlWrites,chatHtmlWrites,'chat append replaced the whole list');
+  run('renderChat([{id:202,name:"b",time:Date.now(),text:"two"}])');assert.equal(elements['chat-messages'].children.length,2);
+  elements['chat-messages'].scrollTop=800;
+  run('renderChat([{id:203,name:"c",time:Date.now(),text:"three"}])');assert.equal(elements['chat-messages'].scrollTop,1000);
+  run('renderChat(Array.from({length:110},(_,i)=>({id:204+i,name:"c",time:Date.now(),text:"x"})))');
+  assert.equal(elements['chat-messages'].children.length,100);assert.equal(run('chatNodes.size'),100);
+
+  // Hidden panels retain latest state but do not mutate their DOM until selected.
+  const posPane={hidden:true},bookPane={hidden:true},chatPane={hidden:true},rankPane={hidden:true},tapePane={hidden:true};
+  panels['[data-lower-pane="pos"]']=posPane;panels['[data-upper-pane="book"]']=bookPane;
+  panels['[data-chat-pane="chat"]']=chatPane;panels['[data-upper-pane="rank"]']=rankPane;panels['[data-chat-pane="tape"]']=tapePane;
+  const hiddenWrites=[elements.pos,elements.rankT,elements['tape-rows'],elements['chat-messages']].map(n=>n.htmlWrites);
+  const hiddenBook=elements['book-asks'].children[0].children[0].textContent;
+  run('render(JSON.parse(exState));renderLb([{name:"new",rank:1,equity:1,ret:0}]);renderBook(102);renderTape([[Date.now(),102,3]],44);renderChat([{id:999,name:"x",text:"hidden",time:Date.now()}])');
+  assert.deepEqual([elements.pos,elements.rankT,elements['tape-rows'],elements['chat-messages']].map(n=>n.htmlWrites),hiddenWrites);
+  assert.equal(elements['book-asks'].children[0].children[0].textContent,hiddenBook);
+  for(const panel of Object.values(panels))panel.hidden=false;
+  run('scheduleVisual("state",()=>paintState(lastState));requestRender()');
+  assert.match(elements['chat-messages'].innerHTML,/hidden/);assert.match(elements.pos.innerHTML,/openTpsl/);
+
+  // All hidden WS packets leave the DOM alone, but account safety/trade notifications still ingest.
+  run('wsConnect();ws.readyState=1;ws.onopen();tradeCursor=true;seenTrade=999;historyLoaded=true');
+  await tick();documentMock.hidden=true;raw('visibilityChanged()');const hiddenDOM=domWrites,hiddenSets=sets,hiddenRequests=requests.length;
+  raw('ws.onmessage({data:JSON.stringify({type:"state",...JSON.parse(exState),last_trade:{id:1000,kind:"stopout",currency:"USD",position_id:7,symbol:"NSTAR",margin_level:.1,pnl:-5}})})');
+  raw('ws.onmessage({data:JSON.stringify({type:"symbols",version:400,rows:[{symbol:"NSTAR",enabled:false}]})})');
+  raw('ws.onmessage({data:JSON.stringify({type:"quote",sym:"NSTAR",price:103,bid:102,ask:104,quote_valid:true,quote_at:Date.now(),time:Date.now(),klines:{"5m":[[Date.now(),103,104,102,103]]},market:{tape:[],tape_seq:45}})})');
+  raw('ws.onmessage({data:JSON.stringify({type:"chat",row:{id:1001,name:"x",text:"background",time:Date.now()}})})');
+  raw('ws.onmessage({data:JSON.stringify({type:"lb",rows:[],total:200,as_of:Date.now()})})');
+  raw('ws.onmessage({data:JSON.stringify({type:"nstar",kind:"rumor",text:"test",time:Date.now()})})');
+  raw('ws.onmessage({data:JSON.stringify({type:"resync",history:true,chat:true})})');
+  assert.equal(raw('chatDirty'),true);
+  flushFrames();assert.equal(domWrites,hiddenDOM,'hidden WS mutated the DOM');assert.equal(sets,hiddenSets);
+  assert.equal(requests.length,hiddenRequests,'hidden state triggered history/daily HTTP polling');
+  assert.equal(raw('historyDirty'),true);assert.equal(raw('seenTrade'),1000);assert.equal(frames.size,0);
+  assert.equal(raw('ws.sent.at(-1).visible'),false);
+  const resumeRequests=[];
+  context.fetch=async(url)=>{resumeRequests.push(url);return {json:async()=>url==='/api/state'?JSON.parse(context.exState):url.includes('/api/klines')?{ok:true,klines:response,updated_at:now}:{ok:true,rows:[],total:200}};};
+  documentMock.hidden=false;raw('visibilityChanged()');assert.equal(frames.size,1,'resume scheduled duplicate frames');await tick();
+  assert.match(elements.msg.textContent,/已触发强平 #7 NSTAR/,'background trade toast was lost');
+  assert.equal(resumeRequests.filter(url=>url.includes('/api/klines')).length,1,'resume fetched unbounded K history');
+  assert.equal(resumeRequests.filter(url=>url==='/api/history').length,1);assert.equal(raw('historyDirty'),false);
+  assert.equal(resumeRequests.filter(url=>url==='/api/chat').length,1);assert.equal(raw('chatDirty'),false);
+  assert.equal(raw('ws.sent.at(-1).visible'),true);
+
+  // Low power is persisted, sends server subscription control and caps visible updates at 2Hz.
+  const timers=new Map(),oldSet=context.setTimeout,oldClear=context.clearTimeout;let timerId=0;
+  context.setTimeout=(callback,ms)=>{timers.set(++timerId,{callback,ms});return timerId;};context.clearTimeout=id=>timers.delete(id);
+  run("$('low-power').checked=true;$('low-power').onchange()");
+  assert.equal(context.localStorage.fx_low_power,'true');assert.equal(raw('ws.sent.at(-1).low_power'),true);
+  assert.equal(raw('ws.sent.at(-1).interval'),'5m');
+  raw('ws.onmessage({data:JSON.stringify({sym:"NSTAR",price:110,bid:109,ask:111,quote_valid:true,quote_at:Date.now()})})');
+  assert.equal(frames.size,0,'low power bypassed 500ms gate');
+  const delayed=[...timers.values()].find(x=>x.ms>0&&x.ms<=500);assert.ok(delayed);
+  now+=500;delayed.callback();flushFrames();assert.match(elements.price.innerHTML,/110/);
+  raw('ws.onmessage({data:JSON.stringify({sym:"NSTAR",price:111,bid:110,ask:112,quote_valid:true,quote_at:Date.now()})})');
+  assert.equal(frames.size,0);run("$('low-power').checked=false;$('low-power').onchange()");assert.match(elements.price.innerHTML,/111/);
+  assert.equal(context.localStorage.fx_low_power,'false');context.setTimeout=oldSet;context.clearTimeout=oldClear;
+
+  // Shared Top50 cannot erase an independently delivered personal rank; pagination is auth + on demand.
+  run('ME="self";render({...JSON.parse(exState),leaderboard_me:{name:"self",rank:123,equity:4321,ret:0}})');
+  run('renderLb(Array.from({length:50},(_,i)=>({name:"u"+i,rank:i+1,equity:100,ret:0})),{total:201,as_of:Date.now()+1})');
+  assert.match(elements['rank-me'].textContent,/#123/);assert.match(elements['rank-me'].textContent,/4,321/);
+  const lbCalls=[];
+  context.fetch=async(url,options)=>{lbCalls.push(url);assert.match(options.headers.Authorization,/^Bearer /);return {json:async()=>({ok:true,rows:[{name:'page2',rank:51,equity:1,ret:0}],me:{name:'self',rank:124,equity:4321},total:201,as_of:now+2})};};
+  run('leaderboardPage(1)');await tick();assert.deepEqual(lbCalls,['/api/leaderboard?offset=50&limit=50']);
+  assert.match(elements.rankT.innerHTML,/>51</);assert.match(elements['rank-me'].textContent,/#124/);
+  rankPane.hidden=true;await run('loadLeaderboard()');assert.equal(lbCalls.length,1,'hidden ranking requested HTTP');rankPane.hidden=false;
+
+  // NSTAR daily change comes from an actual closed-day reference, with no extra K request.
+  const refRequests=[];context.fetch=async url=>{refRequests.push(url);return {json:async()=>({ok:false})};};
+  run('cur.sym="NSTAR";renderQuote(110,"NSTAR",109,111,true,Date.now());renderMarket({prev_close:100,tape:[]})');
+  assert.equal(elements['quote-change'].textContent,'+10.00  +10.00%');assert.equal(refRequests.length,0);
+  run('renderMarket({prev_close:null,open_24h:90,tape:[]})');assert.equal(elements['quote-change'].textContent,'','open24h must not impersonate prev_close');
+  // Quote timestamp guards survive throttled timers; expired spot/perp clicks never submit.
+  run('applySymbols({version:401,rows:[{symbol:"NSTAR",enabled:true}]});renderQuote(110,"NSTAR",109,111,true,Date.now())');
+  now+=30001;await run('trade("buy")');await run('spotTrade()');assert.equal(refRequests.length,0,'expired quote submitted an order');
+  assert.equal(raw('quoteReady'),false);
+  raw('acceptQuote(110,"NSTAR",109,111,true,Date.now());acceptQuote(1,"NSTAR",.9,1.1,true,Date.now()-1)');flushFrames();
+  assert.match(elements.price.innerHTML,/110/,'old quote overrode latest after coalescing');
+  // 401 still invalidates the account while the document is hidden.
+  context.localStorage.fx_token='expired';context.localStorage.removeItem=key=>delete context.localStorage[key];
+  context.fetch=async()=>({status:401,json:async()=>({ok:false})});documentMock.hidden=true;await raw('refresh()');
+  assert.equal(context.location.reloaded,true);assert.equal(context.localStorage.fx_token,undefined);documentMock.hidden=false;flushFrames();
+
+  // Silence timeout is 60s, never a normal 500ms tick; reconnect delay grows with jitter.
+  raw('wsLive=true;wsLastMessage=Date.now();wsOpenedAt=Date.now();ws.closed=false');now+=500;run('checkSocket()');assert.equal(raw('ws.closed'),false);
+  now+=59000;run('checkSocket()');assert.equal(raw('ws.closed'),false);
+  now+=1000;run('checkSocket()');assert.equal(raw('ws.closed'),true);
+  const delays=[];context.setTimeout=(callback,ms)=>{delays.push(ms);return delays.length;};
+  raw('wsAttempts=0;wsTimer=null;reconnectLater();wsTimer=null;reconnectLater();wsTimer=null;reconnectLater()');
+  assert.ok(delays[0]>=750&&delays[0]<=1250);assert.ok(delays[1]>=1500&&delays[1]<=2500);assert.ok(delays[2]>=3000&&delays[2]<=5000);
+  context.setTimeout=oldSet;
+
+  // First boot/open fetches each seed once, and NSTAR has exactly one K request (no dailyRef).
+  const initRequests=[],initEls={},initFrames=new Map();let initId=0;
+  const initDoc={...documentMock,hidden:false,getElementById(id){return initEls[id]||=mockNode('div',id);},querySelector(selector){return /upper-pane="rank"/.test(selector)?{hidden:true}:null;}};
+  const initContext=vm.createContext({...context,localStorage:{fx_token:'test',fx_low_power:'true'},document:initDoc,
+    requestAnimationFrame(fn){initFrames.set(++initId,fn);return initId;},cancelAnimationFrame(id){initFrames.delete(id);},
+    ResizeObserver:class{observe(){}},LightweightCharts:undefined,
+    fetch:async(url)=>{initRequests.push(url);return {json:async()=>url==='/api/me'?{ok:true,name:'tester'}:url==='/api/state'?JSON.parse(context.exState):url==='/api/symbols'?{ok:true,version:1,rows:[{symbol:'NSTAR',enabled:true}]}:url.includes('/api/klines')?{ok:true,klines:response,updated_at:now}:{ok:true,rows:[]}};}});
+  // Disable autoboot only until the chart doubles are injected.
+  initContext.localStorage.fx_token='';vm.runInContext(script,initContext);
+  Object.assign(initContext,{testChart:chart,testSeries:series});vm.runInContext('TOKEN="test";chart=testChart;series=testSeries',initContext);
+  await vm.runInContext('boot()',initContext);await tick();vm.runInContext('ws.readyState=1;ws.onopen()',initContext);await tick();
+  for(const fn of initFrames.values())fn();initFrames.clear();await tick();
+  for(const endpoint of ['/api/symbols','/api/state','/api/chat'])assert.equal(initRequests.filter(url=>url===endpoint).length,1,endpoint+' duplicated on open');
+  assert.equal(initRequests.filter(url=>url.includes('/api/klines')).length,1,'NSTAR boot fetched duplicate/daily K');
+  assert.equal(initRequests.some(url=>url.includes('/api/leaderboard')),false,'hidden initial ranking fetched');
+  assert.equal(vm.runInContext('lowPower',initContext),true);assert.equal(vm.runInContext('ws.sent[0].low_power',initContext),true);
+  assert.match(html,/label[^>]*for="low-power"/);
+  // Library and history requests begin together, before either resolves.
+  const parallel=makeLoader(),parallelRequests=[];let parallelReply;
+  parallel.sandbox.fetch=url=>{parallelRequests.push(url);return new Promise(resolve=>{parallelReply=resolve;});};
+  vm.runInContext('msg=()=>{}',parallel.sandbox);
+  const parallelLoad=vm.runInContext('loadK()',parallel.sandbox);
+  assert.equal(parallelRequests.length,1);assert.equal(parallel.scripts.length,1,'chart library waited for HTTP K');
+  parallel.ready();parallel.scripts[0].onload();parallelReply({json:async()=>({ok:false,err:'test'})});await parallelLoad;
+  context.fetch=normalFetch;
+
+  // Admin accepts the new one-row API, filters mixed responses and retains old audit symbols.
+  const adminElements={},adminRequests=[];
+  const node=()=>({children:[],attributes:{},value:'',textContent:'',hidden:false,disabled:false,
+    append(...children){this.children.push(...children);},add(option){this.children.push(option);},
+    replaceChildren(){this.children=[];},setAttribute(key,value){this.attributes[key]=String(value);}});
+  let adminRows=[{symbol:'NSTAR',provider:'simulation',enabled:true}];
+  const admin=vm.createContext({document:{getElementById(id){return adminElements[id]||=node();},createElement:node},
+    sessionStorage:{},Option:context.Option,AbortSignal,
+    fetch:async(url,options)=>{
+      adminRequests.push(url);
+      if(url==='/api/admin/users')return {json:async()=>({ok:true,rows:[{name:'tester',balance:10000,deposited:0,positions:0}]})};
+      if(url==='/api/admin/deposits')return {json:async()=>({ok:true,rows:[{time:now,kind:'symbol',enabled:false,name:'USDJPY',actor:'admin'}]})};
+      assert.equal(url,'/api/admin/symbols');
+      if(options.method==='POST'){
+        assert.deepEqual(JSON.parse(options.body),{symbol:'NSTAR',enabled:false});
+        adminRows=[{symbol:'USDJPY',provider:'legacy',enabled:true},{symbol:'NSTAR',provider:'simulation',enabled:false},{symbol:'BTCUSDT',provider:'legacy',enabled:true}];
+      }
+      return {json:async()=>({ok:true,rows:adminRows})};
+    }});
+  vm.runInContext(fs.readFileSync('static/admin.js','utf8'),admin);
+  await vm.runInContext('refresh()',admin);
+  assert.deepEqual(adminRequests,['/api/admin/users','/api/admin/deposits','/api/admin/symbols']);
+  assert.equal(adminElements.symbols.children.length,1);
+  assert.equal(adminElements.symbols.children[0].children[0].textContent,'NSTAR');
+  assert.equal(adminElements.users.children.length,1,'NSTAR-only admin refresh did not load accounts');
+  assert.equal(adminElements['fund-button'].disabled,false);
+  assert.equal(adminElements.audit.children[0].children[2].textContent,'USDJPY','legacy audit disappeared');
+  const toggle=adminElements.symbols.children[0].children[2].children[0];
+  assert.equal(toggle.checked,true);assert.equal(toggle.attributes['aria-label'],'启用 NSTAR');
+  toggle.checked=false;await toggle.onchange();
+  assert.equal(adminElements.symbols.children.length,1,'admin mixed response exposed legacy controls');
+  assert.equal(adminElements.symbols.children[0].children[0].textContent,'NSTAR');
+  assert.equal(adminElements.symbols.children[0].children[2].children[0].checked,false);
+  assert.match(adminElements.message.textContent,/NSTAR 已禁用新开仓/);
+  vm.runInContext("renderSymbols([{symbol:'USDJPY',enabled:true}])",admin);
+  assert.equal(adminElements.symbols.children.length,0,'legacy-only admin response exposed a switch');
+  assert.doesNotMatch(fs.readFileSync('static/admin.html','utf8'),/FXSIM|外汇主源/);
+  console.log('PASS: legacy OHLC/history/safety/trading guards; 50 ticks zero setData; bounded bars; DOM/price-line/book/chat reuse; hidden WS zero DOM; rAF/2Hz/view commands; Top50/personal rank/pagination; init singleflight/abort/parallel K; local v5/SRI fallback; prev_close; expiry/heartbeat/backoff');
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -68,6 +68,9 @@ fn password_hash(salt: &str, password: &str) -> String {
     hex::encode(Sha256::digest(format!("{salt}{password}")))
 }
 
+/// Order book levels as (price, units).
+pub type Levels = Vec<(f64, f64)>;
+
 #[derive(Debug, Clone)]
 pub struct User {
     pub name: String,
@@ -377,6 +380,32 @@ impl Store {
             cache.users.values().cloned().collect(),
             cache.deposits.clone(),
         ))
+    }
+    /// Players' resting limit orders on `symbol` as (price, units) summed per price: bids
+    /// highest first, asks lowest first, at most `levels` each. Only the totals are
+    /// published, never who placed them. Untriggered stop orders are not liquidity.
+    pub fn resting_book(&self, symbol: &str, levels: usize) -> (Levels, Levels) {
+        let mut bids = BTreeMap::<i64, f64>::new();
+        let mut asks = BTreeMap::<i64, f64>::new();
+        let contract = trading::contract(symbol);
+        for user in self.cache.read().unwrap().users.values() {
+            for o in &user.account.orders {
+                if o.symbol != symbol || o.kind != "limit" || !(o.price > 0.0 && o.lots > 0.0) {
+                    continue;
+                }
+                let side = if matches!(o.side.as_str(), "long" | "buy") {
+                    &mut bids
+                } else {
+                    &mut asks
+                };
+                *side.entry((o.price * 1e4).round() as i64).or_default() += o.lots * contract;
+            }
+        }
+        let row = |(price, units): (&i64, &f64)| (*price as f64 / 1e4, *units);
+        (
+            bids.iter().rev().take(levels).map(row).collect(),
+            asks.iter().take(levels).map(row).collect(),
+        )
     }
     /// Names of committed accounts matching `filter`, without cloning any account.
     pub fn names_where(&self, filter: impl Fn(&User) -> bool) -> Vec<String> {

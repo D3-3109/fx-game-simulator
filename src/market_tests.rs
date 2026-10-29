@@ -1575,3 +1575,44 @@ async fn restart_without_4h_history_only_relabels_day_candles() {
     assert_eq!(saved, vec![[1793203200.0, 1.0, 1.4, 0.8, 1.2]]);
     store.close().await;
 }
+
+#[tokio::test]
+async fn resting_book_sums_player_limit_orders_per_price() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("book.db")).await.unwrap();
+    let mut q: Prices = [(symbols::NSTAR.to_string(), 100.0)].into_iter().collect();
+    q.anchor.insert(symbols::NSTAR.into(), 100.0f64.ln());
+    for (name, kind, side, lots, price) in [
+        ("pa", "limit", "long", 100.0, 99.0),
+        ("pb", "limit", "long", 50.0, 99.0),
+        ("pc", "limit", "buy", 10.0, 98.5),
+        ("pd", "limit", "short", 30.0, 101.0),
+        ("pe", "stop", "long", 40.0, 102.0),
+    ] {
+        store.register(name, "password-1").await.unwrap();
+        store
+            .transaction(name, |account, _, _| {
+                account.place_order(
+                    kind,
+                    side,
+                    lots,
+                    symbols::NSTAR,
+                    price,
+                    0.0,
+                    0.0,
+                    0.0,
+                    &q,
+                    0,
+                )?;
+                Ok(vec![])
+            })
+            .await
+            .unwrap();
+    }
+    let (bids, asks) = store.resting_book(symbols::NSTAR, 50);
+    // Same-price orders merge, bids run highest first, and untriggered stops are excluded.
+    assert_eq!(bids, vec![(99.0, 1.5), (98.5, 0.1)]);
+    assert_eq!(asks, vec![(101.0, 0.3)]);
+    assert_eq!(store.resting_book(symbols::NSTAR, 1).0, vec![(99.0, 1.5)]);
+    store.close().await;
+}

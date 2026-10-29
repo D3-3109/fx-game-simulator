@@ -944,5 +944,25 @@ const candle = price => {
   run('queueSim([[1793203200000,1,2,0.5,1.5]],1)');
   assert.equal(displayed.at(-1).time,1793203200+8*3600,'queued bar lost or double-shifted the Beijing offset');
   run('CHART_SHIFT=0');
+  // Order book: fixed grid, resting player orders add to their level, changed levels flash.
+  run("cur={sym:'NSTAR',itv:'15m'};pricePrecisions.set('NSTAR',2);market={depth:50000,amm_width:.08,anchor:100,fair:100,resting:{bids:[[99.9,500]],asks:[]}}");
+  run('bookGrid=null;renderBook(100)');
+  const bidRows=elements['book-bids'].children,askRows=elements['book-asks'].children;
+  const size=node=>Number(node.children[1].textContent.replace(/,/g,''));
+  assert.equal(bidRows[0].children[0].textContent,'99.95');assert.equal(bidRows[1].children[0].textContent,'99.90');
+  assert.ok(size(bidRows[1])>500&&size(bidRows[1])<560,'resting bid missing from its level');
+  assert.ok(size(bidRows[0])<60,'resting bid leaked into the wrong level');
+  const flashBefore=bidRows[1].className,askBefore=askRows.map(n=>n.className);
+  run("market={...market,resting:{bids:[[99.9,600]],asks:[]}};renderBook(100)");
+  assert.notEqual(bidRows[1].className,flashBefore,'changed level did not flash');
+  assert.match(bidRows[1].className,/flash-[ab]/);
+  assert.deepEqual(askRows.map(n=>n.className),askBefore,'unchanged levels flashed');
+  // A small move keeps the 0.05 grid: 100.00 drops below the mid and becomes the top bid.
+  run('renderBook(100.01)');
+  assert.deepEqual(bidRows.slice(0,3).map(n=>n.children[0].textContent),['100.00','99.95','99.90']);
+  // Spacing does not flip as the price hovers around 100, but follows a doubled price.
+  run('bookGrid=null');assert.equal(run('bookStep(99.5)'),.05);assert.equal(run('bookStep(100.9)'),.05);
+  assert.equal(run('bookStep(99.5)'),.05);assert.equal(run('bookStep(205)'),.2);
+  run("market=null");
   console.log('PASS: legacy OHLC/history/safety/trading guards; 50 ticks zero setData; bounded bars; DOM/price-line/book/chat reuse; hidden WS zero DOM; rAF/2Hz/view commands; Top50/personal rank/pagination; init singleflight/abort/parallel K; local v5/SRI fallback; prev_close; expiry/heartbeat/backoff');
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -727,9 +727,19 @@ impl Market {
         drop(pending);
         let mut sim = feed.lock().await;
         let events = std::mem::take(&mut sim.book.events);
-        let packet = sim.packet();
+        let mut packet = sim.packet();
+        if sim.symbol == symbols::NSTAR {
+            self.add_resting(&mut packet);
+        }
         self.publish_panel(&sim, &packet);
         Ok((packet, events))
+    }
+    /// Adds players' resting NSTAR limit orders to a packet's market panel, if it has one.
+    fn add_resting(&self, packet: &mut Value) {
+        if let Some(market) = packet.get_mut("market").and_then(Value::as_object_mut) {
+            let (bids, asks) = self.store.resting_book(symbols::NSTAR, RESTING_LEVELS);
+            market.insert("resting".into(), json!({"bids": bids, "asks": asks}));
+        }
     }
     fn publish_panel(&self, sim: &SimFeed, packet: &Value) {
         if sim.symbol != symbols::NSTAR {
@@ -761,7 +771,9 @@ impl Market {
         if let Some(panel) = self.panel.lock().unwrap().0.clone() {
             return panel;
         }
-        self.nstar.lock().await.stats()
+        let mut packet = json!({"market": self.nstar.lock().await.stats()});
+        self.add_resting(&mut packet);
+        packet["market"].take()
     }
     /// Lock the NSTAR book for one account operation. Orders are priced and applied one at a
     /// time, so splitting an order across requests cannot reuse a mid it already moved.
@@ -889,7 +901,9 @@ impl NstarDesk<'_> {
         }
         market.reconcile_nstar(&mut feed, true).await?;
         let events = std::mem::take(&mut feed.book.events);
-        Ok((feed.packet(), events))
+        let mut packet = feed.packet();
+        market.add_resting(&mut packet);
+        Ok((packet, events))
     }
 }
 
@@ -1507,6 +1521,8 @@ const MARK_FOLLOW: f64 = std::f64::consts::LN_2 / 300.0;
 const MARK_MAX_PREMIUM: f64 = 0.05;
 /// Rounds of resting-order matching an order commit runs before printing its price.
 const MATCH_ROUNDS: usize = 4;
+/// Price levels of resting player orders published per side in the market panel.
+const RESTING_LEVELS: usize = 50;
 /// Share of the liquidation backlog released into the book per tick: ~10 s half-life.
 const LIQ_RELEASE: f64 = 0.0138;
 /// Absolute forced-flow release cap per tick; exponential release still handles small queues.

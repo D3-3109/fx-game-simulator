@@ -986,36 +986,68 @@ async function saveTpsl(){
 }
 /* 盘口: NSTAR 的弹性 AMM 曲线可精确推算每一档；其他币对按点差画示意盘口。 */
 const bookNodes=new Map();
+/* Price levels sit on a fixed grid like an exchange book: as the mid moves, the level next
+   to it shrinks or grows and the rest stay put. Each level holds the AMM liquidity between
+   its edges plus players' resting limit orders at that price. */
+const BOOK_STEPS=[.01,.02,.05,.1,.2,.5,1,2,5,10,20,50,100];
+// The spacing sticks until the price doubles or halves, so a price hovering around 100
+// does not flip the grid between 0.05 and 0.1 on every tick.
+let bookGrid=null;
+function bookStep(mid){
+ const target=mid*.0005;
+ if(!(bookGrid>=target/2&&bookGrid<=target*2))bookGrid=BOOK_STEPS.find(s=>s>=target)??BOOK_STEPS.at(-1);
+ return bookGrid;
+}
+function restingLevels(rows,step,mid,side){
+ const out=new Map();
+ for(const [price,size] of rows||[]){
+  if(!(price>0&&size>0)||(side==='ask'?price<=mid:price>=mid))continue;
+  const k=side==='ask'?Math.ceil(price/step-1e-9):Math.floor(price/step+1e-9);
+  out.set(k,(out.get(k)||0)+size);
+ }
+ return out;
+}
 function renderBook(mid){
  if(!paneVisible('upper','book')){scheduleVisual('book',()=>{if(!paneVisible('upper','book'))return false;renderBook(latestQuote?.price??mid)});return}
  if(!Number.isFinite(mid)){$('book-last').textContent='—';return}
- if(!changed('book',[mid,cur.sym,market?.depth,market?.amm_width,market?.anchor,market?.fair,pricePrecisions.get(cur.sym)]))return;
- const star=cur.sym==='NSTAR',depth=market?.depth||50000,dp=pricePrecisions.get(cur.sym)??decimalPlaces(mid);
+ if(!changed('book',[mid,cur.sym,market?.depth,market?.amm_width,market?.anchor,market?.fair,market?.resting,pricePrecisions.get(cur.sym)]))return;
+ const star=cur.sym==='NSTAR',depth=market?.depth||50000,rows=11;
  // 锚价偏离 x 处流动性 = depth·(1+x²/w²)，库存 U(x)=depth·(x+x³/3w²)，与后端 amm_shift 一致。
  const w=market?.amm_width||0,x0=star&&w&&market?.anchor>0?Math.log(mid/market.anchor):0;
  const inv=x=>depth*(x+(w?x**3/(3*w*w):0)),cumAt=p=>Math.abs(inv(x0+Math.log(p/mid))-inv(x0));
- const step=star?mid*.0005:Math.max(10**-dp,mid*.0001),rows=11,asks=[],bids=[];
- let sumA=0,sumB=0;
- for(let i=1;i<=rows;i++){
-  const up=mid+step*i,dn=mid-step*i;
-  sumA+=1+(i*7)%5;sumB+=1+(i*3)%5;
-  asks.push([up,star?cumAt(up):sumA]);bids.push([dn,star?cumAt(dn):sumB]);
+ const step=star?bookStep(mid):Math.max(10**-(pricePrecisions.get(cur.sym)??decimalPlaces(mid)),mid*.0001);
+ const levels={ask:[],bid:[]};
+ for(const side of ['ask','bid']){
+  const dir=side==='ask'?1:-1,first=side==='ask'?Math.floor(mid/step+1e-9)+1:Math.ceil(mid/step-1e-9)-1;
+  const resting=restingLevels(market?.resting?.[side+'s'],step,mid,side);
+  let edge=mid,cum=0;
+  for(let i=0;i<rows;i++){
+   const k=first+dir*i,price=k*step;
+   const amm=star?cumAt(price)-cumAt(edge):1+(i*(side==='ask'?7:3))%5;
+   const size=amm+(resting.get(k)||0);cum+=size;edge=price;
+   levels[side].push({price,size,cum});
+  }
  }
- const max=Math.max(asks.at(-1)[1],bids.at(-1)[1]);
- for(const [side,values] of [['ask',asks],['bid',bids]]){
+ const max=Math.max(levels.ask.at(-1).cum,levels.bid.at(-1).cum)||1;
+ for(const side of ['ask','bid']){
   const container=$('book-'+side+'s');let nodes=bookNodes.get(side);
   if(!nodes){
-   nodes=Array.from({length:11},()=>{
+   nodes=Array.from({length:rows},()=>{
     const node=document.createElement('div');node.className='book-row '+side;
     for(let i=0;i<3;i++)node.append(document.createElement('span'));
     node.onclick=()=>pickPrice(Number(node.dataset.price));container.append(node);return node;
    });bookNodes.set(side,nodes);
   }
-  values.forEach(([p,cum],i)=>{
-   const node=nodes[side==='ask'?10-i:i],prev=i?values[i-1][1]:0;
-   const depth=(cum/max*100).toFixed(1)+'%';node.dataset.price=p;
-   if(node.dataset.depth!==depth){node.dataset.depth=depth;node.style.setProperty('--depth',depth)}
-   [priceText(p,cur.sym),units(cum-prev,star?2:0),units(cum,star?2:0)].forEach((text,j)=>{if(node.children[j].textContent!==text)node.children[j].textContent=text});
+  levels[side].forEach(({price,size,cum},i)=>{
+   const node=nodes[side==='ask'?rows-1-i:i],key=priceText(price,cur.sym);
+   const fill=(cum/max).toFixed(3);
+   if(node.dataset.depth!==fill){node.dataset.depth=fill;node.style.setProperty('--depth',fill)}
+   // Flash a level whose size moved by more than 2% while it stayed the same price.
+   const old=Number(node.dataset.size);
+   if(node.dataset.level===key&&Math.abs(size-old)>Math.max(.01,old*.02))node.dataset.flash=node.dataset.flash==='a'?'b':'a';
+   setClass(node,`book-row ${side}${node.dataset.flash?' flash-'+node.dataset.flash:''}`);
+   node.dataset.level=key;node.dataset.size=size;node.dataset.price=price;
+   [key,units(size,star?2:0),units(cum,star?2:0)].forEach((text,j)=>setText(node.children[j],text));
   });
  }
  const node=$('book-last');setText(node,priceText(mid,cur.sym));setClass(node,$('price').dataset.direction==='down'?'red':'green');

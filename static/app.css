@@ -95,7 +95,7 @@ button:active:not(:disabled){transform:translateY(1px)}
 .book-side{flex:1;min-height:0;overflow:hidden;display:flex;flex-direction:column}
 #book-asks{justify-content:flex-end}
 .book-row{height:20px;position:relative;cursor:pointer}
-.book-row::before{content:'';position:absolute;top:1px;bottom:1px;right:0;width:var(--depth,0%);z-index:0}
+.book-row::before{content:'';position:absolute;top:1px;bottom:1px;right:0;width:100%;z-index:0;transform:scaleX(var(--depth,0));transform-origin:right center}
 .book-row.ask::before{background:var(--red-bg)}.book-row.bid::before{background:var(--green-bg)}
 .book-row span{position:relative;z-index:1}.book-row.ask span:first-child{color:var(--red)}.book-row.bid span:first-child{color:var(--green)}
 @media(hover:hover){.book-row:hover{background:#151515}}
@@ -292,7 +292,13 @@ dialog form{display:flex;flex-direction:column;gap:10px}
 .book-mid b{font-variant-numeric:tabular-nums}
 .book-mid b.green::after{content:' ↑';font-size:12px}.book-mid b.red::after{content:' ↓';font-size:12px}
 .book-row.ask::before{background:rgba(202,63,100,.17)}.book-row.bid::before{background:rgba(37,167,80,.17)}
-.book-row::before{transition:width .2s ease-out}
+/* Depth bars glide to their new length and changed levels flash, like a live exchange
+   book. Both animate transform/opacity only, so they stay on the compositor. */
+.book-row::before{transition:transform .35s cubic-bezier(.2,.8,.2,1);will-change:transform}
+.book-row::after{content:'';position:absolute;inset:0;z-index:0;opacity:0;pointer-events:none}
+.book-row.ask::after{background:rgba(202,63,100,.32)}.book-row.bid::after{background:rgba(37,167,80,.32)}
+.book-row.flash-a::after{animation:book-flash-a .6s ease-out}.book-row.flash-b::after{animation:book-flash-b .6s ease-out}
+@keyframes book-flash-a{from{opacity:1}to{opacity:0}}@keyframes book-flash-b{from{opacity:1}to{opacity:0}}
 
 /* Chart toolbar */
 .chart-toolbar .itv{transition:background .15s,color .15s}

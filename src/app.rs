@@ -31,6 +31,24 @@ struct StateCache {
     expires: Instant,
     packet: Arc<StatePacket>,
 }
+/// Order-size slider ranges cost dozens of trial orders each. They are a UI hint (every
+/// order is checked again on submit), so they are reused while the account is unchanged,
+/// the price has moved less than `LIMITS_DRIFT`, and they are younger than `LIMITS_TTL`.
+struct LimitsCache {
+    account: trading::Account,
+    symbol: String,
+    price: f64,
+    at: Instant,
+    max_lots: Value,
+    spot_max_buy: Option<f64>,
+}
+const LIMITS_TTL: Duration = Duration::from_secs(3);
+const LIMITS_DRIFT: f64 = 0.002;
+#[derive(Default)]
+struct StateSlot {
+    state: Option<StateCache>,
+    limits: Option<LimitsCache>,
+}
 struct QuotePacket {
     sequence: u64,
     full: Arc<str>,
@@ -55,7 +73,7 @@ pub struct App {
     quotes: Mutex<BTreeMap<String, QuotePacket>>,
     quote_seq: AtomicU64,
     leaderboard: leaderboard::Leaderboard,
-    states: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<Option<StateCache>>>>>,
+    states: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<StateSlot>>>>,
     pub admin_key: PathBuf,
     admin_sessions: Mutex<BTreeMap<String, i64>>,
     admin_attempts: Mutex<VecDeque<i64>>,
@@ -284,20 +302,20 @@ impl App {
             }
             states.entry(name.to_owned()).or_default().clone()
         };
-        let mut cache = slot.lock().await;
+        let mut slot = slot.lock().await;
         let board = self.leaderboard.current();
         let revision = (
             self.store.revision(),
             self.market.revision(),
             board.as_ref().map_or(0, |s| s.generation),
         );
-        if let Some(hit) = &*cache
+        if let Some(hit) = &slot.state
             && hit.revision == revision
             && Instant::now() < hit.expires
         {
             return Ok(hit.packet.clone());
         }
-        let mut value = self.compute_state(name).await?;
+        let mut value = self.compute_state(name, &mut slot.limits).await?;
         value["leaderboard_me"] = board.map(|s| s.me(name)).unwrap_or(Value::Null);
         let mut key = value.clone();
         if let Some(object) = key.as_object_mut() {
@@ -326,14 +344,18 @@ impl App {
             key: key.to_string().into(),
             value,
         });
-        *cache = Some(StateCache {
+        slot.state = Some(StateCache {
             revision,
             expires: Instant::now() + Duration::from_millis(ttl),
             packet: packet.clone(),
         });
         Ok(packet)
     }
-    async fn compute_state(&self, name: &str) -> Result<Value, String> {
+    async fn compute_state(
+        &self,
+        name: &str,
+        limits_cache: &mut Option<LimitsCache>,
+    ) -> Result<Value, String> {
         let user = self.store.user(name).await.map_err(|_| "账户读取失败")?;
         let prices = self
             .market
@@ -407,13 +429,30 @@ impl App {
             .as_ref()
             .and_then(|q| q.get(symbols::NSTAR).copied());
         // Slider ranges: the largest orders the real checks would accept right now.
-        let max_lots = json!({
-            "buy": acc.max_open_lots("long", &user.symbol, &prices),
-            "sell": acc.max_open_lots("short", &user.symbol, &prices),
+        let price = prices[&user.symbol];
+        let reusable = limits_cache.as_ref().is_some_and(|c| {
+            c.at.elapsed() < LIMITS_TTL
+                && c.symbol == user.symbol
+                && (price / c.price - 1.0).abs() < LIMITS_DRIFT
+                && c.account == *acc
         });
-        let spot_max_buy = nstar_prices
-            .as_ref()
-            .map(|q| acc.max_spot_buy(symbols::NSTAR, q));
+        if !reusable {
+            *limits_cache = Some(LimitsCache {
+                account: acc.clone(),
+                symbol: user.symbol.clone(),
+                price,
+                at: Instant::now(),
+                max_lots: json!({
+                    "buy": acc.max_open_lots("long", &user.symbol, &prices),
+                    "sell": acc.max_open_lots("short", &user.symbol, &prices),
+                }),
+                spot_max_buy: nstar_prices
+                    .as_ref()
+                    .map(|q| acc.max_spot_buy(symbols::NSTAR, q)),
+            });
+        }
+        let cached = limits_cache.as_ref().expect("limits computed above");
+        let (max_lots, spot_max_buy) = (cached.max_lots.clone(), cached.spot_max_buy);
         let tiers: Vec<_> = trading::leverage_tiers(&user.symbol)
             .iter()
             .map(|(up_to, lev)| json!([up_to, (*lev).min(acc.leverage)]))

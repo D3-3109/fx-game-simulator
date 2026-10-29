@@ -1388,6 +1388,8 @@ impl Account {
 }
 
 /// Largest multiple of `step` in `[min, max]` accepted by a monotone check; 0 if none.
+/// Bisects over whole steps, so the answer is exact in about log2((max - min) / step)
+/// checks: 32 for a 10,000,000-lot order range at 0.01 lots.
 fn largest(min: f64, max: f64, step: f64, ok: impl Fn(f64) -> bool) -> f64 {
     if !ok(min) {
         return 0.0;
@@ -1395,14 +1397,21 @@ fn largest(min: f64, max: f64, step: f64, ok: impl Fn(f64) -> bool) -> f64 {
     if ok(max) {
         return max;
     }
-    let (mut good, mut bad) = (min, max);
-    // Geometric bisection over up to ~1e9x, then snap down to the order step.
-    for _ in 0..48 {
-        let mid = (good * bad).sqrt();
-        if ok(mid) { good = mid } else { bad = mid }
+    let first = (min / step).round() as u64;
+    let (mut good, mut bad) = (first, (max / step).ceil() as u64);
+    while bad - good > 1 {
+        let mid = good + (bad - good) / 2;
+        if ok(mid as f64 * step) {
+            good = mid;
+        } else {
+            bad = mid;
+        }
     }
-    let snapped = ((good / step + 1e-9).floor() * step).max(min);
-    if ok(snapped) { snapped } else { min }
+    if good == first {
+        min
+    } else {
+        good as f64 * step
+    }
 }
 
 #[cfg(test)]

@@ -601,7 +601,22 @@ impl Account {
             return Err("借款金额必须为正数".into());
         }
         self.accrue(now);
-        self.loan = cents(self.loan + amount);
+        let loan = cents(self.loan + amount);
+        if cents(loan + (-(self.balance + amount)).max(0.0)) > DEBT_LIMIT {
+            // Cash that only covers a negative balance swaps one debt for another, so the
+            // room is whatever keeps the loan itself under the limit.
+            let room = if self.debt() <= DEBT_LIMIT {
+                DEBT_LIMIT - self.loan
+            } else {
+                0.0
+            };
+            return Err(format!(
+                "超出借款上限 {DEBT_LIMIT:.0} USDT：当前负债 {:.2}，最多还可借 {:.2}",
+                self.debt(),
+                room.max(0.0)
+            ));
+        }
+        self.loan = loan;
         self.balance += amount;
         self.validate()
     }
@@ -1469,17 +1484,45 @@ mod tests {
         assert!(a.borrow(0.0, 0).is_err());
     }
     #[test]
+    fn borrowing_stops_at_the_debt_limit() {
+        let mut a = Account::default();
+        a.borrow(DEBT_LIMIT - 1000.0, 0).unwrap();
+        let before = a.clone();
+        let err = a.borrow(1000.01, 0).unwrap_err();
+        assert!(err.contains("最多还可借 1000.00"), "{err}");
+        assert_eq!(a, before, "a rejected loan changes nothing");
+        a.borrow(1000.0, 0).unwrap();
+        assert_eq!(a.debt(), DEBT_LIMIT);
+        assert!(a.borrow(0.01, 0).is_err());
+        // A negative balance already counts as debt; borrowing to cover it adds none.
+        let mut b = Account {
+            balance: -5000.0,
+            ..Account::default()
+        };
+        assert!(b.borrow(DEBT_LIMIT + 1.0, 0).is_err());
+        b.borrow(DEBT_LIMIT, 0).unwrap();
+        assert_eq!(b.debt(), DEBT_LIMIT);
+        assert_eq!(b.balance, DEBT_LIMIT - 5000.0);
+        // Interest can still carry the loan past the limit; it then blocks new loans.
+        b.accrue(3_600_000 * 24);
+        assert!(b.debt() > DEBT_LIMIT);
+        let err = b.borrow(1.0, 3_600_000 * 24).unwrap_err();
+        assert!(err.contains("最多还可借 0.00"), "{err}");
+    }
+    #[test]
     fn debt_grace_starts_clears_and_expires_into_reset() {
         let mut a = Account::default();
         let t0 = 1_000_000;
-        a.borrow(DEBT_LIMIT + 1.0, t0).unwrap();
+        a.borrow(DEBT_LIMIT, t0).unwrap();
+        // Only interest carries debt past the limit.
+        a.loan += 1.0;
         assert!(!a.debt_expired(t0));
         assert_eq!(a.debt_since, t0);
         assert!(!a.debt_expired(t0 + DEBT_GRACE_MS - 1));
         a.repay(10.0, t0 + DEBT_GRACE_MS - 1).unwrap();
         assert!(!a.debt_expired(t0 + DEBT_GRACE_MS));
         assert_eq!(a.debt_since, 0);
-        a.borrow(DEBT_LIMIT, t0 + DEBT_GRACE_MS).unwrap();
+        a.loan += 10.0;
         let start = t0 + DEBT_GRACE_MS;
         assert!(!a.debt_expired(start + 1));
         assert!(a.debt_expired(start + 1 + DEBT_GRACE_MS));

@@ -29,7 +29,9 @@ async fn nstar_only_runtime_ticks_settles_risk_and_debt_without_legacy_workers()
         .unwrap();
     store
         .transaction("debt", |a, _, _| {
-            a.borrow(crate::trading::DEBT_LIMIT + 1.0, now_ms())?;
+            a.borrow(crate::trading::DEBT_LIMIT, now_ms())?;
+            // Only interest carries debt past the limit now.
+            a.loan += 1.0;
             a.debt_since = now_ms() - crate::trading::DEBT_GRACE_MS - 1000;
             Ok(vec![])
         })

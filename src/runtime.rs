@@ -54,26 +54,8 @@ pub fn start(app: Arc<App>) -> JoinSet<()> {
     let a = app.clone();
     tasks.spawn(async move {
         loop {
-            if let Ok(users) = a.store.users().await {
-                for u in users
-                    .into_iter()
-                    .filter(|u| u.account.debt() > 0.0 || u.account.debt_since != 0)
-                {
-                    let now = crate::storage::now_ms();
-                    let result = a
-                        .store
-                        .transaction(&u.name, |acct, _, _| {
-                            if acct.debt_expired(now) {
-                                Ok(vec![acct.reset(now)])
-                            } else {
-                                Ok(vec![])
-                            }
-                        })
-                        .await;
-                    if result.is_err() {
-                        eprintln!("[debt] check failed for {}; will retry", u.name);
-                    }
-                }
+            if let Err(e) = a.reset_expired_debts().await {
+                eprintln!("[debt] check failed: {e}; will retry");
             }
             sleep(Duration::from_secs(2)).await;
         }

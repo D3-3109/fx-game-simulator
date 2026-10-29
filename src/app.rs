@@ -450,32 +450,75 @@ impl App {
     }
     /// Settle due hourly funding on every account holding a perpetual book position. Each
     /// account is re-read under the store lock, so a settlement is never applied twice.
+    /// All due accounts settle in one batch, so one commit covers every funded account
+    /// instead of one fsync each. An account whose settlement fails is left unchanged.
     pub async fn settle_funding(&self) -> Result<(), String> {
         let rates = self.market.funding_rates().await;
         let now = storage::now_ms();
-        for user in self.store.users().await.map_err(|_| "账户读取失败")? {
-            let acc = &user.account;
-            if !acc.positions.iter().any(|p| rates.contains_key(&p.symbol)) {
-                continue;
-            }
-            let Ok(prices) = self.market.prices(acc.symbols()).await else {
+        let names = self.store.names_where(|user| {
+            user.account
+                .positions
+                .iter()
+                .any(|p| rates.contains_key(&p.symbol))
+        });
+        let mut priced = BTreeMap::new();
+        for name in names {
+            let Ok(user) = self.store.user(&name).await else {
                 continue;
             };
-            let result = self
-                .store
-                .transaction(&user.name, |a, _, _| {
-                    let mut trades = a.settle_funding(&rates, &prices, now)?;
-                    if !trades.is_empty() {
-                        trades.extend(a.check_stopout_at(&prices.marked(), &prices, now)?);
-                    }
-                    Ok(trades)
-                })
-                .await;
-            if let Err(storage::Error::Database(_)) = result {
-                return Err("资金费保存失败".into());
+            if let Ok(prices) = self.market.prices(user.account.symbols()).await {
+                priced.insert(name, prices);
             }
         }
-        Ok(())
+        let names: Vec<String> = priced.keys().cloned().collect();
+        let result = self
+            .store
+            .transaction_batch(&names, |name, account, _, _| {
+                let prices = &priced[name];
+                let mut next = account.clone();
+                // Validated here so one invalid result skips that account, not the batch.
+                let settled = next
+                    .settle_funding(&rates, prices, now)
+                    .and_then(|mut trades| {
+                        if !trades.is_empty() {
+                            trades.extend(next.check_stopout_at(&prices.marked(), prices, now)?);
+                        }
+                        next.validate()?;
+                        Ok(trades)
+                    });
+                match settled {
+                    Ok(trades) => {
+                        *account = next;
+                        Ok(trades)
+                    }
+                    Err(_) => Ok(vec![]),
+                }
+            })
+            .await;
+        match result {
+            Err(storage::Error::Database(_)) => Err("资金费保存失败".into()),
+            _ => Ok(()),
+        }
+    }
+    /// Reset every account whose debt grace has expired, in one batch.
+    pub async fn reset_expired_debts(&self) -> Result<(), String> {
+        let now = storage::now_ms();
+        let names = self
+            .store
+            .names_where(|user| user.account.debt() > 0.0 || user.account.debt_since != 0);
+        if names.is_empty() {
+            return Ok(());
+        }
+        self.store
+            .transaction_batch(&names, |_, account, _, _| {
+                if account.debt_expired(now) {
+                    Ok(vec![account.reset(now)])
+                } else {
+                    Ok(vec![])
+                }
+            })
+            .await
+            .map_err(|e| e.to_string())
     }
     pub async fn active_symbols(&self) -> Result<Vec<String>, String> {
         let mut out = std::collections::BTreeSet::new();

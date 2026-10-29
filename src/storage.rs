@@ -368,13 +368,26 @@ impl Store {
     pub fn revision(&self) -> u64 {
         self.revision.load(Ordering::Acquire)
     }
+    /// Committed accounts and deposit totals. One publication updates both under the same
+    /// cache write lock, so a read lock alone gives a consistent pair without waiting for
+    /// the writer to finish an fsync.
     pub async fn leaderboard_snapshot(&self) -> Result<(Vec<User>, BTreeMap<String, f64>)> {
-        let _guard = self.gate.lock().await;
         let cache = self.cache.read().unwrap();
         Ok((
             cache.users.values().cloned().collect(),
             cache.deposits.clone(),
         ))
+    }
+    /// Names of committed accounts matching `filter`, without cloning any account.
+    pub fn names_where(&self, filter: impl Fn(&User) -> bool) -> Vec<String> {
+        self.cache
+            .read()
+            .unwrap()
+            .users
+            .values()
+            .filter(|user| filter(user))
+            .map(|user| user.name.clone())
+            .collect()
     }
     pub fn risk_user_names(&self, symbol: &str) -> Vec<String> {
         self.cache

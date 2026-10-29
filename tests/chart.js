@@ -132,6 +132,7 @@ const candle = price => {
   assert.equal(typeof elements.sym.onchange,'undefined','legacy symbol switch handler is still installed');
   assert.deepEqual([...elements['itv-quick'].innerHTML.matchAll(/pickItv\('([^']+)'\)/g)].map(m=>m[1]),['1s','1m','5m','15m','30m','1h','4h','1d','1w']);
   assert.doesNotMatch(require('node:fs').readFileSync('static/index.html','utf8'),/id="itv"/,'duplicate interval dropdown is back');
+  assert.match(require('node:fs').readFileSync('static/index.html','utf8'),/href="https:\/\/www\.tradingview\.com\/"/,'hidden logo needs the NOTICE attribution link');
   response = candle(100);
   await run('loadK()');
   assert.match(requests[0], /symbol=NSTAR&interval=15m(?:&|$)/, 'initial request used wrong symbol/timeframe');
@@ -587,6 +588,7 @@ const candle = price => {
   Object.assign(context, {
     LightweightCharts:{CandlestickSeries:{type:'Candlestick'},version:()=> '5.2.1',createChart(el,options){
       assert.equal(options.height,400);
+      assert.equal(options.layout.attributionLogo,false,'TradingView logo is back on the chart');
       return {subscribeCrosshairMove(){},addSeries(definition,options){assert.equal(definition.type,'Candlestick');assert.equal(options.wickUpColor,'#25a750');return series;},applyOptions(options){applied=options;}};
     }},
     ResizeObserver:class {constructor(callback){this.callback=callback;}observe(el){observe=this.callback;assert.equal(el,elements.cv);}},

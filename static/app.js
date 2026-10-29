@@ -295,20 +295,20 @@ function drawPosLines(){
  for(const [id,{line}] of priceLines)if(!keep.has(id)){series.removePriceLine(line);priceLines.delete(id)}
 }
 const STOCKS=['AAPL','TSLA','NVDA','MSFT','AMZN','GOOGL','META','AMD'];
-const symSel=$('sym'),itvSel=$('itv');
+const symSel=$('sym');
 const symbolLabel=s=>s==='NSTAR'?'NSTAR/USDT · 北极星币':s==='FXSIM'?'FXSIM · 模拟币':pairName(s);
 function syncSecondOption(){
  const fx=cur.sym==='FXSIM'||cur.sym==='NSTAR';
  if(!fx&&cur.itv==='1s')cur.itv='1m';
- itvSel.replaceChildren();
- (fx?['1s','1m','5m','15m','30m','1h','4h','1d','1w']:['1m','5m','15m','30m','1h','4h','1d','1w']).forEach(i=>itvSel.add(new Option(i)));
- itvSel.value=cur.itv;
- $('itv-quick').innerHTML=(fx?['1s','1m','5m','15m','1h','4h','1d']:['1m','5m','15m','1h','4h','1d']).map(i=>
+ $('itv-quick').innerHTML=(fx?['1s','1m','5m','15m','30m','1h','4h','1d','1w']:['1m','5m','15m','30m','1h','4h','1d','1w']).map(i=>
   `<button type="button" class="itv" aria-pressed="${i===cur.itv}" onclick="pickItv('${i}')">${i}</button>`).join('');
 }
-function pickItv(i){itvSel.value=i;itvSel.onchange()}
+function pickItv(i){
+ if(i===cur.itv)return;
+ cur.itv=i;lastBar=null;kLoaded=false;pendingSim.clear();syncSecondOption();drawPosLines();sendView();loadK();
+}
 syncSecondOption();
-symSel.value=cur.sym;itvSel.value=cur.itv;
+symSel.value=cur.sym;
 let tradableSymbols=null,symbolsVersion=-1;
 function syncSymbolChoices(){
  const disabled=tradableSymbols!==null&&!tradableSymbols.includes('NSTAR');
@@ -349,7 +349,6 @@ function loadSymbols(){return singleflight('symbols',async()=>{
   if(!j.ok)throw j.err||'币种配置不可用';applySymbols(j);
  }catch(e){scheduleVisual('symbols-error',()=>{$('symbol-status').textContent='币种配置加载失败，请刷新重试'})}
 })}
-itvSel.onchange=()=>{cur.itv=itvSel.value;lastBar=null;kLoaded=false;pendingSim.clear();syncSecondOption();drawPosLines();sendView();loadK()};
 syncSymbolChoices();
 
 async function api(path,body){const r=await fetch('/api/'+path,{method:'POST',headers:authH({'Content-Type':'application/json'}),body:JSON.stringify(body||{})});

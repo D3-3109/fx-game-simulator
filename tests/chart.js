@@ -122,12 +122,13 @@ const candle = price => {
   // First selection, request and live aggregation must agree before any change event.
   assert.equal(run('cur.itv'), '15m', 'default K-line state is not 15m');
   assert.equal(run('cur.sym'), 'NSTAR');
-  assert.equal(run('itvSel.value'), '15m', 'initial selector disagrees with default');
+  assert.match(elements['itv-quick'].innerHTML,/aria-pressed="true" onclick="pickItv\('15m'\)"/,'initial interval button disagrees with default');
   assert.equal(run('symSel.value'), run('cur.sym'));
   assert.deepEqual(elements.sym.options.map(option=>option.value),['NSTAR'],'startup exposed legacy pairs');
   assert.equal(elements.sym.disabled,true,'NSTAR display offered a symbol switch');
   assert.equal(typeof elements.sym.onchange,'undefined','legacy symbol switch handler is still installed');
-  assert.deepEqual(elements.itv.options.map(option=>option.value),['1s','1m','5m','15m','30m','1h','4h','1d','1w']);
+  assert.deepEqual([...elements['itv-quick'].innerHTML.matchAll(/pickItv\('([^']+)'\)/g)].map(m=>m[1]),['1s','1m','5m','15m','30m','1h','4h','1d','1w']);
+  assert.doesNotMatch(require('node:fs').readFileSync('static/index.html','utf8'),/id="itv"/,'duplicate interval dropdown is back');
   response = candle(100);
   await run('loadK()');
   assert.match(requests[0], /symbol=NSTAR&interval=15m(?:&|$)/, 'initial request used wrong symbol/timeframe');

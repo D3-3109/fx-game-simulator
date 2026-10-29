@@ -1180,7 +1180,8 @@ impl SimFeed {
         let open = hours.last().map_or(self.price, |b| b[1]);
         let high = hours.iter().map(|b| b[2]).fold(self.price, f64::max);
         let low = hours.iter().map(|b| b[3]).fold(self.price, f64::min);
-        let volume: f64 = self.book.volume.iter().map(|(_, v)| v).sum();
+        // An empty f64 sum is -0.0, which the panel would show as "-0".
+        let volume: f64 = self.book.volume.iter().map(|(_, v)| v).sum::<f64>() + 0.0;
         let tape: Vec<_> = self.book.tape.iter().rev().take(30).collect();
         let today = (self.updated_at / 1000).div_euclid(86_400) * 86_400;
         let prev_close = self.bars[&86_400]

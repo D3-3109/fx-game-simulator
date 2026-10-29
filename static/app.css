@@ -239,3 +239,76 @@ dialog form{display:flex;flex-direction:column;gap:10px}
  #rightbar{height:640px;border:0}#workspace{height:900px}.splitter.vertical{display:none}
  .connection{font-size:0}
 }
+
+/* ---------- polish: same dark exchange look, tighter hierarchy ---------- */
+:root{--hover:#141414;--focus:#5b5b5b;--brand:#f0b90b}
+/* Panels repaint independently: a tick inside one never re-lays out its neighbours. */
+#chartpane,#positions,#history,#lbbar,#chatpane,#tradebar{contain:layout paint}
+.book-row,.tape-row{contain:layout style}
+*{scrollbar-width:thin;scrollbar-color:#2c2c2c transparent}
+::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-thumb{background:#2c2c2c;border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:#3d3d3d}::-webkit-scrollbar-track{background:transparent}
+::selection{background:#3a3a3a}
+
+/* Top nav and pair bar */
+#topnav{background:#050505}
+.brand-mark{background:linear-gradient(135deg,#fff 0%,#d9d9d9 100%)}
+.nav-links span{cursor:default;transition:color .15s}
+@media(hover:hover){.nav-links span:hover{color:#fff}}
+#pairbar{gap:0;background:#050505}
+#pairbar>*{padding:0 18px}#pairbar>.market-controls{padding-left:0}
+#pairbar>.stat{border-left:1px solid var(--line);height:28px;justify-content:center}
+#price{font-size:20px;letter-spacing:-.01em;transition:color .2s}
+.quote-decimal{font-size:.8em;opacity:.85}
+.quote-change{font-weight:500}
+
+/* Order panel */
+.mode-tabs{background:#0d0d0d;border:1px solid var(--line)}
+.mode-tabs button{border-radius:4px;transition:background .15s,color .15s}
+.field{transition:border-color .15s;height:38px}
+@media(hover:hover){.field:hover{border-color:var(--line-strong)}}
+.order-buttons button,.spot-submit{padding:10px 0;letter-spacing:.02em;transition:background .15s,filter .15s}
+.order-buttons small{font-variant-numeric:tabular-nums}
+.order-meta b{font-variant-numeric:tabular-nums}
+#close-all{background:transparent;border:1px solid var(--line-strong);color:var(--soft)}
+@media(hover:hover){#close-all:hover:not(:disabled){border-color:#555;color:#fff;background:transparent}}
+
+/* Account overview as compact cards */
+.account-stats{gap:6px}
+.account-stat{background:#0d0d0d;border:1px solid var(--line);border-radius:var(--radius);padding:7px 9px}
+.account-stat b{display:block;margin-top:2px;font-variant-numeric:tabular-nums}
+
+/* Tables: sticky header hairline, row hover, numbers right-aligned feel */
+#pos th,#historyT th,#spotT th,#ordersT th{box-shadow:inset 0 -1px 0 var(--line)}
+#ordersT{width:100%;border-collapse:collapse;font-size:11px}
+#ordersT th,#ordersT td{padding:7px 10px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
+#ordersT th{color:var(--muted);font-weight:400;position:sticky;top:0;background:var(--bg);z-index:1}
+@media(hover:hover){#pos tbody tr:hover td,#historyT tbody tr:hover td,#spotT tbody tr:hover td,#ordersT tbody tr:hover td,#rankT tbody tr:hover td{background:var(--hover)}}
+#pos td button,#ordersT td button{border-radius:4px;transition:border-color .15s,color .15s}
+@media(hover:hover){#pos td button:hover:not(:disabled),#ordersT td button:hover:not(:disabled){border-color:#666;background:transparent}}
+
+/* Order book: mid price with direction arrow, depth bars a touch stronger */
+.book-mid{background:#070707}
+.book-mid b{font-variant-numeric:tabular-nums}
+.book-mid b.green::after{content:' ↑';font-size:12px}.book-mid b.red::after{content:' ↓';font-size:12px}
+.book-row.ask::before{background:rgba(202,63,100,.17)}.book-row.bid::before{background:rgba(37,167,80,.17)}
+.book-row::before{transition:width .2s ease-out}
+
+/* Chart toolbar */
+.chart-toolbar .itv{transition:background .15s,color .15s}
+@media(hover:hover){.chart-toolbar .itv:hover{color:#fff;background:#161616}}
+
+/* Rank: top three get a medal tint */
+#rankT tbody tr:nth-child(1) td:first-child{color:#f0b90b;font-weight:700}
+#rankT tbody tr:nth-child(2) td:first-child{color:#c0c7d0;font-weight:700}
+#rankT tbody tr:nth-child(3) td:first-child{color:#c98b52;font-weight:700}
+
+/* Auth */
+#authbox{box-shadow:0 24px 80px rgba(0,0,0,.6)}
+#authbox .primary{transition:filter .15s}
+@media(hover:hover){#authbox .primary:hover:not(:disabled){filter:brightness(.9);background:#fff}}
+
+/* Low-power and reduced-motion: no decorative motion at all. */
+html.low-power *,html.low-power *::before,html.low-power *::after{transition:none!important;animation:none!important}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{transition:none!important}}
+.order-meta{gap:10px}.order-meta span{white-space:nowrap}.order-meta b{text-align:right}

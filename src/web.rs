@@ -41,7 +41,6 @@ pub fn static_target(path: &str) -> Option<(&str, &str, bool)> {
         "/admin.js" => ("admin.js", "text/javascript", false),
         "/app.css" => ("app.css", "text/css; charset=utf-8", false),
         "/admin.css" => ("admin.css", "text/css; charset=utf-8", false),
-        "/charts.js" => ("charts.js", "text/javascript", false),
         "/assets/lightweight-charts-5.2.1.js" => (
             "assets/lightweight-charts-5.2.1.js",
             "text/javascript",
@@ -76,7 +75,6 @@ pub async fn validate_static(dir: &Path) -> std::io::Result<PathBuf> {
         "/admin.js",
         "/app.css",
         "/admin.css",
-        "/charts.js",
         "/assets/lightweight-charts-5.2.1.js",
         "/assets/noto-sans-latin.woff2",
     ] {
@@ -211,7 +209,6 @@ mod tests {
             "/app.css",
             "/admin.js",
             "/admin.css",
-            "/charts.js",
             "/assets/lightweight-charts-5.2.1.js",
             "/assets/noto-sans-latin.woff2",
         ] {

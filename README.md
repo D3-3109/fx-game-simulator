@@ -1,7 +1,7 @@
 # NSTAR simulator — Rust Web backend
 
 Axum/Tokio + SQLx SQLite。单 crate，使用同目录 `static/`，无需前端构建。
-原 Python Web/CLI/GUI 实现已在切换后删除（见 git 历史与 [ACCEPTANCE.md](ACCEPTANCE.md)）。
+原 Python Web/CLI/GUI 实现已删除；Rust 重写的计划与验收记录归档在 [docs/history/](docs/history/)。
 
 ## NSTAR-only 与旧库迁移
 
@@ -50,22 +50,15 @@ cargo build --locked
 mkdir -p .pi/rust-dev
 ```
 
-创建**独立测试**管理员配置；此命令交互读取密码，不写明文、不覆盖已有文件：
+创建**独立测试**管理员配置。`admin_key` 与容器入口使用同一实现，不覆盖已有文件；未设置 `FX_ADMIN_PSK` 时随机生成口令并只打印一次：
 
 ```sh
-python3 - <<'PY'
-import getpass, hashlib, json, os, secrets
-path = '.pi/rust-dev/admin.json'
-password = getpass.getpass('Test admin PSK: ')
-if not 1 <= len(password) <= 256:
-    raise SystemExit('PSK must contain 1–256 characters')
-salt = secrets.token_bytes(16)
-config = {'salt': salt.hex(), 'hash': hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 200000).hex()}
-fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-with os.fdopen(fd, 'w') as f:
-    json.dump(config, f)
-PY
+FX_ADMIN_PSK='换成测试口令' cargo run --locked --example admin_key -- .pi/rust-dev/admin.json
+```
 
+启动：
+
+```sh
 ./target/debug/fx-sim-rust \
   --listen 127.0.0.1:8000 \
   --db "$PWD/.pi/rust-dev/test.db" \
@@ -75,7 +68,7 @@ PY
 
 打开 `http://127.0.0.1:8000`，注册测试用户；管理员页面 `/admin`。Ctrl+C 关闭连接、后台任务与数据库。静态目录、数据库、管理员文件均为显式参数，支持任意工作目录；默认监听回环 8000。目录须预先存在。
 
-生产数据库 `fx_sim.db` 与管理员配置 `.pi/admin-key.json` 已由 Rust 服务直接使用；不要同时再启动旧 Python 进程写同一库。账户 token 存在浏览器 origin 下，换端口不会自动继承旧登录。
+同一数据库只能由一个服务进程写入。账户 token 存在浏览器 origin 下，换端口不会自动继承旧登录。
 
 局域网访问时，启动参数加 `--listen 0.0.0.0:8000`，通过 `http://<本机局域网 IP>:8000` 访问；数据库、静态目录和管理员配置参数不变。HTTP 未加密，仅用于可信网络。
 

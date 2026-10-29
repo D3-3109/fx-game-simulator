@@ -1,6 +1,6 @@
 //! Administrator PSK provisioning for container starts. Not a production entry point.
 //!
-//! Writes the same `{salt, hash}` format as the README's Python snippet, using the
+//! Writes the `{salt, hash}` administrator config format, using the
 //! exact PBKDF2 call `App::admin_login` verifies against. Never overwrites an
 //! existing file and never echoes the PSK, so callers may log its stdout safely.
 //!

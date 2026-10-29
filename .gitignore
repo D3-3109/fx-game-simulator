@@ -4,6 +4,8 @@
 *.sqlite
 *.sqlite-*
 fx_state.json
+# docker-compose bind mount: fx_sim.db plus admin-key.json
+/data/
 
 # Administrator secrets, backups, logs and observations
 tiingo_apikeys.txt
@@ -13,20 +15,14 @@ tiingo_apikeys.txt
 .env.*
 !.env.example
 
-# Python and local machine artifacts
+# Local machine and editor state
 __pycache__/
-*.py[cod]
-.venv/
 .DS_Store
-
-# Generated compatibility bridges for the already-running pre-extraction Python process
-/admin.html
-/assets
-/charts.js
+.vscode/
+.idea/
 
 # Rust build output
 /target/
-
 
 # realmem: share project memories (.pi/realmem) through git
 !/.pi/

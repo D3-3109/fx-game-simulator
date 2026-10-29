@@ -66,6 +66,9 @@ const context = vm.createContext({
 vm.runInContext(script, context);
 Object.assign(context, {testSeries: series, testChart: chart});
 vm.runInContext('series=testSeries;chart=testChart;', context);
+// Most assertions below compare raw UTC bar times; the Beijing display shift has its own test.
+assert.equal(vm.runInContext('CHART_SHIFT', context),8*3600,'chart axis must read Beijing time');
+vm.runInContext('CHART_SHIFT=0', context);
 const raw = code => vm.runInContext(code, context);
 const run = code => {const result=raw(code);flushFrames();return result?.then?result.then(value=>{flushFrames();return value;}):result;};
 const candle = price => {
@@ -931,5 +934,12 @@ const candle = price => {
   vm.runInContext("renderSymbols([{symbol:'USDJPY',enabled:true}])",admin);
   assert.equal(adminElements.symbols.children.length,0,'legacy-only admin response exposed a switch');
   assert.doesNotMatch(fs.readFileSync('static/admin.html','utf8'),/FXSIM|外汇主源/);
+  // Beijing display shift: the chart sees +8h times, and queued sim bars round-trip unchanged.
+  run('CHART_SHIFT=8*3600');
+  assert.deepEqual(JSON.parse(run('JSON.stringify(toBar([1793203200000,1,2,0.5,1.5]))')),{time:1793203200+8*3600,open:1,high:2,low:.5,close:1.5});
+  run("cur={sym:'NSTAR',itv:'1d'};lastSym=cur.sym;lastItv=cur.itv;kLoaded=true;simBars=[];simStamp=0;pendingSim.clear();pendingSimStamp=0");displayed=[];
+  run('queueSim([[1793203200000,1,2,0.5,1.5]],1)');
+  assert.equal(displayed.at(-1).time,1793203200+8*3600,'queued bar lost or double-shifted the Beijing offset');
+  run('CHART_SHIFT=0');
   console.log('PASS: legacy OHLC/history/safety/trading guards; 50 ticks zero setData; bounded bars; DOM/price-line/book/chat reuse; hidden WS zero DOM; rAF/2Hz/view commands; Top50/personal rank/pagination; init singleflight/abort/parallel K; local v5/SRI fallback; prev_close; expiry/heartbeat/backoff');
 })().catch(error => { console.error(error); process.exitCode = 1; });

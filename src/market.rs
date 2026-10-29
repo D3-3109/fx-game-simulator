@@ -985,6 +985,42 @@ fn biquote_bars(data: &Value) -> Result<Vec<[f64; 5]>> {
     out.dedup_by(|a, b| a[0] == b[0]);
     Ok(out)
 }
+/// Day or week candles moved onto Beijing-time boundaries, or None if already aligned.
+/// Periods covered by `fine` (4h candles, whose boundaries are also Beijing-aligned) are
+/// rebuilt exactly from them; older periods keep their OHLC under the new open time.
+fn realign(
+    bars: &VecDeque<[f64; 5]>,
+    sec: i64,
+    fine: &VecDeque<[f64; 5]>,
+) -> Option<VecDeque<[f64; 5]>> {
+    if bars
+        .iter()
+        .all(|b| symbols::bucket(b[0] as i64, sec) == b[0] as i64)
+    {
+        return None;
+    }
+    let merge = |out: &mut BTreeMap<i64, [f64; 5]>, start: i64, b: &[f64; 5]| {
+        let bar = out
+            .entry(start)
+            .or_insert([start as f64, b[1], b[2], b[3], b[4]]);
+        bar[2] = bar[2].max(b[2]);
+        bar[3] = bar[3].min(b[3]);
+        bar[4] = b[4];
+    };
+    let covered = fine.front().map_or(i64::MAX, |b| b[0] as i64);
+    let mut out = BTreeMap::new();
+    for b in bars {
+        let start = symbols::bucket(b[0] as i64, sec);
+        if start < covered {
+            merge(&mut out, start, b);
+        }
+    }
+    for b in fine {
+        merge(&mut out, symbols::bucket(b[0] as i64, sec), b);
+    }
+    let skip = out.len().saturating_sub(1000);
+    Some(out.into_values().skip(skip).collect())
+}
 fn weekly_bars(bars: Vec<[f64; 5]>, limit: usize) -> Vec<[f64; 5]> {
     const DAY: i64 = 86_400_000;
     let mut weeks = BTreeMap::<i64, [f64; 5]>::new();
@@ -1053,7 +1089,13 @@ impl SimFeed {
                 .map(|(_, s)| {
                     (
                         *s,
-                        VecDeque::from([[((now / 1000) / s * s) as f64, base, base, base, base]]),
+                        VecDeque::from([[
+                            symbols::bucket(now / 1000, *s) as f64,
+                            base,
+                            base,
+                            base,
+                            base,
+                        ]]),
                     )
                 })
                 .collect(),
@@ -1076,11 +1118,35 @@ impl SimFeed {
                 loaded.push(*sec);
             }
         }
+        // Day and week candles written before the switch to Beijing time are rebuilt from
+        // 4h candles where those cover them, and moved onto the new boundary otherwise.
+        // Only stored 4h candles count; without them `bars` holds a base-price placeholder.
+        let fine = if loaded.contains(&14_400) {
+            sim.bars[&14_400].clone()
+        } else {
+            VecDeque::new()
+        };
+        let mut realigned = Vec::new();
+        for sec in [86_400, 604_800] {
+            if loaded.contains(&sec)
+                && let Some(bars) = realign(&sim.bars[&sec], sec, &fine)
+            {
+                sim.bars.insert(sec, bars);
+                realigned.push(sec);
+            }
+        }
+        for sec in realigned {
+            let rows: Vec<[f64; 5]> = sim.bars[&sec].iter().copied().collect();
+            store
+                .replace_bars(symbol, sec, &rows)
+                .await
+                .map_err(|_| "模拟历史保存失败")?;
+        }
         sim.price = sim.bars[&60].back().unwrap()[4];
         sim.book = Book::new(base, sim.price);
         for (sec, bars) in &mut sim.bars {
             if !loaded.contains(sec) {
-                let t = ((now / 1000) / sec * sec) as f64;
+                let t = symbols::bucket(now / 1000, *sec) as f64;
                 *bars = VecDeque::from([[t, sim.price, sim.price, sim.price, sim.price]]);
             }
         }
@@ -1095,7 +1161,7 @@ impl SimFeed {
         self.price = price;
         self.updated_at = now;
         for (sec, bars) in &mut self.bars {
-            let t = ((now / 1000) / sec * sec) as f64;
+            let t = symbols::bucket(now / 1000, *sec) as f64;
             if t < bars.back().unwrap()[0] {
                 continue;
             }
@@ -1183,7 +1249,7 @@ impl SimFeed {
         // An empty f64 sum is -0.0, which the panel would show as "-0".
         let volume: f64 = self.book.volume.iter().map(|(_, v)| v).sum::<f64>() + 0.0;
         let tape: Vec<_> = self.book.tape.iter().rev().take(30).collect();
-        let today = (self.updated_at / 1000).div_euclid(86_400) * 86_400;
+        let today = symbols::bucket(self.updated_at / 1000, 86_400);
         let prev_close = self.bars[&86_400]
             .iter()
             .rev()

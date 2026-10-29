@@ -972,6 +972,29 @@ impl Store {
             })
             .collect())
     }
+    /// Replace every stored candle of one symbol and interval in a single transaction.
+    pub async fn replace_bars(&self, symbol: &str, sec: i64, bars: &[[f64; 5]]) -> Result<()> {
+        let mutation = self.writer.admit_reserved(&self.gate).await?;
+        let mut tx = self.begin().await?;
+        sqlx::query("DELETE FROM sim_bars WHERE symbol=? AND sec=?")
+            .bind(symbol)
+            .bind(sec)
+            .execute(&mut *tx)
+            .await?;
+        for b in bars {
+            sqlx::query("INSERT INTO sim_bars(symbol,sec,t,o,h,l,c) VALUES(?,?,?,?,?,?,?)")
+                .bind(symbol)
+                .bind(sec)
+                .bind(b[0] as i64)
+                .bind(b[1])
+                .bind(b[2])
+                .bind(b[3])
+                .bind(b[4])
+                .execute(&mut *tx)
+                .await?;
+        }
+        self.commit(mutation, tx, Publication::default()).await
+    }
     pub async fn save_bars(&self, symbol: &str, bars: &[(i64, [f64; 5], i64)]) -> Result<()> {
         let mutation = self.writer.admit_reserved(&self.gate).await?;
         if bars.is_empty() {

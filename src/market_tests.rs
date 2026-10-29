@@ -307,7 +307,7 @@ async fn live_fx_cache_cannot_be_overwritten_by_cny_or_single_price_feed() {
 #[test]
 fn recorded_ticks_preserve_wicks_freeze_closed_candles_and_bound_retention() {
     for (_, sec) in symbols::INTERVALS {
-        let t = 1800000000 / sec * sec;
+        let t = symbols::bucket(1800000000, *sec);
         let mut sim = SimFeed::new("FXSIM", 1.1, t * 1000);
         assert_eq!(sim.klines(*sec, 500).len(), 1, "invented history");
         sim.record(0.9, t * 1000 + 200);
@@ -1452,5 +1452,126 @@ async fn market_revision_includes_mark_anchor_and_source_time() {
         assert_eq!(market.revision(), before + 1);
     }
     sql.close().await;
+    store.close().await;
+}
+
+#[test]
+fn day_and_week_candles_follow_beijing_midnight_and_monday() {
+    // 2026-10-29 23:59:59 and 2026-10-30 00:00:00 Beijing time.
+    assert_eq!(symbols::bucket(1793289599, 86_400), 1793203200);
+    assert_eq!(symbols::bucket(1793289600, 86_400), 1793289600);
+    // Sunday 2026-11-01 23:59:59 still belongs to the week of Monday 10-26;
+    // Monday 11-02 00:00 opens the next one.
+    assert_eq!(symbols::bucket(1793548799, 604_800), 1792944000);
+    assert_eq!(symbols::bucket(1793548800, 604_800), 1793548800);
+    // Shorter intervals divide 8 hours, so they keep their UTC boundaries.
+    for (_, sec) in symbols::INTERVALS.iter().filter(|(_, s)| *s <= 14_400) {
+        let t = 1793203200 + 3599;
+        assert_eq!(symbols::bucket(t, *sec), t / sec * sec, "{sec}");
+    }
+}
+
+#[test]
+fn realign_rebuilds_covered_days_from_4h_and_moves_older_ones() {
+    let hour = 3600.0;
+    let utc_days: VecDeque<[f64; 5]> = [1793059200.0, 1793145600.0, 1793232000.0]
+        .iter()
+        .enumerate()
+        .map(|(i, t)| [*t, 100.0 + i as f64, 110.0, 90.0, 101.0 + i as f64])
+        .collect();
+    // 4h candles from Beijing 10-29 00:00 to 10-30 08:00.
+    let fine: VecDeque<[f64; 5]> = (0..8)
+        .map(|i| {
+            let p = 200.0 + i as f64;
+            [
+                1793203200.0 + i as f64 * 4.0 * hour,
+                p,
+                p + 5.0,
+                p - 5.0,
+                p + 1.0,
+            ]
+        })
+        .collect();
+    let days = realign(&utc_days, 86_400, &fine).unwrap();
+    assert_eq!(
+        days.iter().map(|b| b[0] as i64).collect::<Vec<_>>(),
+        vec![1793030400, 1793116800, 1793203200, 1793289600]
+    );
+    // Older days keep their OHLC under the Beijing open time.
+    assert_eq!(&days[0][1..], &utc_days[0][1..]);
+    assert_eq!(&days[1][1..], &utc_days[1][1..]);
+    // Covered days are rebuilt exactly from their six (then two) 4h candles.
+    assert_eq!(days[2], [1793203200.0, 200.0, 210.0, 195.0, 206.0]);
+    assert_eq!(days[3], [1793289600.0, 206.0, 212.0, 201.0, 208.0]);
+    // Already aligned data is left alone.
+    assert!(realign(&days, 86_400, &fine).is_none());
+    let weeks = realign(&utc_days, 604_800, &fine).unwrap();
+    assert_eq!(weeks.len(), 1);
+    assert_eq!(weeks[0][0] as i64, 1792944000);
+    assert_eq!(weeks[0][4], 208.0);
+}
+
+#[tokio::test]
+async fn restart_moves_stored_day_candles_onto_beijing_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bars.db");
+    let store = Store::open_legacy(&path).await.unwrap();
+    // A pre-change database: day candles at UTC midnight, 4h candles for the last day.
+    let mut rows = vec![
+        (86_400, [1793145600.0, 1.0, 1.2, 0.9, 1.1], 0),
+        (86_400, [1793232000.0, 1.1, 1.3, 1.0, 1.2], 0),
+    ];
+    for i in 0..6 {
+        let t = 1793203200.0 + i as f64 * 14_400.0;
+        rows.push((14_400, [t, 1.1, 1.25, 1.05, 1.15], 0));
+    }
+    rows.push((60, [1793289000.0, 1.15, 1.15, 1.15, 1.15], 0));
+    store.save_bars("FXSIM", &rows).await.unwrap();
+    store.close().await;
+    let store = Store::open_legacy(&path).await.unwrap();
+    let now = 1_793_289_000_000;
+    let sim = SimFeed::load(&store, "FXSIM", 1.1, now).await.unwrap();
+    let saved: Vec<i64> = store
+        .load_bars("FXSIM", 86_400)
+        .await
+        .unwrap()
+        .iter()
+        .map(|b| b[0] as i64)
+        .collect();
+    assert_eq!(saved, vec![1793116800, 1793203200]);
+    assert_eq!(
+        sim.klines(86_400, 10)
+            .iter()
+            .map(|b| b[0] as i64 / 1000)
+            .collect::<Vec<_>>(),
+        saved
+    );
+    store.close().await;
+}
+
+#[tokio::test]
+async fn restart_without_4h_history_only_relabels_day_candles() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bars.db");
+    let store = Store::open_legacy(&path).await.unwrap();
+    let day = [1793232000.0, 1.0, 1.4, 0.8, 1.2];
+    store
+        .save_bars(
+            "FXSIM",
+            &[
+                (86_400, day, 0),
+                (60, [1793289000.0, 1.2, 1.2, 1.2, 1.2], 0),
+            ],
+        )
+        .await
+        .unwrap();
+    store.close().await;
+    let store = Store::open_legacy(&path).await.unwrap();
+    SimFeed::load(&store, "FXSIM", 1.1, 1_793_289_000_000)
+        .await
+        .unwrap();
+    let saved = store.load_bars("FXSIM", 86_400).await.unwrap();
+    // Same OHLC under the Beijing open time; no base-price placeholder merged in.
+    assert_eq!(saved, vec![[1793203200.0, 1.0, 1.4, 0.8, 1.2]]);
     store.close().await;
 }

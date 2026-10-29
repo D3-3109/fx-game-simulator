@@ -525,7 +525,10 @@ let kLoaded=false,lastBarLive=false;
 let kSeq=0,simBars=[],simStamp=0,kFlight=null,needsK=false;
 const BAR_LIMIT=500,BAR_SLACK=64,pendingSim=new Map();
 let pendingSimStamp=0;
-const toBar=k=>({time:k[0]/1000,open:k[1],high:k[2],low:k[3],close:k[4]});
+/* The chart library labels every time as UTC. Bars are handed to it shifted by +8h so its
+   axis and crosshair read Beijing time, where the server opens day and week candles. */
+let CHART_SHIFT=8*3600;
+const toBar=k=>({time:k[0]/1000+CHART_SHIFT,open:k[1],high:k[2],low:k[3],close:k[4]});
 const sameBar=(a,b)=>a&&a.time===b.time&&a.open===b.open&&a.high===b.high&&a.low===b.low&&a.close===b.close;
 const preserveWicks=(old,b)=>old?{...b,open:old.open,high:Math.max(old.high,b.high),low:Math.min(old.low,b.low)}:b;
 function mergeSimBars(data,stamp){
@@ -575,7 +578,7 @@ function queueSim(rows,stamp=0){
  while(pendingSim.size>BAR_LIMIT+BAR_SLACK)pendingSim.delete(pendingSim.keys().next().value);
  scheduleVisual('candles',()=>{
   if(!visible('chartpane')||!kLoaded)return false;
-  const data=[...pendingSim.values()].sort((a,b)=>a.time-b.time).map(b=>[b.time*1000,b.open,b.high,b.low,b.close]);
+  const data=[...pendingSim.values()].sort((a,b)=>a.time-b.time).map(b=>[(b.time-CHART_SHIFT)*1000,b.open,b.high,b.low,b.close]);
   const stamp=pendingSimStamp;pendingSim.clear();pendingSimStamp=0;updateSim(data,stamp);
  });
 }
@@ -631,8 +634,9 @@ function applyK(j,sym,itv){
 }
 function updateLast(price){
  if(isSim(cur.sym)||!series||!kLoaded||lastSym!==cur.sym||lastItv!==cur.itv||!price)return;
+ // Legacy upstream history is bucketed in UTC (weeks from Monday); match it, then shift.
  const offset=cur.itv==='1w'?3*86400:0;
- const t=Math.floor((Date.now()/1000+offset)/SEC[cur.itv])*SEC[cur.itv]-offset;
+ const t=Math.floor((Date.now()/1000+offset)/SEC[cur.itv])*SEC[cur.itv]-offset+CHART_SHIFT;
  const base=(lastBar&&lastBar.time===t)?lastBar:{time:t,open:price,high:price,low:price,close:price};
  lastBar={time:t,open:base.open,high:Math.max(base.high,price),low:Math.min(base.low,price),close:price};
  lastBarLive=true;series.update(lastBar);

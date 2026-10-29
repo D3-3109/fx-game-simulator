@@ -11,6 +11,16 @@ pub const FX: &[&str] = &[
     "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD", "EURJPY", "GBPJPY",
     "USDCNH", "USDCNY", "EURCNH",
 ];
+/// The game runs on Beijing time (UTC+8, no daylight saving): day candles start at 00:00
+/// and week candles on Monday 00:00 Beijing time. Every shorter interval divides 8 hours,
+/// so its boundaries are the same as in UTC.
+pub const UTC_OFFSET: i64 = 8 * 3600;
+/// Open time, in UTC seconds, of the `interval`-second candle containing `ts`.
+pub fn bucket(ts: i64, interval: i64) -> i64 {
+    // 1970-01-01 was a Thursday; move week boundaries back three days to Monday.
+    let shift = UTC_OFFSET + if interval == 604_800 { 3 * 86_400 } else { 0 };
+    (ts + shift).div_euclid(interval) * interval - shift
+}
 pub const INTERVALS: &[(&str, i64)] = &[
     ("1s", 1),
     ("1m", 60),

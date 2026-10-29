@@ -1,6 +1,8 @@
 //! SQLite ownership and complete business transactions; callers never assemble SQL.
 #[path = "backup.rs"]
 mod backup;
+#[path = "storage_batch.rs"]
+mod batch;
 #[cfg(test)]
 #[path = "nstar_migration_tests.rs"]
 mod nstar_migration_tests;
@@ -14,6 +16,7 @@ use crate::{
     symbols,
     trading::{self, Account, Trade},
 };
+use batch::{Batch, exposed_to, sweep};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{
@@ -379,18 +382,7 @@ impl Store {
             .unwrap()
             .users
             .values()
-            .filter(|user| {
-                if user.account.positions.is_empty() && user.account.orders.is_empty() {
-                    return false;
-                }
-                let symbols = user
-                    .account
-                    .symbols()
-                    .chain(user.account.orders.iter().map(|o| o.symbol.as_str()));
-                // Invalid legacy exposure must still reach the risk engine for its
-                // established error policy, rather than silently disappear here.
-                trading::price_symbols(symbols).map_or(true, |required| required.contains(symbol))
-            })
+            .filter(|user| exposed_to(user, symbol))
             .map(|user| user.name.clone())
             .collect()
     }
@@ -604,99 +596,76 @@ impl Store {
             + Send,
     {
         let mutation = self.writer.admit(&self.gate).await?;
-        let mut next_id = self.next_id.load(Ordering::SeqCst);
-        let mut rows: Vec<PreparedAccount> = Vec::new();
-        let mut indices = BTreeMap::<String, usize>::new();
-        let mut flow = (0.0, 0.0);
+        let mut batch = Batch::new(self.next_id.load(Ordering::SeqCst), self.nstar_only);
         for name in names {
-            let before = if let Some(index) = indices.get(name) {
-                rows[*index].user.clone()
-            } else {
-                self.cache
+            let before = match batch.current(name) {
+                Some(user) => user.clone(),
+                None => self
+                    .cache
                     .read()
                     .unwrap()
                     .users
                     .get(name)
                     .cloned()
-                    .ok_or_else(|| invalid("账号不存在"))?
+                    .ok_or_else(|| invalid("账号不存在"))?,
             };
             let mut user = before.clone();
-            let id = next_id.max(user.account.next_id);
+            let id = batch.next_id.max(user.account.next_id);
             let trades = operation(name, &mut user.account, &mut user.symbol, id)?;
-            user.account.validate()?;
-            if self.nstar_only
-                && (has_legacy_exposure(&user)
-                    || trades
-                        .iter()
-                        .any(|t| !t.symbol.is_empty() && t.symbol != symbols::NSTAR))
-            {
-                return Err(invalid("当前服务仅支持 NSTAR"));
-            }
-            let changed = user.account != before.account || user.symbol != before.symbol;
-            if !changed && trades.is_empty() {
-                self.writer
-                    .stats
-                    .noop_accounts
-                    .fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-            // IDs are reserved locally, not published until the single batch commits.
-            // Account.next_id also captures multiple fills in one risk operation.
-            next_id = next_id.max(user.account.next_id);
-            for position in &user.account.positions {
-                next_id = next_id.max(position.id.saturating_add(1));
-            }
-            for trade in trades.iter().filter(|trade| trade.kind == "open") {
-                next_id = next_id.max(trade.position_id.saturating_add(1));
-            }
-            let total = nstar_units(&user.account) - nstar_units(&before.account);
-            let player: f64 = trades
-                .iter()
-                .filter(|t| t.symbol == symbols::NSTAR)
-                .map(|t| {
-                    let units = t.lots * trading::contract(symbols::NSTAR);
-                    match (t.kind.as_str(), t.side.as_str()) {
-                        ("open", "long") | ("close" | "tp" | "sl", "short") | ("spot", "buy") => {
-                            units
-                        }
-                        ("open", "short") | ("close" | "tp" | "sl", "long") | ("spot", "sell") => {
-                            -units
-                        }
-                        _ => 0.0,
-                    }
-                })
-                .sum();
-            flow.0 += player;
-            flow.1 += total - player;
-            if let Some(index) = indices.get(name) {
-                let row = &mut rows[*index];
-                row.user = user;
-                row.changed |= changed;
-                row.trades.extend(trades);
-            } else {
-                indices.insert(name.clone(), rows.len());
-                rows.push(PreparedAccount {
-                    user,
-                    old_symbol: before.symbol,
-                    changed,
-                    trades,
-                });
-            }
+            batch.stage(&before, user, trades)?;
         }
+        self.submit_batch(mutation, batch).await
+    }
+    /// Risk sweep for one quote of `symbol`: every exposed account in name order, as if each
+    /// were settled one after another against `live` prices that every fill moves.
+    /// Accounts are evaluated in parallel on the CPU pool, and a result is accepted only
+    /// while the prices and position IDs it saw are still current, so the outcome equals a
+    /// sequential sweep. Most accounts trigger nothing, so one pass usually covers all.
+    pub async fn risk_batch(&self, symbol: &str, live: trading::Prices, now: i64) -> Result<()> {
+        let mutation = self.writer.admit_reserved(&self.gate).await?;
+        let cache = self.cache.clone();
+        let batch = Batch::new(self.next_id.load(Ordering::SeqCst), self.nstar_only);
+        let symbol = symbol.to_owned();
+        let batch = tokio::task::spawn_blocking(move || {
+            let cache = cache.read().unwrap();
+            let users: Vec<&User> = cache
+                .users
+                .values()
+                .filter(|user| exposed_to(user, &symbol))
+                .collect();
+            sweep(batch, &users, live, &symbol, now)
+        })
+        .await
+        .map_err(|_| invalid("风险计算任务失败"))??;
+        self.submit_batch(mutation, batch).await
+    }
+    async fn submit_batch(&self, mutation: Mutation, batch: Batch) -> Result<()> {
+        let stats = &self.writer.stats;
+        stats
+            .noop_accounts
+            .fetch_add(batch.noop_accounts, Ordering::Relaxed);
+        let Batch {
+            mut rows,
+            next_id,
+            flow,
+            ..
+        } = batch;
         // Repeated names are allowed; a later operation can undo an earlier edit.
         // Compare the final full account to the original committed copy, not just
         // a per-operation dirty flag, before deciding whether any SQL is needed.
         {
             let cache = self.cache.read().unwrap();
             rows.retain_mut(|row| {
-                let original = &cache.users[&row.user.name];
+                let Some(original) = cache.users.get(&row.user.name) else {
+                    return false;
+                };
                 row.changed =
                     row.user.account != original.account || row.user.symbol != original.symbol;
                 row.changed || !row.trades.is_empty()
             });
         }
         if rows.is_empty() {
-            self.writer.stats.noops.fetch_add(1, Ordering::Relaxed);
+            stats.noops.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
         self.writer
@@ -991,7 +960,7 @@ impl Store {
             .collect())
     }
     pub async fn save_bars(&self, symbol: &str, bars: &[(i64, [f64; 5], i64)]) -> Result<()> {
-        let mutation = self.writer.admit(&self.gate).await?;
+        let mutation = self.writer.admit_reserved(&self.gate).await?;
         if bars.is_empty() {
             self.writer.stats.noops.fetch_add(1, Ordering::Relaxed);
             return Ok(());

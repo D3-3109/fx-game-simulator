@@ -76,7 +76,7 @@ async fn nstar_only_blocks_cached_quotes_history_and_direct_upstreams_without_eg
         market
             .cache
             .write()
-            .await
+            .unwrap()
             .insert(symbol.into(), Quote::single(100.0, now_ms()));
         assert!(market.price(symbol).await.is_err(), "{symbol}");
         assert!(market.quote(symbol).await.is_err(), "{symbol}");
@@ -94,7 +94,7 @@ async fn nstar_only_blocks_cached_quotes_history_and_direct_upstreams_without_eg
                 .is_err(),
             "{symbol}"
         );
-        assert_eq!(market.cache.read().await[symbol].price, 100.0);
+        assert_eq!(market.cache.read().unwrap()[symbol].price, 100.0);
     }
     let blocked = "NSTAR-only 已禁用外部行情";
     assert_eq!(market.biquote_price("USDJPY").await.unwrap_err(), blocked);
@@ -217,7 +217,7 @@ async fn receipt_cache_reuses_frozen_quotes_without_making_stale_quotes_tradable
         assert_eq!(hit.received_at, now);
     }
     q.at = now - 31000;
-    market.cache.write().await.insert("USDCNH".into(), q);
+    market.cache.write().unwrap().insert("USDCNH".into(), q);
     assert!(
         tokio::time::timeout(
             Duration::from_millis(100),

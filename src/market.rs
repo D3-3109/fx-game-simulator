@@ -13,12 +13,12 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{
-        Arc, Mutex as SyncMutex,
+        Arc, Mutex as SyncMutex, RwLock as SyncRwLock,
         atomic::{AtomicI64, AtomicU64, Ordering},
     },
     time::Duration,
 };
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 
 pub type Result<T> = std::result::Result<T, String>;
 #[derive(Debug, Clone, Copy)]
@@ -63,7 +63,11 @@ pub struct Market {
     pub store: Arc<Store>,
     // NSTAR-only has no external client or legacy feed, even in production mode.
     client: Option<reqwest::Client>,
-    cache: RwLock<BTreeMap<String, Quote>>,
+    // Written only under `quote_gate`, and only for an in-memory swap: never held across
+    // an await, so quote readers never wait on a risk batch or its commit.
+    cache: SyncRwLock<BTreeMap<String, Quote>>,
+    /// Last published NSTAR market panel and funding rate, served while the book is busy.
+    panel: SyncMutex<(Option<Value>, f64)>,
     sim: Option<Mutex<SimFeed>>,
     nstar: Mutex<SimFeed>,
     offline: bool,
@@ -202,7 +206,7 @@ impl Market {
         Ok(Self {
             store,
             client,
-            cache: RwLock::new(
+            cache: SyncRwLock::new(
                 prices
                     .mid
                     .into_iter()
@@ -215,6 +219,7 @@ impl Market {
                     .collect(),
             ),
             sim,
+            panel: SyncMutex::new((None, 0.0)),
             nstar: Mutex::new(nstar),
             offline,
             quote_gate: Mutex::new(None),
@@ -275,8 +280,7 @@ impl Market {
                 .map_err(|_| "交易保存未完成")?;
             self.reconcile_nstar(&mut feed, false).await?;
             let _pending = self.quote_gate.lock().await;
-            let mut cache = self.cache.write().await;
-            self.publish_residual_flow(&mut feed, &mut cache)?;
+            self.publish_residual_flow(&mut feed)?;
         }
         self.flush_bars().await
     }
@@ -293,7 +297,7 @@ impl Market {
         Ok(())
     }
     pub async fn snapshot(&self) -> BTreeMap<String, Quote> {
-        self.cache.read().await.clone()
+        self.cache.read().unwrap().clone()
     }
     pub async fn price(&self, symbol: &str) -> Result<f64> {
         Ok(self.quote(symbol).await?.price)
@@ -302,7 +306,7 @@ impl Market {
         // Enforce the deployment whitelist before even looking at a cached legacy quote.
         self.require_symbol(symbol)?;
         let start = now_ms();
-        let hit = self.cache.read().await.get(symbol).copied();
+        let hit = self.cache.read().unwrap().get(symbol).copied();
         if let Some(q) = hit
             && (self.offline || (0..8000).contains(&(start - q.received_at)))
         {
@@ -330,7 +334,7 @@ impl Market {
         match result {
             Ok(q) => {
                 self.on_market_quote(symbol, q).await?;
-                Ok(self.cache.read().await[symbol])
+                Ok(self.cache.read().unwrap()[symbol])
             }
             // Retain the last price for display; trading_prices refuses stale/closed quotes.
             Err(e) => hit.ok_or(e),
@@ -359,7 +363,7 @@ impl Market {
     ) -> Result<Prices> {
         let needed = trading::price_symbols(symbols)?;
         let prices = self.prices(needed.iter().map(String::as_str)).await?;
-        let quotes = self.cache.read().await;
+        let quotes = self.cache.read().unwrap();
         for symbol in needed {
             if quotes.get(&symbol).is_none_or(|q| {
                 !q.open
@@ -579,23 +583,24 @@ impl Market {
         // A failed/cancelled batch retains its original trigger price and receipt clock.
         // Retry it before accepting another quote, rather than skipping a crossed stop.
         let mut pending = self.quote_gate.lock().await;
-        self.settle_pending(&mut pending).await?;
-        let mut cache = self.cache.write().await;
-        if cache.get(symbol).is_some_and(|q| q.at > quote.at) {
+        self.settle(&mut pending).await?;
+        if self
+            .cache
+            .read()
+            .unwrap()
+            .get(symbol)
+            .is_some_and(|q| q.at > quote.at)
+        {
             return Ok(false);
         }
-        self.stage_quote(&mut pending, &cache, symbol, quote);
-        self.settle_with_cache(&mut pending, &mut cache).await?;
+        self.stage_quote(&mut pending, symbol, quote);
+        self.settle(&mut pending).await?;
         Ok(true)
     }
-    fn stage_quote(
-        &self,
-        pending: &mut Option<PendingQuote>,
-        cache: &BTreeMap<String, Quote>,
-        symbol: &str,
-        quote: Quote,
-    ) {
-        let mut quotes = cache.clone();
+    /// Stage `quote` on top of the published set. Callers hold `quote_gate`, the only
+    /// writer, so the copy cannot miss a concurrent publication.
+    fn stage_quote(&self, pending: &mut Option<PendingQuote>, symbol: &str, quote: Quote) {
+        let mut quotes = self.cache.read().unwrap().clone();
         quotes.insert(symbol.into(), quote);
         *pending = Some(PendingQuote {
             symbol: symbol.into(),
@@ -604,18 +609,8 @@ impl Market {
             risk: None,
         });
     }
-    async fn settle_pending(&self, pending: &mut Option<PendingQuote>) -> Result<()> {
-        if pending.is_some() {
-            let mut cache = self.cache.write().await;
-            self.settle_with_cache(pending, &mut cache).await?;
-        }
-        Ok(())
-    }
-    async fn settle_with_cache(
-        &self,
-        pending: &mut Option<PendingQuote>,
-        cache: &mut BTreeMap<String, Quote>,
-    ) -> Result<()> {
+    /// Run (or keep awaiting) the staged quote's risk batch, then publish the quote.
+    async fn settle(&self, pending: &mut Option<PendingQuote>) -> Result<()> {
         if let Some(quote) = pending.as_mut() {
             if quote.risk.is_none() {
                 let store = self.store.clone();
@@ -631,7 +626,7 @@ impl Market {
             quote.risk = None;
             result.map_err(|_| "风险批处理任务失败，报价保留待重试")??;
             // No await between confirmed commit, cache publication and clearing the retry.
-            *cache = pending.take().unwrap().quotes;
+            *self.cache.write().unwrap() = pending.take().unwrap().quotes;
             self.revision.fetch_add(1, Ordering::Release);
         }
         Ok(())
@@ -643,7 +638,6 @@ impl Market {
         quotes: &BTreeMap<String, Quote>,
         now: i64,
     ) -> Result<()> {
-        let names = store.risk_user_names(symbol);
         let mut live = Prices::new();
         for (s, q) in quotes.iter().filter(|(_, q)| q.fresh(now)) {
             if !offline && symbols::FX.contains(&s.as_str()) && q.bid_ask.is_none() {
@@ -661,52 +655,9 @@ impl Market {
             }
         }
         store
-            .transaction_batch(&names, |_, account, _, id| {
-                if account.positions.is_empty() && account.orders.is_empty() {
-                    return Ok(vec![]);
-                }
-                let Ok(needed) = trading::price_symbols(account.symbols()) else {
-                    return Ok(vec![]);
-                };
-                if (!needed.contains(symbol) && !account.orders.iter().any(|o| o.symbol == symbol))
-                    || needed.iter().any(|s| !live.contains_key(s))
-                {
-                    return Ok(vec![]);
-                }
-                // Invalid operations may mutate before failing. Neither their account candidate
-                // nor their tentative fills may leak into the next account of this batch.
-                let mut candidate = account.clone();
-                let mut after = live.clone();
-                let result: Result<Vec<trading::Trade>> = (|| {
-                    let mut trades = candidate.check_triggers(&after, now)?;
-                    for trade in &trades {
-                        trading::apply_fill(&mut after, trade)?;
-                    }
-                    let fills = candidate.check_orders(&after, id, now)?;
-                    for trade in &fills {
-                        trading::apply_fill(&mut after, trade)?;
-                    }
-                    trades.extend(fills);
-                    // Keep liquidation pricing on the smoothed mark and executions on live AMM.
-                    let stops = candidate.check_stopout_at(&after.marked(), &after, now)?;
-                    for trade in &stops {
-                        trading::apply_fill(&mut after, trade)?;
-                    }
-                    trades.extend(stops);
-                    candidate.validate()?;
-                    Ok(trades)
-                })();
-                match result {
-                    Ok(trades) => {
-                        *account = candidate;
-                        live = after;
-                        Ok(trades)
-                    }
-                    Err(_) => Ok(vec![]),
-                }
-            })
+            .risk_batch(symbol, live, now)
             .await
-            .map_err(|_| "强平保存失败，报价保留待重试".into())
+            .map_err(|e| format!("强平保存失败，报价保留待重试: {e}"))
     }
     pub async fn record_sim(&self, price: f64, now: i64) -> Result<Value> {
         self.require_symbol(symbols::SIM)?;
@@ -714,8 +665,7 @@ impl Market {
         let packet = {
             let mut sim = self.sim.as_ref().ok_or("仅支持 NSTAR")?.lock().await;
             let mut pending = self.quote_gate.lock().await;
-            self.settle_pending(&mut pending).await?;
-            let mut cache = self.cache.write().await;
+            self.settle(&mut pending).await?;
             let mut next = sim.clone();
             next.record(price, now);
             self.dirty_bars
@@ -725,8 +675,8 @@ impl Market {
             let packet = next.packet();
             let quote = next.quote();
             *sim = next;
-            self.stage_quote(&mut pending, &cache, symbols::SIM, quote);
-            self.settle_with_cache(&mut pending, &mut cache).await?;
+            self.stage_quote(&mut pending, symbols::SIM, quote);
+            self.settle(&mut pending).await?;
             packet
         };
         // Explicit record_sim retains its historical immediate-persistence contract.
@@ -747,8 +697,7 @@ impl Market {
     async fn tick_feed(&self, feed: &Mutex<SimFeed>) -> Result<(Value, Vec<Value>)> {
         let mut sim = feed.lock().await;
         let mut pending = self.quote_gate.lock().await;
-        self.settle_pending(&mut pending).await?;
-        let mut cache = self.cache.write().await;
+        self.settle(&mut pending).await?;
         let mut next = sim.clone();
         let lease = (next.symbol == symbols::NSTAR).then(|| FlowLease::take(&self.store));
         if let Some(lease) = &lease {
@@ -766,21 +715,52 @@ impl Market {
         if let Some(lease) = lease {
             lease.commit();
         }
+        // This tick printed the book, including any flow a failed reconcile left unprinted.
+        sim.unprinted_flow = false;
         // No cancellation point between consuming flow, assigning feed and staging recovery.
-        self.stage_quote(&mut pending, &cache, sim.symbol, quote);
-        self.settle_with_cache(&mut pending, &mut cache).await?;
+        self.stage_quote(&mut pending, sim.symbol, quote);
+        // The staged quote is recovered by whoever takes `quote_gate` next, so the book
+        // can be released while the risk batch runs: orders, candles and the market panel
+        // stay available instead of queuing behind the commit. Lock order is feed first.
+        drop(sim);
+        self.settle(&mut pending).await?;
+        drop(pending);
+        let mut sim = feed.lock().await;
         let events = std::mem::take(&mut sim.book.events);
-        Ok((sim.packet(), events))
+        let packet = sim.packet();
+        self.publish_panel(&sim, &packet);
+        Ok((packet, events))
+    }
+    fn publish_panel(&self, sim: &SimFeed, packet: &Value) {
+        if sim.symbol != symbols::NSTAR {
+            return;
+        }
+        let mut panel = self.panel.lock().unwrap();
+        if let Some(market) = packet.get("market") {
+            panel.0 = Some(market.clone());
+        }
+        panel.1 = sim.book.funding_rate();
     }
     /// Current hourly funding rate per book symbol.
+    /// Served from the last published packet once the book has ticked, so callers never
+    /// wait for an order in progress.
     pub async fn funding_rates(&self) -> BTreeMap<String, f64> {
-        BTreeMap::from([(
-            symbols::NSTAR.to_string(),
-            self.nstar.lock().await.book.funding_rate(),
-        )])
+        let published = {
+            let panel = self.panel.lock().unwrap();
+            panel.0.is_some().then_some(panel.1)
+        };
+        let rate = match published {
+            Some(rate) => rate,
+            None => self.nstar.lock().await.book.funding_rate(),
+        };
+        BTreeMap::from([(symbols::NSTAR.to_string(), rate)])
     }
-    /// Public NSTAR market panel (24 h stats, fair value, funding, trades tape).
+    /// Public NSTAR market panel (24 h stats, fair value, funding, trades tape), as last
+    /// published to sockets: at most a second old, and refreshed on every new print.
     pub async fn nstar_stats(&self) -> Value {
+        if let Some(panel) = self.panel.lock().unwrap().0.clone() {
+            return panel;
+        }
         self.nstar.lock().await.stats()
     }
     /// Lock the NSTAR book for one account operation. Orders are priced and applied one at a
@@ -823,11 +803,7 @@ impl Market {
     // A bounded matching pass can itself finish with one more committed fill. Absorb it
     // before releasing the desk: the next order must never reuse an already moved AMM mid.
     // This publishes existing trades only; it does not introduce extra matching rounds.
-    fn publish_residual_flow(
-        &self,
-        feed: &mut SimFeed,
-        cache: &mut BTreeMap<String, Quote>,
-    ) -> Result<()> {
+    fn publish_residual_flow(&self, feed: &mut SimFeed) -> Result<()> {
         if self.apply_committed_flow(feed)? || feed.unprinted_flow {
             let mut next = feed.clone();
             next.record(next.book.published(), now_ms());
@@ -837,43 +813,35 @@ impl Market {
                 .merge(next.symbol, &next.pending())?;
             next.unprinted_flow = false;
             *feed = next;
-            cache.insert(symbols::NSTAR.into(), feed.quote());
+            self.cache
+                .write()
+                .unwrap()
+                .insert(symbols::NSTAR.into(), feed.quote());
             self.revision.fetch_add(1, Ordering::Release);
         }
         Ok(())
     }
     async fn reconcile_nstar(&self, feed: &mut SimFeed, match_orders: bool) -> Result<()> {
         let mut pending = self.quote_gate.lock().await;
-        self.settle_pending(&mut pending).await?;
-        let mut cache = self.cache.write().await;
+        self.settle(&mut pending).await?;
         let moved = self.apply_committed_flow(feed)?;
         if !moved && !feed.unprinted_flow && !match_orders {
             // Initial/offline state still needs an authoritative quote with mark + anchor.
-            if !cache.contains_key(symbols::NSTAR) {
-                self.stage_quote(&mut pending, &cache, symbols::NSTAR, feed.quote());
-                self.settle_with_cache(&mut pending, &mut cache).await?;
-                self.publish_residual_flow(feed, &mut cache)?;
+            if !self.cache.read().unwrap().contains_key(symbols::NSTAR) {
+                self.stage_quote(&mut pending, symbols::NSTAR, feed.quote());
+                self.settle(&mut pending).await?;
+                self.publish_residual_flow(feed)?;
             }
             return Ok(());
         }
-        self.stage_quote(
-            &mut pending,
-            &cache,
-            symbols::NSTAR,
-            feed.live_quote(now_ms()),
-        );
+        self.stage_quote(&mut pending, symbols::NSTAR, feed.live_quote(now_ms()));
         // Preserve the original four matching rounds and post-round final risk check.
         for _ in 0..MATCH_ROUNDS {
-            self.settle_with_cache(&mut pending, &mut cache).await?;
+            self.settle(&mut pending).await?;
             if !self.apply_committed_flow(feed)? {
                 break;
             }
-            self.stage_quote(
-                &mut pending,
-                &cache,
-                symbols::NSTAR,
-                feed.live_quote(now_ms()),
-            );
+            self.stage_quote(&mut pending, symbols::NSTAR, feed.live_quote(now_ms()));
         }
         let mut next = feed.clone();
         next.record(next.book.published(), now_ms());
@@ -883,9 +851,9 @@ impl Market {
             .merge(next.symbol, &next.pending())?;
         next.unprinted_flow = false;
         *feed = next;
-        self.stage_quote(&mut pending, &cache, symbols::NSTAR, feed.quote());
-        self.settle_with_cache(&mut pending, &mut cache).await?;
-        self.publish_residual_flow(feed, &mut cache)
+        self.stage_quote(&mut pending, symbols::NSTAR, feed.quote());
+        self.settle(&mut pending).await?;
+        self.publish_residual_flow(feed)
     }
 }
 

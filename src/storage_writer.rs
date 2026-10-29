@@ -9,7 +9,7 @@ const GATE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(super) struct Mutation {
     _gate: OwnedMutexGuard<()>,
-    _permit: OwnedSemaphorePermit,
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 #[derive(Default)]
@@ -128,7 +128,26 @@ impl Writer {
         }
         Ok(Mutation {
             _gate: guard,
-            _permit: permit,
+            _permit: Some(permit),
+        })
+    }
+
+    /// Admission for the fixed set of background producers (risk sweeps, candle flushes).
+    /// They wait for the gate like everyone else but never take a request permit, so a
+    /// burst of client orders cannot make a liquidation sweep fail and retry.
+    pub async fn admit_reserved(&self, gate: &Arc<Mutex<()>>) -> Result<Mutation> {
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(self.unavailable("storage is closing"));
+        }
+        let guard = tokio::time::timeout(GATE_TIMEOUT, gate.clone().lock_owned())
+            .await
+            .map_err(|_| self.unavailable("storage mutation wait timed out"))?;
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(self.unavailable("storage is closing"));
+        }
+        Ok(Mutation {
+            _gate: guard,
+            _permit: None,
         })
     }
 

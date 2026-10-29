@@ -1451,6 +1451,9 @@ impl SimFeed {
         };
         book.backlog -= release;
         book.flow(release, depth, width, true);
+        let push = (book.tick_flow / MOMENTUM_STEP).clamp(-1.0, 1.0);
+        book.momentum += MOMENTUM_DECAY * (push - book.momentum);
+        book.tick_flow = 0.0;
         // Only the secular driver moves the long-term benchmark. Daily/local moves still
         // mean-revert, producing advances and pullbacks inside a larger weekly trajectory.
         book.base += self.weekly_trend;
@@ -1463,7 +1466,8 @@ impl SimFeed {
         book.fair += trend + drift * FAIR_VOL * volatility;
         book.news(rng);
         let revert = if self.kind == 0 { RANGE_REVERT } else { REVERT };
-        book.log += revert * (book.fair - book.log) + shock * TICK_VOL * volatility + trend;
+        book.log +=
+            revert * pull_home(book.fair - book.log) + shock * TICK_VOL * volatility + trend;
         book.anchor += ANCHOR_FOLLOW * (book.log - book.anchor);
         // Fair value is the internal index. The book premium is bounded and smoothed, so a
         // whale must sustain a real repricing rather than wick the mark through stops.
@@ -1511,8 +1515,39 @@ const FAIR_REVERT: f64 = 4e-5;
 const FAIR_SOFT: f64 = std::f64::consts::LN_2 / 2.0;
 /// Pull of price toward fair value per tick: a displacement halves in ~90 s.
 const REVERT: f64 = 0.0015;
-/// Share of flow impact that becomes fair value instead of reverting.
+/// Gaps between price and fair value up to this size revert symmetrically, so ordinary
+/// noise carries no premium and no funding bias.
+const REVERT_SYMMETRIC: f64 = 0.02;
+/// Scale of the pull on the part of a gap beyond `REVERT_SYMMETRIC`. Dip buyers close a
+/// deep discount quickly; a big premium fades slowly, so a rally holds while a crash
+/// snaps back. Only the transient premium is asymmetric: fair value never moves on it.
+const REVERT_ABOVE: f64 = 0.6;
+const REVERT_BELOW: f64 = 1.6;
+/// Share of flow impact that becomes fair value instead of reverting, near the anchor.
 const CONVICTION: f64 = 0.35;
+/// Conviction fades with the book's displacement from its anchor: impact at `x` converts
+/// at `CONVICTION / (1 + (x / CONVICTION_WIDTH)²)`. One sweep can add at most
+/// `CONVICTION · CONVICTION_WIDTH · π/2` (~2.7%) to fair value, while flow spread over
+/// minutes keeps the book near its trailing anchor and converts in full. The share
+/// depends only on `x`, so split orders and instant round trips leave fair value as one
+/// sweep would.
+const CONVICTION_WIDTH: f64 = 0.08;
+/// Share of liquidated units the insurance fund takes over off-book; the rest is
+/// released into the AMM.
+const INSURANCE_SHARE: f64 = 0.5;
+/// Momentum is a per-tick average, with ~60 s memory, of how consistently players push
+/// one way: each tick counts from -1 to 1, reaching 1 at `MOMENTUM_STEP` log units of
+/// net voluntary impact (~5 NSTAR, ~$500). One sweep is a single tick however large, so
+/// only buying or selling kept up for many ticks builds momentum.
+const MOMENTUM_DECAY: f64 = std::f64::consts::LN_2 / 300.0;
+const MOMENTUM_STEP: f64 = 1e-4;
+/// Extra conviction at full momentum in the direction of the flow. Sustained buying is
+/// rewarded more than sustained selling, so crowd rallies stick while dumps fade.
+const MOMENTUM_BOOST_UP: f64 = 3.0;
+const MOMENTUM_BOOST_DOWN: f64 = 0.3;
+/// Boosted conviction never moves fair value by more than this share of the impact, so
+/// price always has to come back some way and never runs ahead on its own.
+const MAX_CONVICTION: f64 = 0.9;
 /// Per-tick pull of the AMM anchor toward the book: a gap halves in ~5 min (1,500 ticks).
 const ANCHOR_FOLLOW: f64 = std::f64::consts::LN_2 / 1500.0;
 /// Mark price trails a fair-value-anchored target with a ~60 s half-life (300 ticks).
@@ -1538,6 +1573,26 @@ const FUNDING_CAP: f64 = 0.0075;
 /// Flow that moves price by 3% or more (~1,500 NSTAR near the anchor) is announced.
 const BIG_FLOW: f64 = 0.03;
 
+/// Gap to close this tick, before the per-regime rate: `gap` is fair minus price, so a
+/// positive gap means price sits below fair value.
+fn pull_home(gap: f64) -> f64 {
+    let inner = gap.clamp(-REVERT_SYMMETRIC, REVERT_SYMMETRIC);
+    let scale = if gap > 0.0 {
+        REVERT_BELOW
+    } else {
+        REVERT_ABOVE
+    };
+    inner + scale * (gap - inner)
+}
+
+/// Fair-value shift for moving the book from displacement `x0` to `x1` off its anchor:
+/// the integral of the conviction share over the move.
+fn conviction(x0: f64, x1: f64) -> f64 {
+    CONVICTION
+        * CONVICTION_WIDTH
+        * ((x1 / CONVICTION_WIDTH).atan() - (x0 / CONVICTION_WIDTH).atan())
+}
+
 #[derive(Clone)]
 struct Book {
     /// True log price.
@@ -1550,6 +1605,9 @@ struct Book {
     mark: f64,
     /// Signed liquidation units still waiting to be unwound into the book.
     backlog: f64,
+    /// See `MOMENTUM_DECAY`; `tick_flow` collects this tick's voluntary impact.
+    momentum: f64,
+    tick_flow: f64,
     news_in: u32,
     pending: Option<f64>,
     events: Vec<Value>,
@@ -1569,6 +1627,8 @@ impl Book {
             anchor: log,
             mark: log,
             backlog: 0.0,
+            momentum: 0.0,
+            tick_flow: 0.0,
             news_in: NEWS_MIN_GAP,
             pending: None,
             events: Vec::new(),
@@ -1650,19 +1710,23 @@ impl Book {
         if units == 0.0 {
             return;
         }
-        self.backlog += units;
+        let queued = units * (1.0 - INSURANCE_SHARE);
+        self.backlog += queued;
         let x0 = self.log - self.anchor;
-        let d = trading::amm_shift(x0, units, depth, width) - x0;
+        let d = trading::amm_shift(x0, queued, depth, width) - x0;
         if d.abs() >= BIG_FLOW {
             let side = if units > 0.0 { "买入" } else { "卖出" };
-            let size = units.abs();
+            let (size, fund) = (units.abs(), (units - queued).abs());
             self.event(
                 "whale",
-                format!("强平潮：{size:.0} NSTAR 将被强制{side}，约半分钟内逐步释放到盘口"),
+                format!(
+                    "强平潮：{size:.0} NSTAR 被强平，保险基金接管 {fund:.0}，其余将被强制{side}并逐步释放到盘口"
+                ),
             );
         }
     }
     /// Signed units bought (+) or sold (-) move the book immediately along the AMM curve.
+    /// Liquidations are queued by `liquidations` and arrive here with `released`.
     fn flow(&mut self, units: f64, depth: f64, width: f64, released: bool) {
         if units == 0.0 {
             return;
@@ -1675,7 +1739,16 @@ impl Book {
         // Forced flow has a temporary execution impact, not a vote on fundamental value.
         // Otherwise each liquidation lowers/raises fair value and helps trigger the next one.
         if !released {
-            self.fair += CONVICTION * d;
+            // Momentum only moves between ticks, so splitting an order inside one tick
+            // cannot boost its own later parts.
+            let boost = if d > 0.0 {
+                MOMENTUM_BOOST_UP * self.momentum.max(0.0)
+            } else {
+                MOMENTUM_BOOST_DOWN * (-self.momentum).max(0.0)
+            };
+            let shift = (1.0 + boost) * conviction(x0, x1);
+            self.fair += shift.clamp(-MAX_CONVICTION * d.abs(), MAX_CONVICTION * d.abs());
+            self.tick_flow += d;
         }
         self.print(avg, units);
         // Released liquidations were announced when they were queued.

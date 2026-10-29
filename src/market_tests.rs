@@ -731,7 +731,8 @@ fn nstar_large_liquidation_queue_has_a_release_cap() {
     control.left = 10_000;
     nstar_run_seeded(&mut sim, 29, 1);
     nstar_run_seeded(&mut control, 29, 1);
-    assert!((sim.book.backlog + 60_000.0 - LIQ_RELEASE_CAP).abs() < 1e-9);
+    let queued = 60_000.0 * (1.0 - INSURANCE_SHARE);
+    assert!((sim.book.backlog + queued - LIQ_RELEASE_CAP).abs() < 1e-9);
     assert_eq!(sim.book.fair, control.book.fair, "forced flow moved fair");
 }
 
@@ -792,11 +793,13 @@ fn nstar_mark_lags_spikes_and_liquidations_unwind_gradually() {
     let mark = sim.book.mark.exp();
     assert!((mark / 100.0 - 1.0).abs() < 0.01, "{mark}");
     assert!(sim.quote().mark.is_some());
-    // Liquidated units are queued, announced, then released over tens of seconds.
+    // The insurance fund takes its share off-book; the rest is queued, then released
+    // over tens of seconds.
     let mut sim = SimFeed::new("NSTAR", 100.0, t);
     let before = sim.book.log;
-    sim.flow(0.0, -200.0);
+    sim.flow(0.0, -400.0);
     assert_eq!(sim.book.log, before, "nothing hits the book at once");
+    assert_eq!(sim.book.backlog, -400.0 * (1.0 - INSURANCE_SHARE));
     nstar_run(&mut sim, t, 1, 2);
     let first = sim.book.backlog;
     assert!(first < -196.0 && first > -200.0, "{first}");
@@ -1615,4 +1618,94 @@ async fn resting_book_sums_player_limit_orders_per_price() {
     assert_eq!(asks, vec![(101.0, 0.3)]);
     assert_eq!(store.resting_book(symbols::NSTAR, 1).0, vec![(99.0, 1.5)]);
     store.close().await;
+}
+
+#[test]
+fn nstar_one_sweep_has_bounded_conviction_and_splitting_changes_nothing() {
+    let t = 1800000000000;
+    let fresh = || SimFeed::new("NSTAR", 100.0, t);
+    let ceiling = CONVICTION * CONVICTION_WIDTH * std::f64::consts::FRAC_PI_2;
+    let mut whale = fresh();
+    whale.flow(200_000.0, 0.0);
+    let lifted = whale.book.fair - fresh().book.fair;
+    assert!(lifted > 0.0 && lifted < ceiling, "{lifted} vs {ceiling}");
+    // Small trades near the anchor still convert at the full share.
+    let mut small = fresh();
+    small.flow(50.0, 0.0);
+    let d = small.book.log - fresh().book.log;
+    assert!(((small.book.fair - fresh().book.fair) / d - CONVICTION).abs() < 1e-3);
+    // Inside one tick, split orders and an instant round trip leave fair as one sweep.
+    let mut split = fresh();
+    for _ in 0..20 {
+        split.flow(1_000.0, 0.0);
+    }
+    let mut once = fresh();
+    once.flow(20_000.0, 0.0);
+    assert!((split.book.fair - once.book.fair).abs() < 1e-12);
+    once.flow(-20_000.0, 0.0);
+    assert!((once.book.fair - fresh().book.fair).abs() < 1e-12);
+}
+
+#[test]
+fn nstar_sustained_buying_builds_more_momentum_than_selling() {
+    let t = 1800000000000;
+    let quiet = || {
+        let mut sim = SimFeed::new("NSTAR", 100.0, t);
+        sim.kind = 0;
+        sim.left = 100_000;
+        sim.weekly_left = 100_000;
+        sim.day_left = 100_000;
+        sim.pulse_left = 100_000;
+        sim.book.news_in = 100_000;
+        sim
+    };
+    // A crowd trading 20,000 NSTAR over five minutes, against the same random path.
+    let crowd = |units: f64| {
+        let (mut sim, mut base) = (quiet(), quiet());
+        let (mut a, mut b) = {
+            use rand::{SeedableRng, rngs::StdRng};
+            (StdRng::seed_from_u64(5), StdRng::seed_from_u64(5))
+        };
+        for _ in 0..1_500 {
+            sim.flow(units / 1_500.0, 0.0);
+            sim.next_book_price_with(&mut a);
+            base.next_book_price_with(&mut b);
+        }
+        (sim.book.fair - base.book.fair, sim.book.momentum)
+    };
+    let (up, momentum_up) = crowd(20_000.0);
+    let (down, momentum_down) = crowd(-20_000.0);
+    assert!(
+        momentum_up > 0.9 && momentum_down < -0.9,
+        "{momentum_up} {momentum_down}"
+    );
+    assert!(up > 1.3 * -down && down < 0.0, "rally {up} vs dump {down}");
+    // One sweep of the same size is a single tick and builds almost no momentum.
+    let mut sweep = quiet();
+    sweep.flow(20_000.0, 0.0);
+    nstar_run_seeded(&mut sweep, 5, 1);
+    assert!(sweep.book.momentum < 0.01, "{}", sweep.book.momentum);
+}
+
+#[test]
+fn nstar_premium_reverts_slower_than_a_discount_but_noise_stays_unbiased() {
+    // Small gaps revert symmetrically; only the part beyond the band is skewed.
+    assert_eq!(pull_home(0.01), 0.01);
+    assert_eq!(pull_home(-0.01), -0.01);
+    assert!((pull_home(0.10) - (0.02 + REVERT_BELOW * 0.08)).abs() < 1e-12);
+    assert!((pull_home(-0.10) + (0.02 + REVERT_ABOVE * 0.08)).abs() < 1e-12);
+    // Without players the price shows no lasting premium over fair value.
+    let mut sum = 0.0;
+    let mut n = 0.0;
+    for seed in 0..12 {
+        let mut sim = SimFeed::new("NSTAR", 100.0, 1800000000000);
+        use rand::{SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(seed);
+        for _ in 0..20_000 {
+            sim.next_book_price_with(&mut rng);
+            sum += sim.book.log - sim.book.fair;
+            n += 1.0;
+        }
+    }
+    assert!((sum / n).abs() < 0.002, "mean premium {}", sum / n);
 }

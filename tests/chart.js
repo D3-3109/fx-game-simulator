@@ -132,7 +132,8 @@ const candle = price => {
   assert.equal(typeof elements.sym.onchange,'undefined','legacy symbol switch handler is still installed');
   assert.deepEqual([...elements['itv-quick'].innerHTML.matchAll(/pickItv\('([^']+)'\)/g)].map(m=>m[1]),['1s','1m','5m','15m','30m','1h','4h','1d','1w']);
   assert.doesNotMatch(require('node:fs').readFileSync('static/index.html','utf8'),/id="itv"/,'duplicate interval dropdown is back');
-  assert.match(require('node:fs').readFileSync('static/index.html','utf8'),/href="https:\/\/www\.tradingview\.com\/"/,'hidden logo needs the NOTICE attribution link');
+  assert.match(require('node:fs').readFileSync('static/index.html','utf8'),/href="https:\/\/www\.tradingview\.com\/"/,'hidden logo needs the NOTICE attribution link on the login page');
+  assert.doesNotMatch(require('node:fs').readFileSync('static/index.html','utf8'),/chart-credit/,'credit is back in the chart toolbar');
   response = candle(100);
   await run('loadK()');
   assert.match(requests[0], /symbol=NSTAR&interval=15m(?:&|$)/, 'initial request used wrong symbol/timeframe');

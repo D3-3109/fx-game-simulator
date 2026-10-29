@@ -75,8 +75,6 @@ button:active:not(:disabled){transform:translateY(1px)}
 .chart-toolbar .itv{background:none;border:0;color:var(--muted);padding:3px 8px;border-radius:4px;font-size:12px}
 .chart-toolbar .itv[aria-pressed=true]{background:var(--raised);color:#fff}
 #itv-quick{display:flex;flex:none;white-space:nowrap}
-.chart-credit{margin-left:auto;padding-left:8px;min-width:0;overflow:hidden;text-overflow:ellipsis;font-size:10px;color:#555;text-decoration:none;white-space:nowrap}
-@media(hover:hover){.chart-credit:hover{color:var(--muted)}}
 #cv{flex:1;min-height:0}
 #px{position:absolute;top:44px;left:12px;z-index:3;font-size:11px;color:var(--soft);pointer-events:none}
 #msg{position:absolute;top:48px;left:50%;transform:translateX(-50%);z-index:6;width:max-content;max-width:calc(100% - 32px);margin:0;padding:8px 14px;background:#1f1f1f;color:#fff;border:1px solid var(--line-strong);border-radius:6px;overflow-wrap:anywhere;font-size:12px;pointer-events:none;box-shadow:0 8px 24px rgba(0,0,0,.5)}
@@ -231,6 +229,7 @@ dialog form{display:flex;flex-direction:column;gap:10px}
 #authbox button{width:100%;margin-top:10px;padding:11px}
 #authbox .primary{background:#fff;color:#000;font-weight:700}
 .auth-note{color:var(--muted);font-size:10px;text-align:center;margin:20px 0 0}
+.auth-note a{color:var(--muted)}
 
 /* ---------- responsive ---------- */
 @media(max-width:1100px){.nav-links{display:none}#pairbar{gap:18px}}

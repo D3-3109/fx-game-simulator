@@ -268,7 +268,7 @@ function initChart(){
  if(chart||typeof LightweightCharts==='undefined')return;
  const cw=$('cv').clientWidth||innerWidth-24;
  chart=LightweightCharts.createChart($('cv'),{width:cw,height:$('cv').clientHeight||160,
-  // The library's NOTICE requires attribution; the toolbar credit link replaces the logo.
+  // The licence's attribution link is on the login page instead of inside the chart.
   layout:{attributionLogo:false,background:{type:'solid',color:'#000000'},textColor:'#8a8a8a',fontSize:11,fontFamily:'Noto Sans, PingFang SC, Noto Sans SC, sans-serif'},
   grid:{vertLines:{color:'#161616'},horzLines:{color:'#161616'}},crosshair:{mode:0},
   timeScale:{borderColor:'#232323',timeVisible:true,secondsVisible:false},

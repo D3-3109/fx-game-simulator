@@ -922,8 +922,7 @@ async fn dirty_record(market: &Market, price: f64, at: i64) {
         .dirty_bars
         .lock()
         .unwrap()
-        .merge(feed.symbol, &feed.pending())
-        .unwrap();
+        .merge(feed.symbol, &feed.pending());
     let _ = feed.packet();
 }
 

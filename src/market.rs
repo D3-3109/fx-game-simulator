@@ -117,17 +117,7 @@ impl DirtyBars {
         }
         Ok(())
     }
-    fn check_capacity(&self, symbol: &'static str, bars: &[(i64, [f64; 5], i64)]) -> Result<()> {
-        let added = bars
-            .iter()
-            .filter(|(sec, bar, _)| !self.rows.contains_key(&(symbol, *sec, bar[0] as i64)))
-            .count();
-        if self.rows.len() + added > MAX_DIRTY_BARS {
-            return Err("模拟K线待保存队列已满，暂停行情推进".into());
-        }
-        Ok(())
-    }
-    fn merge_unchecked(&mut self, symbol: &'static str, bars: &[(i64, [f64; 5], i64)]) {
+    fn merge(&mut self, symbol: &'static str, bars: &[(i64, [f64; 5], i64)]) {
         self.version += 1;
         for (sec, bar, keep_from) in bars {
             self.rows.insert(
@@ -139,11 +129,6 @@ impl DirtyBars {
                 },
             );
         }
-    }
-    fn merge(&mut self, symbol: &'static str, bars: &[(i64, [f64; 5], i64)]) -> Result<()> {
-        self.check_capacity(symbol, bars)?;
-        self.merge_unchecked(symbol, bars);
-        Ok(())
     }
 }
 
@@ -691,7 +676,7 @@ impl Market {
             self.dirty_bars
                 .lock()
                 .unwrap()
-                .merge_unchecked(sim.symbol, &sim.pending());
+                .merge(sim.symbol, &sim.pending());
             let packet = sim.packet();
             let quote = sim.quote();
             self.stage_quote(&mut pending, symbols::SIM, quote);
@@ -732,7 +717,7 @@ impl Market {
         self.dirty_bars
             .lock()
             .unwrap()
-            .merge_unchecked(sim.symbol, &sim.pending());
+            .merge(sim.symbol, &sim.pending());
         let quote = sim.quote();
         if let Some(lease) = lease {
             lease.commit();
@@ -847,7 +832,7 @@ impl Market {
             self.dirty_bars
                 .lock()
                 .unwrap()
-                .merge_unchecked(feed.symbol, &feed.pending());
+                .merge(feed.symbol, &feed.pending());
             feed.unprinted_flow = false;
             self.cache
                 .write()
@@ -888,7 +873,7 @@ impl Market {
         self.dirty_bars
             .lock()
             .unwrap()
-            .merge_unchecked(feed.symbol, &feed.pending());
+            .merge(feed.symbol, &feed.pending());
         feed.unprinted_flow = false;
         self.stage_quote(&mut pending, symbols::NSTAR, feed.quote());
         self.settle(&mut pending).await?;

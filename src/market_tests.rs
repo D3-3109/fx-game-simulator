@@ -808,15 +808,15 @@ fn nstar_mark_lags_spikes_and_liquidations_unwind_gradually() {
     // and released over tens of seconds.
     let mut sim = SimFeed::new("NSTAR", 100.0, t);
     let before = sim.book.log;
-    sim.flow(0.0, -400.0);
+    sim.flow(0.0, -600.0);
     assert_eq!(sim.book.log, before, "nothing hits the book at once");
-    assert_eq!(sim.book.backlog, -400.0 * (1.0 - INSURANCE_SHARE_LONG));
+    assert!((sim.book.backlog - (-600.0 * (1.0 - INSURANCE_SHARE_LONG))).abs() < 1e-9);
     nstar_run(&mut sim, t, 1, 2);
     let first = sim.book.backlog;
-    assert!(first < -135.0 && first > -140.0, "{first}");
+    assert!(first < -205.0 && first > -210.0, "{first}");
     nstar_run(&mut sim, t, 2, 51);
     let half = sim.book.backlog;
-    assert!(half < -55.0 && half > -85.0, "{half}");
+    assert!(half < -85.0 && half > -125.0, "{half}");
     nstar_run(&mut sim, t, 51, 600);
     assert!(sim.book.backlog.abs() < 1.0, "{}", sim.book.backlog);
 }

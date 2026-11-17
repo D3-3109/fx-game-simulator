@@ -1556,9 +1556,7 @@ impl Account {
         let cap = symbols::spec(symbol).map_or(0.0, |s| s.max_spot_units);
         let held = self.spot.get(symbol).map_or(0.0, |h| h.units);
         let mut ok = |units: f64| {
-            if !(SPOT_MIN..=SPOT_MAX).contains(&units)
-                || (cap > 0.0 && held + units > cap + 1e-9)
-            {
+            if !(SPOT_MIN..=SPOT_MAX).contains(&units) || (cap > 0.0 && held + units > cap + 1e-9) {
                 return false;
             }
             let Ok((avg, _)) = book_fill(prices, symbol, mid, units) else {

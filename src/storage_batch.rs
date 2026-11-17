@@ -102,7 +102,9 @@ pub(super) fn exposed_to(user: &User, symbol: &str) -> bool {
     {
         return true;
     }
-    let symbols = a.symbols().chain(a.orders.iter().map(|o| o.symbol.as_str()));
+    let symbols = a
+        .symbols()
+        .chain(a.orders.iter().map(|o| o.symbol.as_str()));
     trading::price_symbols(symbols).map_or(true, |required| required.contains(symbol))
 }
 

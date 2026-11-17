@@ -161,9 +161,8 @@ impl App {
             .flatten();
         if let Some(symbol) = symbol {
             let mut intervals = BTreeMap::new();
-            let text: Arc<str> = if let Some(klines) = message
-                .as_object_mut()
-                .and_then(|map| map.remove("klines"))
+            let text: Arc<str> = if let Some(klines) =
+                message.as_object_mut().and_then(|map| map.remove("klines"))
             {
                 // Serialize shared quote + market panel once instead of nine times per tick.
                 let base = message.to_string();

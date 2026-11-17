@@ -33,7 +33,8 @@
  <div class="stat" data-nstar hidden><span>24h 最低</span><b id="stat-low">—</b></div>
  <div class="stat" data-nstar hidden><span>24h 成交量 (NSTAR)</span><b id="stat-vol">—</b></div>
  <div class="stat" data-nstar hidden><span>24h 成交额 (USDT)</span><b id="stat-turnover">—</b></div>
- <div class="stat" data-nstar hidden><span>资金费率 / 倒计时</span><b><span id="stat-funding">—</span> / <span id="stat-countdown" class="countdown">—</span></b></div>
+ <div class="stat" data-nstar hidden><span>拉盘热度 / 转化</span><b id="stat-momentum">—</b></div>
+ <div class="stat" data-nstar hidden><span>15m 资费 / 倒计时</span><b><span id="stat-funding">—</span> / <span id="stat-countdown" class="countdown">—</span></b></div>
 </header>
 
 <div id="wrap">
@@ -81,7 +82,7 @@
  </form>
  <div id="close-box" class="close-section"><button id="close-all" type="button" onclick="closeAll()">全部平仓</button></div>
  <div id="spot-form" class="order-form" hidden>
-  <div class="order-symbol"><b>NSTAR/USDT</b><span>现货 · 与永续共用 AMM · 手续费 0.1%</span></div>
+  <div class="order-symbol"><b>NSTAR/USDT</b><span>现货 · 共用弹性 AMM · 买 0.03% / 卖 0.35%</span></div>
   <div class="type-tabs" role="tablist" aria-label="现货委托类型">
    <button type="button" role="tab" data-spot-otype="market" aria-selected="true">市价</button>
    <button type="button" role="tab" data-spot-otype="limit" aria-selected="false">限价</button>

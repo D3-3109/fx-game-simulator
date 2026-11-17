@@ -71,12 +71,15 @@ fn password_hash(salt: &str, password: &str) -> String {
 /// Order book levels as (price, units).
 pub type Levels = Vec<(f64, f64)>;
 
+const CACHED_RESTING_LEVELS: usize = 50;
+
 #[derive(Debug, Clone)]
 pub struct User {
     pub name: String,
     pub symbol: String,
     pub account: Account,
     pub last_trade: Option<Value>,
+    pub revision: u64,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -99,6 +102,7 @@ pub struct Store {
     login_aliases: Arc<std::sync::Mutex<BTreeMap<String, String>>>,
     /// Committed copies only; hot paths never re-read and re-parse SQLite.
     cache: Arc<std::sync::RwLock<Cache>>,
+    resting_cache: std::sync::Mutex<Option<(u64, Levels, Levels)>>,
     revision: Arc<AtomicU64>,
     writer: Writer,
 }
@@ -108,6 +112,7 @@ struct Cache {
     users: BTreeMap<String, User>,
     tokens: std::collections::HashMap<String, String>,
     deposits: BTreeMap<String, f64>,
+    orders_revision: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -214,6 +219,7 @@ impl Store {
                 .into_iter()
                 .map(|row| (row.get("name"), row.get("total")))
                 .collect();
+        cache.orders_revision = 1;
         drop(conn);
         let gate = Arc::new(Mutex::new(()));
         let next_id = Arc::new(AtomicU64::new(next_id));
@@ -239,6 +245,7 @@ impl Store {
             nstar_flow,
             login_aliases,
             cache,
+            resting_cache: std::sync::Mutex::new(None),
             revision,
             writer,
         })
@@ -385,27 +392,55 @@ impl Store {
     /// highest first, asks lowest first, at most `levels` each. Only the totals are
     /// published, never who placed them. Untriggered stop orders are not liquidity.
     pub fn resting_book(&self, symbol: &str, levels: usize) -> (Levels, Levels) {
+        let cacheable = symbol == symbols::NSTAR && levels <= CACHED_RESTING_LEVELS;
+        if cacheable {
+            let orders_rev = self.cache.read().unwrap().orders_revision;
+            if let Some((rev, bids, asks)) = &*self.resting_cache.lock().unwrap()
+                && *rev == orders_rev
+            {
+                return (
+                    bids.iter().take(levels).copied().collect(),
+                    asks.iter().take(levels).copied().collect(),
+                );
+            }
+        }
+        let target_levels = if cacheable {
+            CACHED_RESTING_LEVELS
+        } else {
+            levels
+        };
         let mut bids = BTreeMap::<i64, f64>::new();
         let mut asks = BTreeMap::<i64, f64>::new();
         let contract = trading::contract(symbol);
-        for user in self.cache.read().unwrap().users.values() {
-            for o in &user.account.orders {
-                if o.symbol != symbol || o.kind != "limit" || !(o.price > 0.0 && o.lots > 0.0) {
-                    continue;
+        let orders_rev = {
+            let cache = self.cache.read().unwrap();
+            for user in cache.users.values() {
+                for o in &user.account.orders {
+                    if o.symbol != symbol || o.kind != "limit" || !(o.price > 0.0 && o.lots > 0.0) {
+                        continue;
+                    }
+                    let side = if matches!(o.side.as_str(), "long" | "buy") {
+                        &mut bids
+                    } else {
+                        &mut asks
+                    };
+                    *side.entry((o.price * 1e4).round() as i64).or_default() += o.lots * contract;
                 }
-                let side = if matches!(o.side.as_str(), "long" | "buy") {
-                    &mut bids
-                } else {
-                    &mut asks
-                };
-                *side.entry((o.price * 1e4).round() as i64).or_default() += o.lots * contract;
             }
-        }
+            cache.orders_revision
+        };
         let row = |(price, units): (&i64, &f64)| (*price as f64 / 1e4, *units);
-        (
-            bids.iter().rev().take(levels).map(row).collect(),
-            asks.iter().take(levels).map(row).collect(),
-        )
+        let full_bids: Levels = bids.iter().rev().take(target_levels).map(row).collect();
+        let full_asks: Levels = asks.iter().take(target_levels).map(row).collect();
+        if cacheable {
+            let out = (
+                full_bids.iter().take(levels).copied().collect(),
+                full_asks.iter().take(levels).copied().collect(),
+            );
+            *self.resting_cache.lock().unwrap() = Some((orders_rev, full_bids, full_asks));
+            return out;
+        }
+        (full_bids, full_asks)
     }
     /// Names of committed accounts matching `filter`, without cloning any account.
     pub fn names_where(&self, filter: impl Fn(&User) -> bool) -> Vec<String> {
@@ -465,6 +500,15 @@ impl Store {
             .users
             .get(name)
             .map(|u| u.symbol.clone())
+    }
+    /// Per-account revision counter, read in O(1) without cloning `User`.
+    pub fn user_revision(&self, name: &str) -> Option<u64> {
+        self.cache
+            .read()
+            .unwrap()
+            .users
+            .get(name)
+            .map(|u| u.revision)
     }
     pub async fn authenticate(&self, tok: &str) -> Result<Option<String>> {
         if tok.is_empty() {
@@ -575,6 +619,7 @@ impl Store {
                     symbol: symbol.into(),
                     account,
                     last_trade: None,
+                    revision: 1,
                 }],
                 tokens: vec![(tok.clone(), name.into())],
                 revision: true,
@@ -665,8 +710,18 @@ impl Store {
     /// sequential sweep. Most accounts trigger nothing, so one pass usually covers all.
     pub async fn risk_batch(&self, symbol: &str, live: trading::Prices, now: i64) -> Result<()> {
         let mutation = self.writer.admit_reserved(&self.gate).await?;
-        let cache = self.cache.clone();
         let batch = Batch::new(self.next_id.load(Ordering::SeqCst), self.nstar_only);
+        let any_exposed = self
+            .cache
+            .read()
+            .unwrap()
+            .users
+            .values()
+            .any(|user| exposed_to(user, symbol));
+        if !any_exposed {
+            return self.submit_batch(mutation, batch).await;
+        }
+        let cache = self.cache.clone();
         let symbol = symbol.to_owned();
         let batch = tokio::task::spawn_blocking(move || {
             let cache = cache.read().unwrap();
@@ -1114,6 +1169,7 @@ async fn load_user_mode(
         symbol: row.get("symbol"),
         account,
         last_trade,
+        revision: 1,
     })
 }
 async fn persist(conn: &mut SqliteConnection, user: &User) -> Result<()> {

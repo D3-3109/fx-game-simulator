@@ -58,10 +58,13 @@ pub struct Spec {
     /// Units that move the price by one log unit (e≈2.72x) near the anchor; 0 means no
     /// simulated order book.
     pub depth: f64,
-    /// Elastic AMM width (log units). Liquidity at displacement `x` from the book's slow
-    /// anchor is `depth · (1 + (x / width)²)`, so small trades feel the plain `depth` while
-    /// pushing the price far needs ever more size. 0 keeps the constant-depth book.
+    /// Elastic AMM width (log units) above the anchor. Liquidity at displacement `x >= 0`
+    /// is `depth · (1 + (x / amm_width)²)`. 0 keeps the constant-depth book.
     pub amm_width: f64,
+    /// Elastic AMM width below the anchor (`x < 0`); 0 reuses `amm_width` symmetrically.
+    /// A smaller downward width thickens buy support so dumps face cubic resistance while
+    /// rallies push through thinner upper resistance.
+    pub amm_width_down: f64,
     /// Spot units one account may hold in this symbol; 0 means no holding cap.
     pub max_spot_units: f64,
 }
@@ -82,6 +85,7 @@ const fn lot(symbol: &'static str, spread: f64, settle: Option<&'static str>) ->
         leverage_tiers: &[],
         depth: 0.0,
         amm_width: 0.0,
+        amm_width_down: 0.0,
         max_spot_units: 0.0,
     }
 }
@@ -100,6 +104,7 @@ const fn coin(symbol: &'static str) -> Spec {
         leverage_tiers: &[],
         depth: 0.0,
         amm_width: 0.0,
+        amm_width_down: 0.0,
         max_spot_units: 0.0,
     }
 }
@@ -118,16 +123,16 @@ const fn stock(symbol: &'static str) -> Spec {
         leverage_tiers: &[],
         depth: 0.0,
         amm_width: 0.0,
+        amm_width_down: 0.0,
         max_spot_units: 0.0,
     }
 }
 const SPECS: &[Spec] = &[
     lot(SIM, TIGHT, None),
-    // 1 lot = 0.01 NSTAR. ~500 NSTAR (~$50k) moves the price ~1% near the anchor. The
-    // elastic curve thickens away from it: 20,000 NSTAR lifts ~18% (49% on a flat book),
-    // 100,000 ~37% (flat: 7x). There is no total holding cap: progressively lower leverage
+    // 1 lot = 0.01 NSTAR. ~500 NSTAR (~$50k) moves the price ~1% near the anchor. Asymmetric
+    // elastic widths make upward breakouts lighter (20k lifts ~23%, 100k ~51%) while thickening
+    // support below the anchor (20k drops ~13%, 100k ~22%). Progressively lower leverage tiers
     // and full collateral beyond 100,000 NSTAR make size expensive instead of forbidden.
-    // One order has a numeric safety bound, but accounts may accumulate any total size.
     Spec {
         contract: 0.01,
         max_leverage: 10,
@@ -135,7 +140,8 @@ const SPECS: &[Spec] = &[
         max_order_lots: 10_000_000.0,
         leverage_tiers: &[(10_000.0, 10), (25_000.0, 5), (50_000.0, 2), (100_000.0, 1)],
         depth: 50_000.0,
-        amm_width: 0.08,
+        amm_width: 0.12,
+        amm_width_down: 0.055,
         max_spot_units: 0.0,
         ..coin(NSTAR)
     },

@@ -63,7 +63,7 @@ pub fn start(app: Arc<App>) -> JoinSet<()> {
     let a = app.clone();
     tasks.spawn(async move {
         loop {
-            sleep(Duration::from_secs(60)).await;
+            sleep(Duration::from_secs(15)).await;
             if let Err(e) = a.settle_funding().await {
                 eprintln!("[funding] {e}; will retry");
             }
@@ -72,7 +72,10 @@ pub fn start(app: Arc<App>) -> JoinSet<()> {
     if !app.market.is_offline() {
         let a = app.clone();
         tasks.spawn(async move {
+            let mut clock = tokio::time::interval(Duration::from_millis(200));
+            clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
+                clock.tick().await;
                 match a.market.tick_nstar().await {
                     Ok((packet, events)) => {
                         a.broadcast(packet);
@@ -80,7 +83,6 @@ pub fn start(app: Arc<App>) -> JoinSet<()> {
                     }
                     Err(_) => eprintln!("[nstar] tick persistence/settlement failed; will retry"),
                 }
-                sleep(Duration::from_millis(200)).await;
             }
         });
         if !app.store.is_nstar_only() {

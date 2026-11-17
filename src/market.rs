@@ -51,8 +51,10 @@ impl Quote {
     }
     pub fn packet(self, symbol: &str, now: i64) -> Value {
         let (bid, ask) = self.bid_ask.unwrap_or_else(|| {
-            let half = trading::spread(symbol, self.price) / 2.0;
-            (self.price - half, self.price + half)
+            (
+                self.price - trading::bid_offset(symbol, self.price),
+                self.price + trading::ask_offset(symbol, self.price),
+            )
         });
         json!({"sym":symbol,"price":self.price,"bid":bid,"ask":ask,
             "quote_at":self.at,"quote_valid":self.fresh(now)})
@@ -103,6 +105,18 @@ struct DirtyBars {
     version: u64,
 }
 impl DirtyBars {
+    fn check_keys(&self, keys: &[BarKey]) -> Result<()> {
+        let mut added = 0;
+        for (idx, key) in keys.iter().enumerate() {
+            if !keys[..idx].contains(key) && !self.rows.contains_key(key) {
+                added += 1;
+            }
+        }
+        if self.rows.len() + added > MAX_DIRTY_BARS {
+            return Err("模拟K线待保存队列已满，暂停行情推进".into());
+        }
+        Ok(())
+    }
     fn check_capacity(&self, symbol: &'static str, bars: &[(i64, [f64; 5], i64)]) -> Result<()> {
         let added = bars
             .iter()
@@ -113,8 +127,7 @@ impl DirtyBars {
         }
         Ok(())
     }
-    fn merge(&mut self, symbol: &'static str, bars: &[(i64, [f64; 5], i64)]) -> Result<()> {
-        self.check_capacity(symbol, bars)?;
+    fn merge_unchecked(&mut self, symbol: &'static str, bars: &[(i64, [f64; 5], i64)]) {
         self.version += 1;
         for (sec, bar, keep_from) in bars {
             self.rows.insert(
@@ -126,6 +139,10 @@ impl DirtyBars {
                 },
             );
         }
+    }
+    fn merge(&mut self, symbol: &'static str, bars: &[(i64, [f64; 5], i64)]) -> Result<()> {
+        self.check_capacity(symbol, bars)?;
+        self.merge_unchecked(symbol, bars);
         Ok(())
     }
 }
@@ -666,15 +683,17 @@ impl Market {
             let mut sim = self.sim.as_ref().ok_or("仅支持 NSTAR")?.lock().await;
             let mut pending = self.quote_gate.lock().await;
             self.settle(&mut pending).await?;
-            let mut next = sim.clone();
-            next.record(price, now);
             self.dirty_bars
                 .lock()
                 .unwrap()
-                .merge(next.symbol, &next.pending())?;
-            let packet = next.packet();
-            let quote = next.quote();
-            *sim = next;
+                .check_keys(&sim.pending_keys_at(now))?;
+            sim.record(price, now);
+            self.dirty_bars
+                .lock()
+                .unwrap()
+                .merge_unchecked(sim.symbol, &sim.pending());
+            let packet = sim.packet();
+            let quote = sim.quote();
             self.stage_quote(&mut pending, symbols::SIM, quote);
             self.settle(&mut pending).await?;
             packet
@@ -698,26 +717,29 @@ impl Market {
         let mut sim = feed.lock().await;
         let mut pending = self.quote_gate.lock().await;
         self.settle(&mut pending).await?;
-        let mut next = sim.clone();
-        let lease = (next.symbol == symbols::NSTAR).then(|| FlowLease::take(&self.store));
-        if let Some(lease) = &lease {
-            lease.apply(&mut next);
-        }
-        let price = next.next_price();
-        next.record(price, now_ms());
-        // This bounded merge can fail; the RAII lease then restores the discarded flow.
+        let lease = (sim.symbol == symbols::NSTAR).then(|| FlowLease::take(&self.store));
+        let now = now_ms();
+        // Verify dirty-bar capacity before mutating the feed; on failure `FlowLease` restores flow.
         self.dirty_bars
             .lock()
             .unwrap()
-            .merge(next.symbol, &next.pending())?;
-        let quote = next.quote();
-        *sim = next;
+            .check_keys(&sim.pending_keys_at(now))?;
+        if let Some(lease) = &lease {
+            lease.apply(&mut sim);
+        }
+        let price = sim.next_price();
+        sim.record(price, now);
+        self.dirty_bars
+            .lock()
+            .unwrap()
+            .merge_unchecked(sim.symbol, &sim.pending());
+        let quote = sim.quote();
         if let Some(lease) = lease {
             lease.commit();
         }
         // This tick printed the book, including any flow a failed reconcile left unprinted.
         sim.unprinted_flow = false;
-        // No cancellation point between consuming flow, assigning feed and staging recovery.
+        // No cancellation point between consuming flow, mutating feed and staging recovery.
         self.stage_quote(&mut pending, sim.symbol, quote);
         // The staged quote is recovered by whoever takes `quote_gate` next, so the book
         // can be released while the risk batch runs: orders, candles and the market panel
@@ -791,24 +813,20 @@ impl Market {
             error,
         }
     }
-    fn apply_committed_flow(&self, feed: &mut SimFeed) -> Result<bool> {
+    fn apply_committed_flow_at(&self, feed: &mut SimFeed, now: i64) -> Result<bool> {
         let lease = FlowLease::take(&self.store);
         if lease.flow == Some((0.0, 0.0)) {
             lease.commit();
             return Ok(false);
         }
-        let mut next = feed.clone();
-        lease.apply(&mut next);
         // Reserve room before moving the authoritative book. Do not print a provisional
         // wick: resting liquidity must still get its original rounds to answer the flow.
-        let mut printed = next.clone();
-        printed.record(printed.book.published(), now_ms());
         self.dirty_bars
             .lock()
             .unwrap()
-            .check_capacity(next.symbol, &printed.pending())?;
-        next.unprinted_flow = true;
-        *feed = next;
+            .check_keys(&feed.pending_keys_at(now))?;
+        lease.apply(feed);
+        feed.unprinted_flow = true;
         lease.commit();
         Ok(true)
     }
@@ -816,15 +834,21 @@ impl Market {
     // before releasing the desk: the next order must never reuse an already moved AMM mid.
     // This publishes existing trades only; it does not introduce extra matching rounds.
     fn publish_residual_flow(&self, feed: &mut SimFeed) -> Result<()> {
-        if self.apply_committed_flow(feed)? || feed.unprinted_flow {
-            let mut next = feed.clone();
-            next.record(next.book.published(), now_ms());
+        let now = now_ms();
+        let moved = self.apply_committed_flow_at(feed, now)?;
+        if moved || feed.unprinted_flow {
+            if !moved {
+                self.dirty_bars
+                    .lock()
+                    .unwrap()
+                    .check_keys(&feed.pending_keys_at(now))?;
+            }
+            feed.record(feed.book.published(), now);
             self.dirty_bars
                 .lock()
                 .unwrap()
-                .merge(next.symbol, &next.pending())?;
-            next.unprinted_flow = false;
-            *feed = next;
+                .merge_unchecked(feed.symbol, &feed.pending());
+            feed.unprinted_flow = false;
             self.cache
                 .write()
                 .unwrap()
@@ -836,7 +860,7 @@ impl Market {
     async fn reconcile_nstar(&self, feed: &mut SimFeed, match_orders: bool) -> Result<()> {
         let mut pending = self.quote_gate.lock().await;
         self.settle(&mut pending).await?;
-        let moved = self.apply_committed_flow(feed)?;
+        let moved = self.apply_committed_flow_at(feed, now_ms())?;
         if !moved && !feed.unprinted_flow && !match_orders {
             // Initial/offline state still needs an authoritative quote with mark + anchor.
             if !self.cache.read().unwrap().contains_key(symbols::NSTAR) {
@@ -850,19 +874,22 @@ impl Market {
         // Preserve the original four matching rounds and post-round final risk check.
         for _ in 0..MATCH_ROUNDS {
             self.settle(&mut pending).await?;
-            if !self.apply_committed_flow(feed)? {
+            if !self.apply_committed_flow_at(feed, now_ms())? {
                 break;
             }
             self.stage_quote(&mut pending, symbols::NSTAR, feed.live_quote(now_ms()));
         }
-        let mut next = feed.clone();
-        next.record(next.book.published(), now_ms());
+        let now = now_ms();
         self.dirty_bars
             .lock()
             .unwrap()
-            .merge(next.symbol, &next.pending())?;
-        next.unprinted_flow = false;
-        *feed = next;
+            .check_keys(&feed.pending_keys_at(now))?;
+        feed.record(feed.book.published(), now);
+        self.dirty_bars
+            .lock()
+            .unwrap()
+            .merge_unchecked(feed.symbol, &feed.pending());
+        feed.unprinted_flow = false;
         self.stage_quote(&mut pending, symbols::NSTAR, feed.quote());
         self.settle(&mut pending).await?;
         self.publish_residual_flow(feed)
@@ -1076,7 +1103,7 @@ struct SimFeed {
     /// Intervals whose candle closed since the last packet.
     rolled: std::collections::BTreeSet<i64>,
     stats_at: i64,
-    sent_print: f64,
+    sent_tape_seq: u64,
     // Committed flow applied to the book but not yet printed after resting-order matching.
     unprinted_flow: bool,
 }
@@ -1115,7 +1142,7 @@ impl SimFeed {
                 .collect(),
             rolled: Default::default(),
             stats_at: 0,
-            sent_print: 0.0,
+            sent_tape_seq: 0,
             unprinted_flow: false,
         }
     }
@@ -1193,6 +1220,23 @@ impl SimFeed {
             }
         }
     }
+    fn pending_keys_at(&self, now: i64) -> Vec<BarKey> {
+        let mut keys = Vec::with_capacity(symbols::INTERVALS.len() * 2);
+        for (sec, bars) in &self.bars {
+            let last_t = bars.back().unwrap()[0] as i64;
+            let t = symbols::bucket(now / 1000, *sec);
+            if t > last_t {
+                keys.push((self.symbol, *sec, last_t));
+                keys.push((self.symbol, *sec, t));
+            } else {
+                let count = if self.rolled.contains(sec) { 2 } else { 1 };
+                for bar in bars.iter().skip(bars.len().saturating_sub(count)) {
+                    keys.push((self.symbol, *sec, bar[0] as i64));
+                }
+            }
+        }
+        keys
+    }
     fn pending(&self) -> Vec<(i64, [f64; 5], i64)> {
         self.bars
             .iter()
@@ -1235,10 +1279,10 @@ impl SimFeed {
         let mut packet = self.quote().packet(self.symbol, self.updated_at);
         packet["time"] = json!(self.updated_at);
         if trading::depth(self.symbol) > 0.0 {
-            let prints = self.book.tape.back().map_or(0.0, |p| p[0]);
-            if prints != self.sent_print || self.updated_at - self.stats_at >= 1000 {
+            let seq = self.book.tape_seq;
+            if seq != self.sent_tape_seq || self.updated_at - self.stats_at >= 1000 {
                 packet["market"] = self.stats();
-                self.sent_print = prints;
+                self.sent_tape_seq = seq;
                 self.stats_at = self.updated_at;
             }
         }
@@ -1260,8 +1304,12 @@ impl SimFeed {
         let open = hours.last().map_or(self.price, |b| b[1]);
         let high = hours.iter().map(|b| b[2]).fold(self.price, f64::max);
         let low = hours.iter().map(|b| b[3]).fold(self.price, f64::min);
-        // An empty f64 sum is -0.0, which the panel would show as "-0".
-        let volume: f64 = self.book.volume.iter().map(|(_, v)| v).sum::<f64>() + 0.0;
+        // Maintained incrementally in O(1) instead of scanning up to 86,400 buckets.
+        let volume = if self.book.volume.is_empty() {
+            0.0
+        } else {
+            self.book.volume_total.max(0.0) + 0.0
+        };
         let tape: Vec<_> = self.book.tape.iter().rev().take(30).collect();
         let today = symbols::bucket(self.updated_at / 1000, 86_400);
         let prev_close = self.bars[&86_400]
@@ -1270,15 +1318,20 @@ impl SimFeed {
             .find(|bar| bar[0] < today as f64)
             .map(|bar| bar[4])
             .filter(|price| price.is_finite() && *price > 0.0);
+        let (amm_width, amm_width_down) = trading::amm_widths(self.symbol);
+        let conviction_mult = 1.0 + MOMENTUM_BOOST_UP * self.book.momentum.max(0.0);
         json!({
             "prev_close": prev_close,
             "open_24h": open, "high_24h": high, "low_24h": low,
             "volume_24h": volume, "turnover_24h": volume * self.price,
             "fair": self.book.fair.exp(), "funding_rate": self.book.funding_rate(),
+            "funding_interval_ms": trading::FUNDING_INTERVAL_MS,
             "depth": trading::depth(self.symbol),
-            "anchor": self.book.anchor.exp(), "amm_width": trading::amm_width(self.symbol),
+            "anchor": self.book.anchor.exp(),
+            "amm_width": amm_width, "amm_width_down": amm_width_down,
             "mark": self.book.mark.exp(), "liq_backlog": self.book.backlog,
-            "tape": tape,
+            "momentum": self.book.momentum, "conviction_mult": conviction_mult,
+            "tape_seq": self.book.tape_seq, "tape": tape,
         })
     }
     fn regime(&mut self, rng: &mut impl Rng) {
@@ -1365,7 +1418,7 @@ impl SimFeed {
     fn pulse_regime(&mut self, rng: &mut impl Rng) {
         if self.pulse_left == 0 {
             self.pulse_left = rng.random_range(PULSE_TICKS);
-            self.pulse_trend = if rng.random::<f64>() < 0.55 {
+            self.pulse_trend = if rng.random::<f64>() < 0.50 {
                 0.0
             } else {
                 let parent = if self.trend != 0.0 {
@@ -1437,23 +1490,38 @@ impl SimFeed {
         let shock = StudentT::new(4.0).unwrap().sample(rng) / std::f64::consts::SQRT_2;
         let drift: f64 = StandardNormal.sample(rng);
         let depth = trading::depth(self.symbol);
-        let width = trading::amm_width(self.symbol);
+        let widths = trading::amm_widths(self.symbol);
         if self.kind == 0 {
             // A burst is a real short trend, not noise for the range pull to erase.
             self.range_center += self.pulse_trend;
         }
         let book = &mut self.book;
-        // Large liquidation queues cannot turn into an unlimited market-order waterfall.
-        let release = if book.backlog.abs() * LIQ_RELEASE < 1.0 {
+        // Short-squeeze buybacks unwind faster than long liquidations, fueling explosive rallies
+        // while keeping long stopouts cushioned from infinite waterfalls.
+        let (rate, cap) = if book.backlog >= 0.0 {
+            (LIQ_RELEASE_UP, LIQ_RELEASE_CAP_UP)
+        } else {
+            (LIQ_RELEASE_DOWN, LIQ_RELEASE_CAP_DOWN)
+        };
+        let release = if book.backlog.abs() * rate < 1.0 {
             book.backlog
         } else {
-            (book.backlog * LIQ_RELEASE).clamp(-LIQ_RELEASE_CAP, LIQ_RELEASE_CAP)
+            (book.backlog * rate).clamp(-cap, cap)
         };
         book.backlog -= release;
-        book.flow(release, depth, width, true);
+        book.flow(release, depth, widths, true);
         let push = (book.tick_flow / MOMENTUM_STEP).clamp(-1.0, 1.0);
         book.momentum += MOMENTUM_DECAY * (push - book.momentum);
         book.tick_flow = 0.0;
+        book.rally_cd = book.rally_cd.saturating_sub(1);
+        if book.momentum >= 0.72 && book.rally_cd == 0 {
+            let mult = 1.0 + MOMENTUM_BOOST_UP * book.momentum;
+            book.event(
+                "rally",
+                format!("多头集结：持续买盘点燃拉盘热潮，公允价值转化倍率已升至 {mult:.1}x！"),
+            );
+            book.rally_cd = 1_500;
+        }
         // Only the secular driver moves the long-term benchmark. Daily/local moves still
         // mean-revert, producing advances and pullbacks inside a larger weekly trajectory.
         book.base += self.weekly_trend;
@@ -1468,7 +1536,12 @@ impl SimFeed {
         let revert = if self.kind == 0 { RANGE_REVERT } else { REVERT };
         book.log +=
             revert * pull_home(book.fair - book.log) + shock * TICK_VOL * volatility + trend;
-        book.anchor += ANCHOR_FOLLOW * (book.log - book.anchor);
+        let anchor_follow = if book.log >= book.anchor {
+            ANCHOR_FOLLOW_UP
+        } else {
+            ANCHOR_FOLLOW_DOWN
+        };
+        book.anchor += anchor_follow * (book.log - book.anchor);
         // Fair value is the internal index. The book premium is bounded and smoothed, so a
         // whale must sustain a real repricing rather than wick the mark through stops.
         let premium = (book.log - book.fair).clamp(-MARK_MAX_PREMIUM, MARK_MAX_PREMIUM);
@@ -1480,9 +1553,9 @@ impl SimFeed {
     fn flow(&mut self, units: f64, forced: f64) {
         let depth = trading::depth(self.symbol);
         if depth > 0.0 {
-            let width = trading::amm_width(self.symbol);
-            self.book.flow(units, depth, width, false);
-            self.book.liquidations(forced, depth, width);
+            let widths = trading::amm_widths(self.symbol);
+            self.book.flow(units, depth, widths, false);
+            self.book.liquidations(forced, depth, widths);
         }
     }
 }
@@ -1499,7 +1572,7 @@ const WEEKLY_DRIFT: std::ops::RangeInclusive<f64> = 0.000_000_015..=0.000_000_05
 const DAY_TICKS: std::ops::RangeInclusive<u32> = 36_000..=108_000;
 const DAY_DRIFT: std::ops::RangeInclusive<f64> = 0.000001..=0.000003;
 const PULSE_TICKS: std::ops::RangeInclusive<u32> = 300..=900;
-const PULSE_DRIFT: std::ops::RangeInclusive<f64> = 0.00003..=0.00005;
+const PULSE_DRIFT: std::ops::RangeInclusive<f64> = 0.000032..=0.000055;
 const RANGE_VOL: f64 = 0.7;
 const VOLATILE_VOL: f64 = 2.8;
 const TREND_VOL: f64 = 0.9;
@@ -1517,39 +1590,36 @@ const FAIR_SOFT: f64 = std::f64::consts::LN_2 / 2.0;
 const REVERT: f64 = 0.0015;
 /// Gaps between price and fair value up to this size revert symmetrically, so ordinary
 /// noise carries no premium and no funding bias.
-const REVERT_SYMMETRIC: f64 = 0.02;
+const REVERT_SYMMETRIC: f64 = 0.025;
 /// Scale of the pull on the part of a gap beyond `REVERT_SYMMETRIC`. Dip buyers close a
-/// deep discount quickly; a big premium fades slowly, so a rally holds while a crash
-/// snaps back. Only the transient premium is asymmetric: fair value never moves on it.
-const REVERT_ABOVE: f64 = 0.6;
-const REVERT_BELOW: f64 = 1.6;
-/// Share of flow impact that becomes fair value instead of reverting, near the anchor.
-const CONVICTION: f64 = 0.35;
-/// Conviction fades with the book's displacement from its anchor: impact at `x` converts
-/// at `CONVICTION / (1 + (x / CONVICTION_WIDTH)²)`. One sweep can add at most
-/// `CONVICTION · CONVICTION_WIDTH · π/2` (~2.7%) to fair value, while flow spread over
-/// minutes keeps the book near its trailing anchor and converts in full. The share
-/// depends only on `x`, so split orders and instant round trips leave fair value as one
-/// sweep would.
-const CONVICTION_WIDTH: f64 = 0.08;
-/// Share of liquidated units the insurance fund takes over off-book; the rest is
-/// released into the AMM.
-const INSURANCE_SHARE: f64 = 0.5;
+/// deep discount aggressively while rallies fade slowly so pumps stick and dumps V-bounce.
+const REVERT_ABOVE: f64 = 0.45;
+const REVERT_BELOW: f64 = 2.4;
+/// Asymmetric conviction share and width above (`x >= 0`) vs below (`x < 0`) the anchor.
+/// Buying converts 48% near the anchor (up to ~7.5% fair-value lift per sweep); dumping
+/// converts only 12% over a narrow width (at most ~0.94% drop per sweep) so raids snap back.
+const CONVICTION_ABOVE: f64 = 0.48;
+const CONVICTION_WIDTH_UP: f64 = 0.10;
+const CONVICTION_BELOW: f64 = 0.12;
+const CONVICTION_WIDTH_DOWN: f64 = 0.05;
+/// Asymmetric insurance absorption: 65% of long stopouts are absorbed off-book to cushion
+/// cascades, whereas only 20% of short stopouts are absorbed so 80% squeeze the book upward.
+const INSURANCE_SHARE_LONG: f64 = 0.65;
+const INSURANCE_SHARE_SHORT: f64 = 0.20;
 /// Momentum is a per-tick average, with ~60 s memory, of how consistently players push
 /// one way: each tick counts from -1 to 1, reaching 1 at `MOMENTUM_STEP` log units of
 /// net voluntary impact (~5 NSTAR, ~$500). One sweep is a single tick however large, so
-/// only buying or selling kept up for many ticks builds momentum.
+/// only buying kept up for many ticks builds upward momentum.
 const MOMENTUM_DECAY: f64 = std::f64::consts::LN_2 / 300.0;
 const MOMENTUM_STEP: f64 = 1e-4;
-/// Extra conviction at full momentum in the direction of the flow. Sustained buying is
-/// rewarded more than sustained selling, so crowd rallies stick while dumps fade.
-const MOMENTUM_BOOST_UP: f64 = 3.0;
-const MOMENTUM_BOOST_DOWN: f64 = 0.3;
-/// Boosted conviction never moves fair value by more than this share of the impact, so
-/// price always has to come back some way and never runs ahead on its own.
-const MAX_CONVICTION: f64 = 0.9;
-/// Per-tick pull of the AMM anchor toward the book: a gap halves in ~5 min (1,500 ticks).
-const ANCHOR_FOLLOW: f64 = std::f64::consts::LN_2 / 1500.0;
+/// Extra conviction at full upward momentum; sustained selling receives zero momentum boost.
+const MOMENTUM_BOOST_UP: f64 = 3.2;
+/// Boosted conviction never moves fair value by more than this share of the impact.
+const MAX_CONVICTION: f64 = 0.92;
+/// Asymmetric AMM anchor trailing: follows rallies with a ~3 min half-life to lock in higher
+/// support, and trails dumps slowly (~10 min half-life) so thick bid walls stay in place.
+const ANCHOR_FOLLOW_UP: f64 = std::f64::consts::LN_2 / 900.0;
+const ANCHOR_FOLLOW_DOWN: f64 = std::f64::consts::LN_2 / 3_000.0;
 /// Mark price trails a fair-value-anchored target with a ~60 s half-life (300 ticks).
 const MARK_FOLLOW: f64 = std::f64::consts::LN_2 / 300.0;
 /// A last-price premium can only move the liquidation mark this far from fair value.
@@ -1558,18 +1628,23 @@ const MARK_MAX_PREMIUM: f64 = 0.05;
 const MATCH_ROUNDS: usize = 4;
 /// Price levels of resting player orders published per side in the market panel.
 const RESTING_LEVELS: usize = 50;
-/// Share of the liquidation backlog released into the book per tick: ~10 s half-life.
-const LIQ_RELEASE: f64 = 0.0138;
-/// Absolute forced-flow release cap per tick; exponential release still handles small queues.
-const LIQ_RELEASE_CAP: f64 = 10.0;
+/// Asymmetric forced-flow release: short squeezes hit the book 3x faster than long unwinds.
+const LIQ_RELEASE_DOWN: f64 = 0.0138;
+const LIQ_RELEASE_CAP_DOWN: f64 = 10.0;
+const LIQ_RELEASE_UP: f64 = 0.035;
+const LIQ_RELEASE_CAP_UP: f64 = 30.0;
 const RUMOR_LEAD: u32 = 25;
 const RUMOR_ACCURACY: f64 = 0.65;
-const NEWS_MIN_GAP: u32 = 1500;
+const NEWS_MIN_GAP: u32 = 600;
 /// Recent prints kept for the trades tape.
 const TAPE_LEN: usize = 60;
-/// Funding charges this share of the hourly price-over-fair premium, capped per hour.
-const FUNDING_SHARE: f64 = 0.1;
-const FUNDING_CAP: f64 = 0.0075;
+/// 15-minute funding: rallies up to +2% over fair pay zero funding, while discounts below
+/// fair charge crowded shorts heavily and credit longs.
+const FUNDING_BULL_GRACE: f64 = 0.02;
+const FUNDING_UP_SHARE: f64 = 0.04;
+const FUNDING_UP_CAP: f64 = 0.0025;
+const FUNDING_DOWN_SHARE: f64 = 0.18;
+const FUNDING_DOWN_CAP: f64 = 0.0075;
 /// Flow that moves price by 3% or more (~1,500 NSTAR near the anchor) is announced.
 const BIG_FLOW: f64 = 0.03;
 
@@ -1585,12 +1660,19 @@ fn pull_home(gap: f64) -> f64 {
     inner + scale * (gap - inner)
 }
 
-/// Fair-value shift for moving the book from displacement `x0` to `x1` off its anchor:
-/// the integral of the conviction share over the move.
-fn conviction(x0: f64, x1: f64) -> f64 {
-    CONVICTION
-        * CONVICTION_WIDTH
-        * ((x1 / CONVICTION_WIDTH).atan() - (x0 / CONVICTION_WIDTH).atan())
+fn conviction_potential(x: f64, bull_momentum: f64) -> f64 {
+    if x >= 0.0 {
+        let boost = 1.0 + MOMENTUM_BOOST_UP * bull_momentum.max(0.0);
+        boost * CONVICTION_ABOVE * CONVICTION_WIDTH_UP * (x / CONVICTION_WIDTH_UP).atan()
+    } else {
+        CONVICTION_BELOW * CONVICTION_WIDTH_DOWN * (x / CONVICTION_WIDTH_DOWN).atan()
+    }
+}
+
+/// Fair-value shift for moving the book from `x0` to `x1` off its anchor. Potential-based
+/// evaluation guarantees split-order equivalence and zero wash-trade gain at any momentum.
+fn conviction(x0: f64, x1: f64, bull_momentum: f64) -> f64 {
+    conviction_potential(x1, bull_momentum) - conviction_potential(x0, bull_momentum)
 }
 
 #[derive(Clone)]
@@ -1608,13 +1690,16 @@ struct Book {
     /// See `MOMENTUM_DECAY`; `tick_flow` collects this tick's voluntary impact.
     momentum: f64,
     tick_flow: f64,
+    rally_cd: u32,
     news_in: u32,
     pending: Option<f64>,
     events: Vec<Value>,
     /// Recent prints, newest last: [time ms, price, signed units].
     tape: VecDeque<[f64; 3]>,
+    tape_seq: u64,
     /// Per-second units traded over the last 24 h, oldest first: (second, units).
     volume: VecDeque<(i64, f64)>,
+    volume_total: f64,
 }
 impl Book {
     fn new(base: f64, price: f64) -> Self {
@@ -1629,11 +1714,14 @@ impl Book {
             backlog: 0.0,
             momentum: 0.0,
             tick_flow: 0.0,
+            rally_cd: 0,
             news_in: NEWS_MIN_GAP,
             pending: None,
             events: Vec::new(),
             tape: VecDeque::new(),
+            tape_seq: 0,
             volume: VecDeque::new(),
+            volume_total: 0.0,
         }
     }
     fn published(&self) -> f64 {
@@ -1646,14 +1734,17 @@ impl Book {
     /// A rumor, right 65% of the time, precedes each news shock by five seconds.
     fn news(&mut self, rng: &mut impl Rng) {
         const GOOD: &[&str] = &[
-            "传闻：北极星基金会即将公布重大合作",
-            "传闻：头部交易所准备上线 NSTAR 永续合约",
-            "传闻：神秘巨鲸正在场外吸筹",
+            "传闻：北极星基金会即将公布重大生态回购计划",
+            "传闻：头部交易所准备上线 NSTAR 零费率拉盘专区",
+            "传闻：神秘巨鲸地址正在场外扫货吸筹",
+            "传闻：主网升级提案获全票通过，质押锁仓量激增",
+            "传闻：做市商联盟准备联手发动逼空行情",
         ];
         const BAD: &[&str] = &[
-            "传闻：北极星核心钱包疑似异动",
-            "传闻：监管机构点名调查 NSTAR 项目方",
-            "传闻：早期投资人解锁筹码准备出货",
+            "传闻：北极星核心冷钱包疑似出现大额异动",
+            "传闻：监管机构点名问询 NSTAR 衍生品波动",
+            "传闻：早期私募份额即将解锁，空头借币激增",
+            "传闻：跨链桥节点短暂延迟，引发避险抛盘猜测",
         ];
         self.news_in = self.news_in.saturating_sub(1);
         if self.news_in == RUMOR_LEAD {
@@ -1675,9 +1766,9 @@ impl Book {
                 self.log += jump * 0.5;
                 let pct = jump.exp_m1() * 100.0;
                 let text = if jump > 0.0 {
-                    format!("利好落地：NSTAR 公允价值 {pct:+.1}%")
+                    format!("利好落地：NSTAR 公允价值飙升 {pct:+.1}%！")
                 } else {
-                    format!("利空坐实：NSTAR 公允价值 {pct:+.1}%")
+                    format!("利空坐实：NSTAR 公允价值调整 {pct:+.1}%")
                 };
                 self.event("news", text);
             }
@@ -1689,77 +1780,98 @@ impl Book {
     fn print(&mut self, price: f64, units: f64) {
         let now = now_ms();
         self.tape.push_back([now as f64, price, units]);
+        self.tape_seq = self.tape_seq.wrapping_add(1);
         while self.tape.len() > TAPE_LEN {
             self.tape.pop_front();
         }
+        let abs = units.abs();
         let sec = now / 1000;
+        self.volume_total += abs;
         match self.volume.back_mut() {
-            Some((s, v)) if *s == sec => *v += units.abs(),
-            _ => self.volume.push_back((sec, units.abs())),
+            Some((s, v)) if *s == sec => *v += abs,
+            _ => self.volume.push_back((sec, abs)),
         }
         while self.volume.front().is_some_and(|(s, _)| *s <= sec - 86_400) {
-            self.volume.pop_front();
+            if let Some((_, expired)) = self.volume.pop_front() {
+                self.volume_total = (self.volume_total - expired).max(0.0);
+            }
+        }
+        if self.volume.is_empty() {
+            self.volume_total = 0.0;
         }
     }
-    /// Hourly funding rate: the premium of price over fair value, clamped to ±0.75%.
+    /// 15-minute funding rate: rallies enjoy a 2% grace zone, while discounts penalise shorts.
     fn funding_rate(&self) -> f64 {
-        ((self.log - self.fair) * FUNDING_SHARE).clamp(-FUNDING_CAP, FUNDING_CAP)
+        let gap = self.log - self.fair;
+        if gap >= 0.0 {
+            ((gap - FUNDING_BULL_GRACE).max(0.0) * FUNDING_UP_SHARE).min(FUNDING_UP_CAP)
+        } else {
+            (gap * FUNDING_DOWN_SHARE).max(-FUNDING_DOWN_CAP)
+        }
     }
-    /// Queue liquidated units for gradual release, announcing a big wave once on arrival.
-    fn liquidations(&mut self, units: f64, depth: f64, width: f64) {
+    /// Queue liquidated units for gradual release, announcing short squeezes and cascades.
+    fn liquidations(&mut self, units: f64, depth: f64, widths: (f64, f64)) {
         if units == 0.0 {
             return;
         }
-        let queued = units * (1.0 - INSURANCE_SHARE);
+        let share = if units > 0.0 {
+            INSURANCE_SHARE_SHORT
+        } else {
+            INSURANCE_SHARE_LONG
+        };
+        let queued = units * (1.0 - share);
         self.backlog += queued;
         let x0 = self.log - self.anchor;
-        let d = trading::amm_shift(x0, queued, depth, width) - x0;
+        let d = trading::amm_shift_asym(x0, queued, depth, widths.0, widths.1) - x0;
         if d.abs() >= BIG_FLOW {
-            let side = if units > 0.0 { "买入" } else { "卖出" };
             let (size, fund) = (units.abs(), (units - queued).abs());
-            self.event(
-                "whale",
-                format!(
-                    "强平潮：{size:.0} NSTAR 被强平，保险基金接管 {fund:.0}，其余将被强制{side}并逐步释放到盘口"
-                ),
-            );
+            let (kind, text) = if units > 0.0 {
+                (
+                    "squeeze",
+                    format!(
+                        "连环逼空：{size:.0} NSTAR 空头爆仓！保险接管 {fund:.0}，{queued:.0} 强平买单涌入拉升"
+                    ),
+                )
+            } else {
+                (
+                    "whale",
+                    format!(
+                        "多头护盘：{size:.0} NSTAR 被强平，保险基金场外承接 {fund:.0}，其余缓释进入盘口"
+                    ),
+                )
+            };
+            self.event(kind, text);
         }
     }
     /// Signed units bought (+) or sold (-) move the book immediately along the AMM curve.
     /// Liquidations are queued by `liquidations` and arrive here with `released`.
-    fn flow(&mut self, units: f64, depth: f64, width: f64, released: bool) {
+    fn flow(&mut self, units: f64, depth: f64, widths: (f64, f64), released: bool) {
         if units == 0.0 {
             return;
         }
         let x0 = self.log - self.anchor;
-        let x1 = trading::amm_shift(x0, units, depth, width);
+        let x1 = trading::amm_shift_asym(x0, units, depth, widths.0, widths.1);
         let d = x1 - x0;
-        let avg = self.log.exp() * trading::amm_avg(x0, x1, width);
+        let avg = self.log.exp() * trading::amm_avg_asym(x0, x1, widths.0, widths.1);
         self.log += d;
         // Forced flow has a temporary execution impact, not a vote on fundamental value.
         // Otherwise each liquidation lowers/raises fair value and helps trigger the next one.
         if !released {
-            // Momentum only moves between ticks, so splitting an order inside one tick
-            // cannot boost its own later parts.
-            let boost = if d > 0.0 {
-                MOMENTUM_BOOST_UP * self.momentum.max(0.0)
-            } else {
-                MOMENTUM_BOOST_DOWN * (-self.momentum).max(0.0)
-            };
-            let shift = (1.0 + boost) * conviction(x0, x1);
+            let shift = conviction(x0, x1, self.momentum);
             self.fair += shift.clamp(-MAX_CONVICTION * d.abs(), MAX_CONVICTION * d.abs());
             self.tick_flow += d;
         }
         self.print(avg, units);
         // Released liquidations were announced when they were queued.
         if d.abs() >= BIG_FLOW && !released {
-            let side = if units > 0.0 { "买入" } else { "卖出" };
             let pct = d.exp_m1() * 100.0;
             let size = units.abs();
-            self.event(
-                "whale",
-                format!("巨鲸出没：有人一口气{side} {size:.0} NSTAR，价格 {pct:+.1}%"),
-            );
+            let text = if units > 0.0 {
+                format!("巨鲸拉盘：有人一口气扫入 {size:.0} NSTAR，盘口飙升 {pct:+.1}%！")
+            } else {
+                format!("巨鲸砸盘：有人抛售 {size:.0} NSTAR，价格瞬时 {pct:+.1}%（护盘买墙承接中）")
+            };
+            self.event("whale", text);
         }
     }
 }

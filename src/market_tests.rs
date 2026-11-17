@@ -669,9 +669,10 @@ fn nstar_forced_flow_cannot_rewrite_fair_value_or_jump_mark() {
     let t = 1800000000000;
     let mut sim = SimFeed::new("NSTAR", 100.0, t);
     let fair = sim.book.fair;
-    sim.book.flow(-1_000.0, 50_000.0, 0.08, true);
+    let widths = crate::trading::amm_widths("NSTAR");
+    sim.book.flow(-1_000.0, 50_000.0, widths, true);
     assert_eq!(sim.book.fair, fair);
-    sim.book.flow(1_000.0, 50_000.0, 0.08, false);
+    sim.book.flow(1_000.0, 50_000.0, widths, false);
     assert!(sim.book.fair > fair, "voluntary conviction must persist");
 
     let mut sim = SimFeed::new("NSTAR", 100.0, t);
@@ -731,21 +732,31 @@ fn nstar_large_liquidation_queue_has_a_release_cap() {
     control.left = 10_000;
     nstar_run_seeded(&mut sim, 29, 1);
     nstar_run_seeded(&mut control, 29, 1);
-    let queued = 60_000.0 * (1.0 - INSURANCE_SHARE);
-    assert!((sim.book.backlog + queued - LIQ_RELEASE_CAP).abs() < 1e-9);
+    let queued = 60_000.0 * (1.0 - INSURANCE_SHARE_LONG);
+    assert!((sim.book.backlog + queued - LIQ_RELEASE_CAP_DOWN).abs() < 1e-9);
     assert_eq!(sim.book.fair, control.book.fair, "forced flow moved fair");
+
+    // Short liquidations put 80% into the book and squeeze 3x faster than long liquidations.
+    let mut squeeze = SimFeed::new("NSTAR", 100.0, t);
+    squeeze.kind = 0;
+    squeeze.left = 10_000;
+    squeeze.flow(0.0, 60_000.0);
+    assert!(squeeze.book.events.iter().any(|e| e["kind"] == "squeeze"));
+    nstar_run_seeded(&mut squeeze, 29, 1);
+    let short_queued = 60_000.0 * (1.0 - INSURANCE_SHARE_SHORT);
+    assert!((squeeze.book.backlog - (short_queued - LIQ_RELEASE_CAP_UP)).abs() < 1e-9);
 }
 
 #[test]
 fn nstar_flow_moves_price_by_depth_then_mostly_reverts() {
     let t = 1800000000000;
     let mut sim = SimFeed::new("NSTAR", 100.0, t);
-    // 5% of depth (2,500 NSTAR, ~$250k): +5.1% on a flat book, ~+4.6% on the AMM curve.
+    // 5% of depth (2,500 NSTAR, ~$250k): ~+4.87% on the lighter upward AMM curve.
     sim.flow(0.05 * crate::trading::depth("NSTAR"), 0.0);
     let moved = sim.book.log.exp();
-    assert!((moved / 100.0 - 1.0 - 0.0461).abs() < 1e-3, "{moved}");
+    assert!((moved / 100.0 - 1.0 - 0.0487).abs() < 1e-3, "{moved}");
     assert!(sim.book.events.iter().any(|e| e["kind"] == "whale"));
-    // Within ~5 minutes price rejoins fair; 35% of player impact became conviction.
+    // Within ~5 minutes price rejoins fair; 48% of near-anchor buy impact became conviction.
     let mut errs = Vec::new();
     for _ in 0..40 {
         let mut s = sim.clone();
@@ -761,10 +772,10 @@ fn nstar_anchor_trails_slowly_and_big_flow_never_halts() {
     let t = 1800000000000;
     let mut sim = SimFeed::new("NSTAR", 100.0, t);
     let start = sim.book.anchor;
-    // 40,000 NSTAR at once: ~+25% on the AMM curve (flat book: +122%).
+    // 40,000 NSTAR at once: ~+32.6% on the upward AMM curve (flat book: +122%).
     sim.flow(40_000.0, 0.0);
     let lifted = sim.book.log - start;
-    assert!(lifted < 0.23, "{lifted}");
+    assert!(lifted > 0.25 && lifted < 0.30, "{lifted}");
     assert_eq!(sim.book.anchor, start, "flow never drags the anchor");
     // No circuit breaker: the next tick publishes the moved price and trading stays open.
     nstar_run(&mut sim, t, 1, 2);
@@ -778,14 +789,14 @@ fn nstar_anchor_trails_slowly_and_big_flow_never_halts() {
     let mut s = sim.clone();
     nstar_run(&mut s, t, 2, 1500);
     let caught = (s.book.anchor - start) / (sim.book.log - start);
-    assert!(caught > 0.05 && caught < 0.8, "{caught}");
+    assert!(caught > 0.05 && caught < 0.85, "{caught}");
 }
 
 #[test]
 fn nstar_mark_lags_spikes_and_liquidations_unwind_gradually() {
     let t = 1800000000000;
     let mut sim = SimFeed::new("NSTAR", 100.0, t);
-    // A +25% spike that is reversed within a second barely moves the mark.
+    // A spike that is reversed within a second barely moves the mark.
     sim.flow(40_000.0, 0.0);
     nstar_run(&mut sim, t, 1, 5);
     sim.flow(-40_000.0, 0.0);
@@ -793,19 +804,19 @@ fn nstar_mark_lags_spikes_and_liquidations_unwind_gradually() {
     let mark = sim.book.mark.exp();
     assert!((mark / 100.0 - 1.0).abs() < 0.01, "{mark}");
     assert!(sim.quote().mark.is_some());
-    // The insurance fund takes its share off-book; the rest is queued, then released
-    // over tens of seconds.
+    // The insurance fund takes 65% of long stopouts off-book; the remaining 35% is queued
+    // and released over tens of seconds.
     let mut sim = SimFeed::new("NSTAR", 100.0, t);
     let before = sim.book.log;
     sim.flow(0.0, -400.0);
     assert_eq!(sim.book.log, before, "nothing hits the book at once");
-    assert_eq!(sim.book.backlog, -400.0 * (1.0 - INSURANCE_SHARE));
+    assert_eq!(sim.book.backlog, -400.0 * (1.0 - INSURANCE_SHARE_LONG));
     nstar_run(&mut sim, t, 1, 2);
     let first = sim.book.backlog;
-    assert!(first < -196.0 && first > -200.0, "{first}");
+    assert!(first < -135.0 && first > -140.0, "{first}");
     nstar_run(&mut sim, t, 2, 51);
     let half = sim.book.backlog;
-    assert!(half < -80.0 && half > -120.0, "{half}");
+    assert!(half < -55.0 && half > -85.0, "{half}");
     nstar_run(&mut sim, t, 51, 600);
     assert!(sim.book.backlog.abs() < 1.0, "{}", sim.book.backlog);
 }
@@ -815,13 +826,13 @@ fn nstar_price_has_no_hard_ceiling_or_floor_and_stays_finite() {
     let t = 1800000000000;
     let mut sim = SimFeed::new("NSTAR", 100.0, t);
     let depth = crate::trading::depth("NSTAR");
-    // The old clamps stopped everything at 800 / 12.5; now only the curve pushes back,
-    // and hard: 2.5M NSTAR of buying (that pinned 800 before) only reaches ~266.
+    // The old clamps stopped everything at 800 / 12.5; now only the curve pushes back:
+    // 2.5M NSTAR of buying reaches ~360 on the lighter upward curve.
     for _ in 0..50 {
         sim.flow(depth, 0.0);
     }
     let lifted = sim.book.log.exp();
-    assert!(lifted > 200.0 && lifted < 320.0, "{lifted}");
+    assert!(lifted > 300.0 && lifted < 420.0, "{lifted}");
     let mut bought = 50.0 * depth;
     while sim.book.log.exp() <= 800.0 && bought < 1e9 {
         sim.flow(10.0 * depth, 0.0);
@@ -829,7 +840,7 @@ fn nstar_price_has_no_hard_ceiling_or_floor_and_stays_finite() {
     }
     let high = sim.book.log.exp();
     assert!(high.is_finite() && high > 800.0, "{high}");
-    assert!(bought > 2e7, "passing 800 took only {bought} NSTAR");
+    assert!(bought > 1e7, "passing 800 took only {bought} NSTAR");
     while sim.book.log.exp() >= 12.5 {
         sim.flow(-10.0 * depth, 0.0);
     }
@@ -868,8 +879,14 @@ fn nstar_day_stays_in_a_sane_range_with_news_and_rumors() {
         }
     }
     assert!(lo > 25.0 && hi < 400.0, "range {lo}..{hi}");
-    assert!(kinds.get("news").copied().unwrap_or(0) >= 3, "{kinds:?}");
-    assert_eq!(kinds.get("news"), kinds.get("rumor"), "{kinds:?}");
+    let news = kinds.get("news").copied().unwrap_or(0);
+    let rumors = kinds.get("rumor").copied().unwrap_or(0);
+    assert!(news >= 8, "{kinds:?}");
+    assert_eq!(
+        rumors,
+        news + usize::from(sim.book.pending.is_some()),
+        "{kinds:?}"
+    );
 }
 
 #[test]
@@ -1624,17 +1641,31 @@ async fn resting_book_sums_player_limit_orders_per_price() {
 fn nstar_one_sweep_has_bounded_conviction_and_splitting_changes_nothing() {
     let t = 1800000000000;
     let fresh = || SimFeed::new("NSTAR", 100.0, t);
-    let ceiling = CONVICTION * CONVICTION_WIDTH * std::f64::consts::FRAC_PI_2;
+    let ceiling_up = CONVICTION_ABOVE * CONVICTION_WIDTH_UP * std::f64::consts::FRAC_PI_2;
+    let ceiling_down = CONVICTION_BELOW * CONVICTION_WIDTH_DOWN * std::f64::consts::FRAC_PI_2;
     let mut whale = fresh();
     whale.flow(200_000.0, 0.0);
     let lifted = whale.book.fair - fresh().book.fair;
-    assert!(lifted > 0.0 && lifted < ceiling, "{lifted} vs {ceiling}");
-    // Small trades near the anchor still convert at the full share.
+    assert!(
+        lifted > 0.0 && lifted < ceiling_up,
+        "{lifted} vs {ceiling_up}"
+    );
+    // One-shot dumps barely dent fair value (<1% ceiling), so raids snap back.
+    let mut dumper = fresh();
+    dumper.flow(-200_000.0, 0.0);
+    let dropped = fresh().book.fair - dumper.book.fair;
+    assert!(
+        dropped > 0.0 && dropped < ceiling_down,
+        "{dropped} vs {ceiling_down}"
+    );
+    assert!(lifted > 6.0 * dropped, "pump {lifted} vs dump {dropped}");
+    // Small trades near the anchor convert at the full directional share.
     let mut small = fresh();
     small.flow(50.0, 0.0);
     let d = small.book.log - fresh().book.log;
-    assert!(((small.book.fair - fresh().book.fair) / d - CONVICTION).abs() < 1e-3);
-    // Inside one tick, split orders and an instant round trip leave fair as one sweep.
+    assert!(((small.book.fair - fresh().book.fair) / d - CONVICTION_ABOVE).abs() < 1e-3);
+    // Inside one tick, split orders and instant round trips leave fair as one sweep,
+    // even when player buying momentum is already elevated.
     let mut split = fresh();
     for _ in 0..20 {
         split.flow(1_000.0, 0.0);
@@ -1644,6 +1675,17 @@ fn nstar_one_sweep_has_bounded_conviction_and_splitting_changes_nothing() {
     assert!((split.book.fair - once.book.fair).abs() < 1e-12);
     once.flow(-20_000.0, 0.0);
     assert!((once.book.fair - fresh().book.fair).abs() < 1e-12);
+
+    let mut hot = fresh();
+    hot.book.momentum = 0.85;
+    let fair_before = hot.book.fair;
+    hot.flow(5_000.0, 0.0);
+    hot.flow(-5_000.0, 0.0);
+    assert!(
+        (hot.book.fair - fair_before).abs() < 1e-12,
+        "wash trade moved fair: {} vs {fair_before}",
+        hot.book.fair
+    );
 }
 
 #[test]
@@ -1679,7 +1721,7 @@ fn nstar_sustained_buying_builds_more_momentum_than_selling() {
         momentum_up > 0.9 && momentum_down < -0.9,
         "{momentum_up} {momentum_down}"
     );
-    assert!(up > 1.3 * -down && down < 0.0, "rally {up} vs dump {down}");
+    assert!(up > 3.0 * -down && down < 0.0, "rally {up} vs dump {down}");
     // One sweep of the same size is a single tick and builds almost no momentum.
     let mut sweep = quiet();
     sweep.flow(20_000.0, 0.0);
@@ -1688,12 +1730,27 @@ fn nstar_sustained_buying_builds_more_momentum_than_selling() {
 }
 
 #[test]
-fn nstar_premium_reverts_slower_than_a_discount_but_noise_stays_unbiased() {
+fn nstar_premium_reverts_slower_than_a_discount_and_funding_taxes_dumps() {
     // Small gaps revert symmetrically; only the part beyond the band is skewed.
     assert_eq!(pull_home(0.01), 0.01);
     assert_eq!(pull_home(-0.01), -0.01);
-    assert!((pull_home(0.10) - (0.02 + REVERT_BELOW * 0.08)).abs() < 1e-12);
-    assert!((pull_home(-0.10) + (0.02 + REVERT_ABOVE * 0.08)).abs() < 1e-12);
+    let excess = 0.10 - REVERT_SYMMETRIC;
+    assert!((pull_home(0.10) - (REVERT_SYMMETRIC + REVERT_BELOW * excess)).abs() < 1e-12);
+    assert!((pull_home(-0.10) + (REVERT_SYMMETRIC + REVERT_ABOVE * excess)).abs() < 1e-12);
+
+    // Funding gives moderate rallies (+1.5%) a grace zone, while taxing -3% dumps heavily.
+    let mut book = Book::new(100.0, 100.0);
+    book.log = book.fair + 0.015;
+    assert_eq!(book.funding_rate(), 0.0);
+    book.log = book.fair + 0.04;
+    let up_rate = book.funding_rate();
+    book.log = book.fair - 0.04;
+    let down_rate = book.funding_rate();
+    assert!(
+        up_rate > 0.0 && -down_rate > 5.0 * up_rate,
+        "{up_rate} vs {down_rate}"
+    );
+
     // Without players the price shows no lasting premium over fair value.
     let mut sum = 0.0;
     let mut n = 0.0;

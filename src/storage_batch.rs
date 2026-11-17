@@ -91,13 +91,18 @@ impl Batch {
 /// Whether a quote for `symbol` can trigger anything on this account. Invalid legacy
 /// exposure still reaches the risk engine for its established error policy.
 pub(super) fn exposed_to(user: &User, symbol: &str) -> bool {
-    if user.account.positions.is_empty() && user.account.orders.is_empty() {
+    let a = &user.account;
+    if a.positions.is_empty() && a.orders.is_empty() {
         return false;
     }
-    let symbols = user
-        .account
-        .symbols()
-        .chain(user.account.orders.iter().map(|o| o.symbol.as_str()));
+    if symbol == symbols::NSTAR
+        && a.positions.iter().all(|p| p.symbol == symbols::NSTAR)
+        && a.orders.iter().all(|o| o.symbol == symbols::NSTAR)
+        && a.spot.keys().all(|s| s == symbols::NSTAR)
+    {
+        return true;
+    }
+    let symbols = a.symbols().chain(a.orders.iter().map(|o| o.symbol.as_str()));
     trading::price_symbols(symbols).map_or(true, |required| required.contains(symbol))
 }
 
@@ -110,15 +115,35 @@ struct Outcome {
 /// Triggers, resting orders and stop-out for one account at `live`. `None` means the
 /// account is unaffected: skipped, unchanged, or an operation that failed and must not
 /// leak a partial candidate or tentative fills.
-fn evaluate(user: &User, live: &Prices, symbol: &str, next_id: u64, now: i64) -> Option<Outcome> {
+fn evaluate(
+    user: &User,
+    live: &Prices,
+    marked: &Prices,
+    symbol: &str,
+    next_id: u64,
+    now: i64,
+) -> Option<Outcome> {
     let account = &user.account;
     if account.positions.is_empty() && account.orders.is_empty() {
         return None;
     }
-    let needed = trading::price_symbols(account.symbols()).ok()?;
-    if (!needed.contains(symbol) && !account.orders.iter().any(|o| o.symbol == symbol))
-        || needed.iter().any(|s| !live.contains_key(s))
-    {
+    let nstar_only = symbol == symbols::NSTAR
+        && account.positions.iter().all(|p| p.symbol == symbols::NSTAR)
+        && account.orders.iter().all(|o| o.symbol == symbols::NSTAR)
+        && account.spot.keys().all(|s| s == symbols::NSTAR);
+    if nstar_only {
+        if !live.contains_key(symbols::NSTAR) {
+            return None;
+        }
+    } else {
+        let needed = trading::price_symbols(account.symbols()).ok()?;
+        if (!needed.contains(symbol) && !account.orders.iter().any(|o| o.symbol == symbol))
+            || needed.iter().any(|s| !live.contains_key(s))
+        {
+            return None;
+        }
+    }
+    if !account.may_trigger_at(live, marked) {
         return None;
     }
     let id = next_id.max(account.next_id);
@@ -170,12 +195,13 @@ pub(super) fn sweep(
 ) -> Result<Batch> {
     let mut start = 0;
     let mut window = users.len();
+    let mut marked = live.marked();
     while start < users.len() {
         let end = (start + window).min(users.len());
         let next_id = batch.next_id;
         let outcomes: Vec<Option<Outcome>> = users[start..end]
             .par_iter()
-            .map(|user| evaluate(user, &live, symbol, next_id, now))
+            .map(|user| evaluate(user, &live, &marked, symbol, next_id, now))
             .collect();
         let mut accepted = end;
         for (offset, outcome) in outcomes.into_iter().enumerate() {
@@ -192,6 +218,7 @@ pub(super) fn sweep(
             batch.stage(before, user, outcome.trades)?;
             if moved || batch.next_id != next_id {
                 live = outcome.after;
+                marked = live.marked();
                 accepted = start + offset + 1;
                 break;
             }
@@ -219,13 +246,15 @@ mod tests {
 
     /// The pre-parallel algorithm: one account after another, each seeing every earlier fill.
     fn sequential(mut batch: Batch, users: &[&User], mut live: Prices, now: i64) -> Batch {
+        let mut marked = live.marked();
         for user in users {
-            match evaluate(user, &live, symbols::NSTAR, batch.next_id, now) {
+            match evaluate(user, &live, &marked, symbols::NSTAR, batch.next_id, now) {
                 Some(outcome) => {
                     let mut next = (*user).clone();
                     next.account = outcome.account;
                     batch.stage(user, next, outcome.trades).unwrap();
                     live = outcome.after;
+                    marked = live.marked();
                 }
                 None => batch.noop_accounts += 1,
             }
@@ -280,6 +309,7 @@ mod tests {
                 symbol: symbols::NSTAR.into(),
                 account,
                 last_trade: None,
+                revision: 1,
             });
         }
         let refs: Vec<&User> = users.iter().collect();

@@ -364,21 +364,32 @@ function msg(t){
 }
 /* 数量滑块: 100% = 服务器按真实保证金/档位/冲击成本算出的最大可开（多空取小）。 */
 const fmtLots=n=>STOCKS.includes(cur.sym)||cur.sym==='NSTAR'&&n>=1?String(+n.toFixed(2)):n.toFixed(2);
-/* NSTAR 预估成交：与后端 amm_shift/amm_avg 同一公式。冲击超过 5% 标红提醒，建议改用限价单。 */
+/* NSTAR 预估成交：与后端非对称 amm_shift_asym/amm_avg_asym 同一公式。冲击超过 5% 标红提醒。 */
 const IMPACT_WARN=.05;
-function ammShift(x0,u,D,W){if(!W)return x0+u/D;const c=x0+x0**3/(3*W*W)+u/D;return 2*W*Math.sinh(Math.asinh(3*c/(2*W))/3)}
+const ammInvSide=(x,W)=>!W?x:x+x**3/(3*W*W);
+const ammInv=(x,wu,wd)=>ammInvSide(x,x>=0?wu:wd);
+function ammSolve(c,W){if(!W)return c;const x=2*W*Math.sinh(Math.asinh(3*c/(2*W))/3),w2=W*W;return x-(x+x**3/(3*w2)-c)/(1+x*x/w2)}
+function ammShift(x0,u,D,W){return ammShiftAsym(x0,u,D,W,W)}
+function ammShiftAsym(x0,u,D,wu,wd){const c=ammInv(x0,wu,wd)+u/D;return ammSolve(c,c>=0?wu:wd)}
 function ammAvg(x0,x1,W){const d=x1-x0,g=Math.abs(d)<1e-12?1:Math.expm1(d)/d;if(!W)return g;const w2=W*W;
  return (g*(1+(x1*x1-2*x1+2)/w2)+(x1+x0-2)/w2)/(1+(x1*x1+x1*x0+x0*x0)/(3*w2))}
-// 预估 NSTAR 吃单均价（不含手续费）；units 为正买负卖。其他币对按当前买卖价。
+function ammAvgAsym(x0,x1,wu,wd){
+ if((x0>=0&&x1>=0)||Math.abs(wu-wd)<1e-15)return ammAvg(x0,x1,wu);
+ if(x0<=0&&x1<=0)return ammAvg(x0,x1,wd);
+ const w0=x0<0?wd:wu,w1=x1<0?wd:wu,di0=-ammInvSide(x0,w0),di1=ammInvSide(x1,w1),tot=di0+di1;
+ return Math.abs(tot)<1e-15?1:(di0*ammAvg(x0,0,w0)+di1*Math.exp(-x0)*ammAvg(0,x1,w1))/tot;
+}
+// 预估 NSTAR 吃单均价（不含现货手续费）；units 为正买负卖。其他币对按当前买卖价。
 function bookFill(units){
  const mid=nstarMid(),m=market;if(!(mid>0)||!m?.depth)return NaN;
- const W=m.amm_width||0,x0=W&&m.anchor>0?Math.log(mid/m.anchor):0;
- return mid*ammAvg(x0,ammShift(x0,units,m.depth,W),W);
+ const wu=m.amm_width||0,wd=m.amm_width_down||wu,x0=(wu||wd)&&m.anchor>0?Math.log(mid/m.anchor):0;
+ return mid*ammAvgAsym(x0,ammShiftAsym(x0,units,m.depth,wu,wd),wu,wd);
 }
 function perpFill(side,lots){
  const c=lastState?.contract??1,u=lots*c*(side==='buy'?1:-1);
  if(cur.sym!=='NSTAR')return side==='buy'?quoteAsk:quoteBid;
- const f=bookFill(u),half=(nstarMid()||0)*.0005/2;return f+(side==='buy'?half:-half);
+ const mid=nstarMid()||0,f=bookFill(u),dump=lastState?.perp_dump_fee??.0012;
+ return f+(side==='buy'?mid*.00025:-mid*(.00025+dump));
 }
 function maxLots(){const s=lastState,m=s?.limits?.max_lots;return m&&s.symbol===cur.sym?m:null}
 function setSlider(el,pct,enabled){
@@ -904,7 +915,8 @@ function renderSpotForm(){
  const px=nstarMid(),n=Number($('spot-units').value),price=Number($('spot-price').value)||0,trigger=Number($('spot-trigger').value)||0;
  const reference=spotType==='market'?NaN:spotType==='limit'?price:(price||trigger);
  const avg=n>0?(Number.isFinite(reference)?reference:bookFill(spotSide==='buy'?n:-n)):NaN,est=Number.isFinite(avg)?avg:px;
- $('spot-total').textContent=Number.isFinite(est)&&n>0?`≈ ${units(est*n*(1+(spotSide==='buy'?1:-1)*(lastState?.spot_fee??.001)),2)} USDT`:'—';
+ const fee=spotSide==='buy'?(lastState?.spot_buy_fee??lastState?.spot_fee??.0003):-(lastState?.spot_sell_fee??lastState?.spot_fee??.0035);
+ $('spot-total').textContent=Number.isFinite(est)&&n>0?`≈ ${units(est*n*(1+fee),2)} USDT`:'—';
  $('spot-avail').textContent=lastState?spotSide==='buy'?`${units(lastState.balance,2)} USDT · 最多 ${units(spotMax(),2)} NSTAR`:`${units(heldNstar())} NSTAR`:'—';
  const max=spotMax();setSlider($('spot-slider'),max>0&&n>0?n/max*100:0,max>0);
  const f=n>0&&spotType==='market'?bookFill(spotSide==='buy'?n:-n):NaN,imp=f/px-1,node=$('spot-fill');
@@ -913,8 +925,8 @@ function renderSpotForm(){
 }
 function spotMax(){
  if(!lastState)return 0;
- const exact=lastState.limits?.spot_max_buy,px=nstarMid(),sign=spotSide==='buy'?1:-1;
- const raw=spotSide==='sell'?heldNstar():Number.isFinite(exact)?exact:Number.isFinite(px)&&px>0?lastState.balance/(px*1.003):0;
+ const exact=lastState.limits?.spot_max_buy,px=nstarMid();
+ const raw=spotSide==='sell'?heldNstar():Number.isFinite(exact)?exact:Number.isFinite(px)&&px>0?lastState.balance/(px*1.002):0;
  return raw;
 }
 function spotPercent(f){
@@ -1010,11 +1022,11 @@ function restingLevels(rows,step,mid,side){
 function renderBook(mid){
  if(!paneVisible('upper','book')){scheduleVisual('book',()=>{if(!paneVisible('upper','book'))return false;renderBook(latestQuote?.price??mid)});return}
  if(!Number.isFinite(mid)){$('book-last').textContent='—';return}
- if(!changed('book',[mid,cur.sym,market?.depth,market?.amm_width,market?.anchor,market?.fair,market?.resting,pricePrecisions.get(cur.sym)]))return;
+ if(!changed('book',[mid,cur.sym,market?.depth,market?.amm_width,market?.amm_width_down,market?.anchor,market?.fair,market?.resting,pricePrecisions.get(cur.sym)]))return;
  const star=cur.sym==='NSTAR',depth=market?.depth||50000,rows=11;
- // 锚价偏离 x 处流动性 = depth·(1+x²/w²)，库存 U(x)=depth·(x+x³/3w²)，与后端 amm_shift 一致。
- const w=market?.amm_width||0,x0=star&&w&&market?.anchor>0?Math.log(mid/market.anchor):0;
- const inv=x=>depth*(x+(w?x**3/(3*w*w):0)),cumAt=p=>Math.abs(inv(x0+Math.log(p/mid))-inv(x0));
+ // 锚价上方 w_up / 下方 w_down 非对称弹性库存曲线，与后端 amm_inv 一致。
+ const wu=market?.amm_width||0,wd=market?.amm_width_down||wu,x0=star&&(wu||wd)&&market?.anchor>0?Math.log(mid/market.anchor):0;
+ const inv=x=>depth*ammInv(x,wu,wd),cumAt=p=>Math.abs(inv(x0+Math.log(p/mid))-inv(x0));
  const step=star?bookStep(mid):Math.max(10**-(pricePrecisions.get(cur.sym)??decimalPlaces(mid)),mid*.0001);
  const levels={ask:[],bid:[]};
  for(const side of ['ask','bid']){
@@ -1078,6 +1090,8 @@ function paintMarket(m){
   setText($('stat-mark'),units(m.mark??quoteLast,4));setText($('stat-fair'),units(m.fair,4));
   setText($('stat-high'),units(m.high_24h,4));setText($('stat-low'),units(m.low_24h,4));
   setText($('stat-vol'),compact(m.volume_24h));setText($('stat-turnover'),compact(m.turnover_24h));
+  const mom=Number(m.momentum)||0,mult=Number(m.conviction_mult)||(1+3.2*Math.max(0,mom)),mn=$('stat-momentum');
+  if(mn){setText(mn,`${mom>=0?'+':''}${Math.round(mom*100)}% · ${mult.toFixed(1)}x`);setClass(mn,mom>=.25?'green':mom<=-.25?'red':'')}
   const f=$('stat-funding');setText(f,`${(m.funding_rate*100).toFixed(4)}%`);setClass(f,m.funding_rate>=0?'green':'red');
  }
  renderTape(m.tape,m.tape_seq);renderBook(latestQuote?.price??quoteLast);
@@ -1086,8 +1100,9 @@ function paintMarket(m){
 }
 function fundingCountdown(){
  if(document.hidden)return;
- const left=3600000-(Date.now()%3600000),node=$('stat-countdown');
- if(node)setText(node,new Date(left).toISOString().slice(11,19));
+ const span=market?.funding_interval_ms||lastState?.funding_interval_ms||900000;
+ const left=span-(Date.now()%span),node=$('stat-countdown');
+ if(node)setText(node,new Date(left).toISOString().slice(14,19));
 }
 async function loadMarket(){
  try{const r=await fetch('/api/market',{signal:AbortSignal.timeout(20000)}),j=await r.json();if(j.ok)renderMarket(j)}catch(_){}

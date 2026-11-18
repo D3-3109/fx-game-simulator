@@ -83,7 +83,9 @@ button:active:not(:disabled){transform:translateY(1px)}
 #nstar-feed:empty{display:none}
 #nstar-feed li{font-size:11px;line-height:1.45;padding:5px 9px;border-radius:5px;background:rgba(18,18,18,.92);border:1px solid var(--line-strong);overflow-wrap:anywhere;animation:feed-in .18s ease-out}
 #nstar-feed li[data-kind='rumor']{color:var(--warn)}
-#nstar-feed li[data-kind='whale']{color:#9ecbff}#nstar-feed time{color:var(--muted);margin-right:6px}
+#nstar-feed li[data-kind='whale']{color:#9ecbff}
+#nstar-feed li[data-kind='squeeze'],#nstar-feed li[data-kind='rally']{color:#45e884;border-color:rgba(37,167,80,.65);background:rgba(12,34,20,.94)}
+#nstar-feed time{color:var(--muted);margin-right:6px}
 @keyframes feed-in{from{opacity:0;transform:translateY(4px)}}
 @media(prefers-reduced-motion:reduce){#nstar-feed li{animation:none}}
 

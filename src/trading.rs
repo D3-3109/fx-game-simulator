@@ -8,10 +8,16 @@ pub const STOPOUT: f64 = 0.5;
 pub const MAX_LEVERAGE: u64 = 10;
 pub const MAX_LOTS: f64 = 100_000.0;
 pub const LOAN_RATE: f64 = 0.10;
-/// Spot taker fee (0.1%, OKX's base tier) and order size bounds in units.
-pub const SPOT_FEE: f64 = 0.001;
+/// Asymmetric spot fees: discounted buy fee rewards accumulation; higher sell fee taxes dumps.
+pub const SPOT_BUY_FEE: f64 = 0.0003;
+pub const SPOT_SELL_FEE: f64 = 0.0035;
+pub const SPOT_FEE: f64 = SPOT_BUY_FEE;
 pub const SPOT_MIN: f64 = 0.0001;
 pub const SPOT_MAX: f64 = 100_000.0;
+/// Extra execution fee on active NSTAR perpetual sell orders (short opens and long exits).
+pub const PERP_DUMP_FEE: f64 = 0.0012;
+/// Funding settles every 15 minutes so sustained discounts quickly penalise crowded shorts.
+pub const FUNDING_INTERVAL_MS: i64 = 15 * 60 * 1000;
 /// Pending limit/stop orders one account may keep.
 pub const MAX_ORDERS: usize = 20;
 /// Slowest the book anchor may be ignored: displacements beyond this many widths are
@@ -186,9 +192,45 @@ pub fn max_order_lots(symbol: &str) -> f64 {
     }
 }
 
-/// Elastic AMM width of a book symbol (0: constant depth).
+/// Elastic AMM width above the anchor of a book symbol (0: constant depth).
 pub fn amm_width(symbol: &str) -> f64 {
     symbols::spec(symbol).map_or(0.0, |s| s.amm_width)
+}
+
+/// Elastic AMM `(width_up, width_down)` of a book symbol.
+pub fn amm_widths(symbol: &str) -> (f64, f64) {
+    symbols::spec(symbol).map_or((0.0, 0.0), |s| {
+        let down = if s.amm_width_down > 0.0 {
+            s.amm_width_down
+        } else {
+            s.amm_width
+        };
+        (s.amm_width, down)
+    })
+}
+
+fn amm_inv_side(x: f64, width: f64) -> f64 {
+    if width <= 0.0 {
+        x
+    } else {
+        x + x.powi(3) / (3.0 * width * width)
+    }
+}
+
+/// Normalised inventory `U(x) / depth` for piecewise-elastic widths `(width_up, width_down)`.
+pub fn amm_inv(x: f64, width_up: f64, width_down: f64) -> f64 {
+    amm_inv_side(x, if x >= 0.0 { width_up } else { width_down })
+}
+
+fn amm_solve(c: f64, width: f64) -> f64 {
+    if width <= 0.0 {
+        return c;
+    }
+    // Unique real root of x³/3w² + x = c (hyperbolic Cardano, no cancellation).
+    let x = 2.0 * width * ((3.0 * c / (2.0 * width)).asinh() / 3.0).sinh();
+    // One Newton step polishes the last ulps.
+    let w2 = width * width;
+    x - (x + x.powi(3) / (3.0 * w2) - c) / (1.0 + x * x / w2)
 }
 
 /// Book inventory curve: liquidity at displacement `x` (log price minus anchor) is
@@ -198,15 +240,15 @@ pub fn amm_width(symbol: &str) -> f64 {
 /// keeps every fill path-independent: split orders cost the same and a round trip lands
 /// back where it started.
 pub fn amm_shift(x0: f64, units: f64, depth: f64, width: f64) -> f64 {
-    if width <= 0.0 {
-        return x0 + units / depth;
-    }
-    let c = (x0 + x0.powi(3) / (3.0 * width * width) + units / depth).clamp(-AMM_MAX_C, AMM_MAX_C);
-    // Unique real root of x³/3w² + x = c (trigonometric/hyperbolic Cardano, no cancellation).
-    let x = 2.0 * width * ((3.0 * c / (2.0 * width)).asinh() / 3.0).sinh();
-    // One Newton step polishes the last ulps.
-    let w2 = width * width;
-    x - (x + x.powi(3) / (3.0 * w2) - c) / (1.0 + x * x / w2)
+    amm_shift_asym(x0, units, depth, width, width)
+}
+
+/// Asymmetric elastic shift: `width_up` applies for `x >= 0` and `width_down` for `x < 0`.
+/// Since `U(0) = 0` and `U` is strictly increasing, the sign of target inventory `c`
+/// uniquely selects the active branch while preserving exact split-order equivalence.
+pub fn amm_shift_asym(x0: f64, units: f64, depth: f64, width_up: f64, width_down: f64) -> f64 {
+    let c = (amm_inv(x0, width_up, width_down) + units / depth).clamp(-AMM_MAX_C, AMM_MAX_C);
+    amm_solve(c, if c >= 0.0 { width_up } else { width_down })
 }
 
 /// Average fill price over mid (the price at `x0`) for moving the book from `x0` to `x1`.
@@ -223,10 +265,31 @@ pub fn amm_avg(x0: f64, x1: f64, width: f64) -> f64 {
     num / den
 }
 
+/// Average fill price over mid across an asymmetric `(width_up, width_down)` curve,
+/// splitting the integral at the anchor (`x = 0`) when a sweep crosses it.
+pub fn amm_avg_asym(x0: f64, x1: f64, width_up: f64, width_down: f64) -> f64 {
+    if (x0 >= 0.0 && x1 >= 0.0) || (width_up - width_down).abs() <= f64::EPSILON {
+        return amm_avg(x0, x1, width_up);
+    }
+    if x0 <= 0.0 && x1 <= 0.0 {
+        return amm_avg(x0, x1, width_down);
+    }
+    let w0 = if x0 < 0.0 { width_down } else { width_up };
+    let w1 = if x1 < 0.0 { width_down } else { width_up };
+    let di0 = -amm_inv_side(x0, w0);
+    let di1 = amm_inv_side(x1, w1);
+    let total = di0 + di1;
+    if total.abs() < 1e-15 {
+        return 1.0;
+    }
+    (di0 * amm_avg(x0, 0.0, w0) + di1 * (-x0).exp() * amm_avg(0.0, x1, w1)) / total
+}
+
 /// Current displacement of a book symbol from its anchor; 0 without an anchor.
 fn displacement(prices: &Prices, symbol: &str, mid: f64) -> f64 {
+    let (w_up, w_down) = amm_widths(symbol);
     match prices.anchor.get(symbol) {
-        Some(a) if a.is_finite() && amm_width(symbol) > 0.0 => mid.ln() - a,
+        Some(a) if a.is_finite() && (w_up > 0.0 || w_down > 0.0) => mid.ln() - a,
         _ => 0.0,
     }
 }
@@ -237,11 +300,11 @@ pub fn book_fill(prices: &Prices, symbol: &str, mid: f64, units: f64) -> Result<
     if depth <= 0.0 {
         return Err("该币种没有模拟盘口".into());
     }
-    let width = amm_width(symbol);
+    let (w_up, w_down) = amm_widths(symbol);
     let x0 = displacement(prices, symbol, mid);
-    let x1 = amm_shift(x0, units, depth, width);
+    let x1 = amm_shift_asym(x0, units, depth, w_up, w_down);
     Ok((
-        finite(mid * amm_avg(x0, x1, width))?,
+        finite(mid * amm_avg_asym(x0, x1, w_up, w_down))?,
         finite(mid * (x1 - x0).exp())?,
     ))
 }
@@ -268,7 +331,8 @@ pub fn apply_fill(prices: &mut Prices, trade: &Trade) -> Result<()> {
     // The curve must stay put for the rest of the operation: pin a missing anchor to the
     // pre-fill mid, or every later fill would re-centre on the moved price and stacked
     // orders could mark themselves up.
-    if amm_width(&trade.symbol) > 0.0 {
+    let (w_up, w_down) = amm_widths(&trade.symbol);
+    if w_up > 0.0 || w_down > 0.0 {
         prices
             .anchor
             .entry(trade.symbol.clone())
@@ -293,28 +357,34 @@ pub fn limit_fillable_lots(prices: &Prices, symbol: &str, buy: bool, limit: f64)
     // the price, so solve for it rather than subtracting today's half spread.
     let pct = symbols::spec(symbol).map_or(0.0, |s| s.pct);
     let target = if pct > 0.0 {
+        let dump = if !buy && symbol == symbols::NSTAR {
+            PERP_DUMP_FEE
+        } else {
+            0.0
+        };
         limit
             / if buy {
                 1.0 + pct / 2.0
             } else {
-                1.0 - pct / 2.0
+                1.0 - pct / 2.0 - dump
             }
     } else {
-        let half = spread(symbol, mid) / 2.0;
-        if buy { limit - half } else { limit + half }
+        let offset = if buy {
+            ask_offset(symbol, mid)
+        } else {
+            bid_offset(symbol, mid)
+        };
+        if buy { limit - offset } else { limit + offset }
     };
     if target <= 0.0 || (buy && target <= mid) || (!buy && target >= mid) {
         return Ok(0.0);
     }
-    let (depth, width) = (depth(symbol), amm_width(symbol));
+    let depth = depth(symbol);
+    let (w_up, w_down) = amm_widths(symbol);
     let x0 = displacement(prices, symbol, mid);
     let x1 = x0 + (target / mid).ln();
-    let cubic = if width > 0.0 {
-        (x1.powi(3) - x0.powi(3)) / (3.0 * width * width)
-    } else {
-        0.0
-    };
-    Ok((depth * (x1 - x0 + cubic)).abs() / contract(symbol))
+    let units = depth * (amm_inv(x1, w_up, w_down) - amm_inv(x0, w_up, w_down));
+    Ok(units.abs() / contract(symbol))
 }
 
 /// Round lots down to what the symbol accepts as an order size.
@@ -327,12 +397,31 @@ fn snap_lots(symbol: &str, lots: f64) -> f64 {
     (lots / step + 1e-9).floor() * step
 }
 
-/// Fill price for trading `lots` of a book symbol, including its spread.
+/// Ask-side spread offset above mid for a simulated/synthetic book.
+pub fn ask_offset(symbol: &str, mid: f64) -> f64 {
+    spread(symbol, mid) / 2.0
+}
+
+/// Bid-side offset below mid, including NSTAR's active perpetual dump fee.
+pub fn bid_offset(symbol: &str, mid: f64) -> f64 {
+    let dump = if symbol == symbols::NSTAR {
+        mid * PERP_DUMP_FEE
+    } else {
+        0.0
+    };
+    spread(symbol, mid) / 2.0 + dump
+}
+
+/// Fill price for trading `lots` of a book symbol, including its spread and dump fee.
 fn book_price(prices: &Prices, symbol: &str, lots: f64, buy: bool) -> Result<f64> {
     let mid = market_price(prices, symbol)?;
     let units = lots * contract(symbol) * if buy { 1.0 } else { -1.0 };
-    let half = spread(symbol, mid) / 2.0;
-    let px = book_fill(prices, symbol, mid, units)?.0 + if buy { half } else { -half };
+    let offset = if buy {
+        ask_offset(symbol, mid)
+    } else {
+        -bid_offset(symbol, mid)
+    };
+    let px = book_fill(prices, symbol, mid, units)?.0 + offset;
     if !px.is_finite() || px <= 0.0 {
         return Err("成交价无效".into());
     }
@@ -356,7 +445,7 @@ pub fn spread(symbol: &str, mid: f64) -> f64 {
     }
 }
 
-/// Source bid/ask when present; keep the original simulated spread for offline/non-FX feeds.
+/// Source bid/ask when present; keep the simulated spread and dump fee for book/synthetic feeds.
 pub fn execution_price(prices: &Prices, symbol: &str, buy: bool) -> Result<f64> {
     let mid = market_price(prices, symbol)?;
     let px = if let Some(&(bid, ask)) = prices.bid_ask.get(symbol) {
@@ -364,12 +453,10 @@ pub fn execution_price(prices: &Prices, symbol: &str, buy: bool) -> Result<f64> 
             return Err("买卖报价无效".into());
         }
         if buy { ask } else { bid }
+    } else if buy {
+        mid + ask_offset(symbol, mid)
     } else {
-        mid + if buy {
-            spread(symbol, mid) / 2.0
-        } else {
-            -spread(symbol, mid) / 2.0
-        }
+        mid - bid_offset(symbol, mid)
     };
     if !px.is_finite() || px <= 0.0 {
         return Err("成交价无效".into());
@@ -925,13 +1012,13 @@ impl Account {
         let mut total = 0.0;
         for (symbol, h) in self.spot.iter().filter(|(_, h)| h.units > 0.0) {
             let mid = market_price(prices, symbol)?;
-            let px = book_fill(prices, symbol, mid, -h.units)?.0 * (1.0 - SPOT_FEE);
+            let px = book_fill(prices, symbol, mid, -h.units)?.0 * (1.0 - SPOT_SELL_FEE);
             total += px * h.units;
         }
         finite(total)
     }
     /// Buy (`units > 0`) or sell spot units of a book symbol at its swept price, paying
-    /// the spot fee. Spot is fully paid: cash must cover the buy, units must cover the sale.
+    /// the asymmetric spot fee. Spot is fully paid: cash covers buys, units cover sales.
     pub fn spot(&mut self, symbol: &str, units: f64, prices: &Prices, now: i64) -> Result<Trade> {
         let depth = depth(symbol);
         if depth <= 0.0 {
@@ -952,7 +1039,7 @@ impl Account {
         let (avg, _) = book_fill(prices, symbol, mid, units)?;
         let holding = self.spot.entry(symbol.into()).or_default();
         let (side, pnl) = if units > 0.0 {
-            let cost = finite(avg * units * (1.0 + SPOT_FEE))?;
+            let cost = finite(avg * units * (1.0 + SPOT_BUY_FEE))?;
             // Cash only: borrowed balance can fund spot, open-position margin cannot.
             if cost > self.balance {
                 return Err(format!(
@@ -969,7 +1056,7 @@ impl Account {
             if sell > holding.units + 1e-9 {
                 return Err(format!("{symbol} 可用余额不足: 持有 {:.4}", holding.units));
             }
-            let proceeds = finite(avg * sell * (1.0 - SPOT_FEE))?;
+            let proceeds = finite(avg * sell * (1.0 - SPOT_SELL_FEE))?;
             let pnl = proceeds - holding.cost * sell;
             self.balance += proceeds;
             holding.units -= sell;
@@ -1242,6 +1329,56 @@ impl Account {
         *self = next;
         Ok(trades)
     }
+    /// Zero-allocation precheck for `risk_batch`: returns false only when no trigger,
+    /// resting order, or stop-out could fire at `live` / `marked`.
+    pub fn may_trigger_at(&self, live: &Prices, marked: &Prices) -> bool {
+        for p in &self.positions {
+            if p.tp <= 0.0 && p.sl <= 0.0 {
+                continue;
+            }
+            let Some(mid) = live.get(&p.symbol).copied() else {
+                continue;
+            };
+            let long = p.side == "long";
+            let tp_hit = p.tp > 0.0 && if long { mid >= p.tp } else { mid <= p.tp };
+            let sl_hit = p.sl > 0.0 && if long { mid <= p.sl } else { mid >= p.sl };
+            if tp_hit || sl_hit {
+                return true;
+            }
+        }
+
+        for o in &self.orders {
+            let Ok(mid) = market_price(live, &o.symbol) else {
+                continue;
+            };
+            let long = matches!(o.side.as_str(), "long" | "buy");
+            if o.kind == "stop" {
+                let crossed = if long { mid >= o.price } else { mid <= o.price };
+                if crossed {
+                    return true;
+                }
+                continue;
+            }
+            let Ok(px) = execution_price(live, &o.symbol, long) else {
+                return true;
+            };
+            let marketable = if long { px <= o.price } else { px >= o.price };
+            if marketable {
+                return true;
+            }
+        }
+
+        if self.positions.is_empty() {
+            return false;
+        }
+
+        match self.margin_level(marked) {
+            Ok(Some(ml)) => ml < STOPOUT,
+            Ok(None) => false,
+            Err(_) => true,
+        }
+    }
+
     /// Close every position whose take-profit or stop-loss the mid has crossed.
     pub fn check_triggers(&mut self, prices: &Prices, now: i64) -> Result<Vec<Trade>> {
         let hit: Vec<(u64, &'static str)> = self
@@ -1259,6 +1396,9 @@ impl Account {
                 }
             })
             .collect();
+        if hit.is_empty() {
+            return Ok(vec![]);
+        }
         let mut next = self.clone();
         let mut prices = prices.clone();
         let mut trades = Vec::new();
@@ -1269,24 +1409,164 @@ impl Account {
         *self = next;
         Ok(trades)
     }
+
     /// Largest order in lots this account could open now (0 if none), found by bisection
-    /// on the real `open` checks so margin, tiers, impact and caps all count.
+    /// on a reusable scratch candidate so margin, tiers, impact and caps match `open`
+    /// without cloning the account on every step.
     pub fn max_open_lots(&self, side: &str, symbol: &str, prices: &Prices) -> f64 {
-        let whole = symbols::spec(symbol).is_some_and(|s| s.whole_lots);
-        let min = symbols::spec(symbol).map_or(0.01, |s| s.min_lots);
-        let step = if whole { 1.0 } else { 0.01 };
-        let ok = |lots: f64| {
-            self.clone()
-                .open(side, lots, symbol, prices, u64::MAX - 1, 0)
-                .is_ok()
+        if !matches!(side, "long" | "short") || self.validate().is_err() {
+            return 0.0;
+        }
+        let (Ok(rate), Ok(eq), Ok(used)) = (
+            usd_rate(prices, symbol),
+            self.equity(prices),
+            self.used_margin(prices),
+        ) else {
+            return 0.0;
         };
-        largest(min, max_order_lots(symbol), step, ok)
+        let free = eq - used;
+        if !free.is_finite() || free <= 0.0 {
+            return 0.0;
+        }
+
+        let spec = symbols::spec(symbol);
+        let whole = spec.is_some_and(|s| s.whole_lots);
+        let min = spec.map_or(0.01, |s| s.min_lots);
+        let step = if whole { 1.0 } else { 0.01 };
+        let cap = spec.map_or(0.0, |s| s.max_open_lots);
+        let held_lots: f64 = if cap > 0.0 {
+            self.positions
+                .iter()
+                .filter(|p| p.symbol == symbol)
+                .map(|p| p.lots)
+                .sum()
+        } else {
+            0.0
+        };
+        let max_cap = if cap > 0.0 {
+            (cap - held_lots).min(max_order_lots(symbol))
+        } else {
+            max_order_lots(symbol)
+        };
+        if max_cap < min {
+            return 0.0;
+        }
+
+        let unit = contract(symbol);
+        let has_tiers = !leverage_tiers(symbol).is_empty();
+        let held_gross = if has_tiers {
+            self.gross_units(symbol)
+        } else {
+            0.0
+        };
+        let base_tier_margin = if has_tiers {
+            tiered_margin_units(symbol, held_gross, self.leverage)
+        } else {
+            0.0
+        };
+        let eff_lev = leverage_for(symbol, self.leverage) as f64;
+        let has_depth = depth(symbol) > 0.0;
+        let buy = side == "long";
+        if !has_depth {
+            let mut ok = |lots: f64| {
+                if !lots_valid(symbol, lots) {
+                    return false;
+                }
+                let Ok(px) = execution_price(prices, symbol, buy) else {
+                    return false;
+                };
+                let raw_need = if !has_tiers {
+                    lots * unit * px * rate / eff_lev
+                } else {
+                    let added =
+                        tiered_margin_units(symbol, held_gross + lots * unit, self.leverage);
+                    (added - base_tier_margin) * px * rate
+                };
+                finite(raw_need).is_ok_and(|need| need <= free)
+            };
+            return largest(min, max_cap, step, &mut ok);
+        }
+
+        let Ok(mid) = market_price(prices, symbol) else {
+            return 0.0;
+        };
+        let mut trial = Account {
+            orders: Vec::new(),
+            ..self.clone()
+        };
+        let mut after = prices.clone();
+        let (w_up, w_down) = amm_widths(symbol);
+        if w_up > 0.0 || w_down > 0.0 {
+            after.anchor.entry(symbol.to_owned()).or_insert(mid.ln());
+        }
+        let mut scratch = Some(Position {
+            id: u64::MAX - 1,
+            side: side.into(),
+            lots: 0.0,
+            entry: 0.0,
+            symbol: symbol.into(),
+            tp: 0.0,
+            sl: 0.0,
+        });
+        let mut ok = |lots: f64| -> bool {
+            if !lots_valid(symbol, lots) {
+                return false;
+            }
+            let Ok(px) = book_price(prices, symbol, lots, buy) else {
+                return false;
+            };
+            let units = lots * unit;
+            let raw_need = if !has_tiers {
+                units * px * rate / eff_lev
+            } else {
+                let added = tiered_margin_units(symbol, held_gross + units, self.leverage);
+                (added - base_tier_margin) * px * rate
+            };
+            if !finite(raw_need).is_ok_and(|need| need <= free) {
+                return false;
+            }
+            let signed = if buy { units } else { -units };
+            let Ok((_, moved)) = book_fill(&after, symbol, mid, signed) else {
+                return false;
+            };
+            *after.mid.get_mut(symbol).unwrap() = moved;
+            let mut pos = scratch.take().unwrap();
+            pos.lots = lots;
+            pos.entry = px;
+            trial.positions.push(pos);
+            let survived = match (trial.equity(&after), trial.used_margin(&after)) {
+                (Ok(e), Ok(u)) => e - u >= 0.0,
+                _ => false,
+            };
+            scratch = trial.positions.pop();
+            *after.mid.get_mut(symbol).unwrap() = mid;
+            survived
+        };
+        largest(min, max_cap, step, &mut ok)
     }
+
     /// Largest spot buy in units this account could make now (0 if none).
     pub fn max_spot_buy(&self, symbol: &str, prices: &Prices) -> f64 {
-        let ok = |units: f64| self.clone().spot(symbol, units, prices, 0).is_ok();
-        largest(SPOT_MIN, SPOT_MAX, SPOT_MIN, ok)
+        if depth(symbol) <= 0.0 || self.balance <= 0.0 || self.validate().is_err() {
+            return 0.0;
+        }
+        let Ok(mid) = market_price(prices, symbol) else {
+            return 0.0;
+        };
+        let cap = symbols::spec(symbol).map_or(0.0, |s| s.max_spot_units);
+        let held = self.spot.get(symbol).map_or(0.0, |h| h.units);
+        let mut ok = |units: f64| {
+            if !(SPOT_MIN..=SPOT_MAX).contains(&units) || (cap > 0.0 && held + units > cap + 1e-9) {
+                return false;
+            }
+            let Ok((avg, _)) = book_fill(prices, symbol, mid, units) else {
+                return false;
+            };
+            finite(avg * units * (1.0 + SPOT_BUY_FEE)).is_ok_and(|cost| cost <= self.balance)
+        };
+        largest(SPOT_MIN, SPOT_MAX, SPOT_MIN, &mut ok)
     }
+
     /// Mid at which the account would hit stop-out if only this symbol moved, holding
     /// everything else fixed; None when no move in range would liquidate it.
     pub fn liquidation_price(&self, symbol: &str, prices: &Prices) -> Result<Option<f64>> {
@@ -1294,9 +1574,10 @@ impl Account {
             return Ok(None);
         }
         let mid = market_price(prices, symbol)?;
-        let at = |px: f64| -> Result<bool> {
-            let mut q = prices.clone();
-            q.insert(symbol.into(), px);
+        let mut q = prices.clone();
+        q.insert(symbol.into(), mid);
+        let mut at = |px: f64| -> Result<bool> {
+            *q.mid.get_mut(symbol).unwrap() = px;
             Ok(self.margin_level(&q)?.is_some_and(|ml| ml < STOPOUT))
         };
         if at(mid)? {
@@ -1321,15 +1602,15 @@ impl Account {
         }
         Ok(found)
     }
-    /// Settle hourly funding on book-symbol positions: longs pay shorts when the price is
-    /// above fair value and vice versa. `rates` holds the per-hour rate for each symbol.
+
+    /// Settle 15-minute funding on book-symbol positions: longs pay shorts when price exceeds
+    /// fair value beyond the rally grace band, and shorts pay punitive funding on discounts.
     pub fn settle_funding(
         &mut self,
         rates: &BTreeMap<String, f64>,
         prices: &Prices,
         now: i64,
     ) -> Result<Vec<Trade>> {
-        const HOUR: i64 = 3_600_000;
         let held = self.positions.iter().any(|p| rates.contains_key(&p.symbol));
         if !held {
             self.funding_at = now;
@@ -1338,11 +1619,11 @@ impl Account {
         if self.funding_at == 0 {
             self.funding_at = now;
         }
-        let hours = ((now - self.funding_at) / HOUR).min(24);
-        if hours <= 0 {
+        let periods = ((now - self.funding_at) / FUNDING_INTERVAL_MS).min(96);
+        if periods <= 0 {
             return Ok(vec![]);
         }
-        self.funding_at += hours * HOUR;
+        self.funding_at += periods * FUNDING_INTERVAL_MS;
         let mut trades = Vec::new();
         for p in self.positions.clone() {
             let Some(rate) = rates.get(&p.symbol) else {
@@ -1350,7 +1631,7 @@ impl Account {
             };
             let notional = p.lots * contract(&p.symbol) * market_price(prices, &p.symbol)?;
             let sign = if p.side == "long" { -1.0 } else { 1.0 };
-            let fee = finite(cents(sign * rate * notional * hours as f64))?;
+            let fee = finite(cents(sign * rate * notional * periods as f64))?;
             if fee == 0.0 {
                 continue;
             }
@@ -1405,7 +1686,7 @@ impl Account {
 /// Largest multiple of `step` in `[min, max]` accepted by a monotone check; 0 if none.
 /// Bisects over whole steps, so the answer is exact in about log2((max - min) / step)
 /// checks: 32 for a 10,000,000-lot order range at 0.01 lots.
-fn largest(min: f64, max: f64, step: f64, ok: impl Fn(f64) -> bool) -> f64 {
+fn largest(min: f64, max: f64, step: f64, mut ok: impl FnMut(f64) -> bool) -> f64 {
     if !ok(min) {
         return 0.0;
     }
@@ -1881,20 +2162,50 @@ mod tests {
         assert!((amm_avg(0.2, 0.2, w) - 1.0).abs() < 1e-12);
     }
     #[test]
-    fn amm_curve_damps_big_pushes_but_not_small_trades() {
+    fn amm_curve_damps_big_pushes_and_favours_rallies_over_dumps() {
         let q = quotes(&[("NSTAR", 100.0)]);
         let lift = |units: f64| book_fill(&q, "NSTAR", 100.0, units).unwrap().1 / 100.0 - 1.0;
-        // 1,000 NSTAR: ~2%, same as the flat book.
+        // 1,000 NSTAR: ~2%, close to the flat book near the anchor.
         assert!((lift(1_000.0) - 0.02).abs() < 0.001, "{}", lift(1_000.0));
-        // 20,000 NSTAR: ~18% (flat book +49%); 100,000: ~37% (flat book 7x).
-        assert!(lift(20_000.0) < 0.19, "{}", lift(20_000.0));
-        assert!(lift(100_000.0) < 0.38, "{}", lift(100_000.0));
-        assert!(lift(-100_000.0) > -0.28, "{}", lift(-100_000.0));
-        // Already pushed 20% above the anchor, the next 1,000 NSTAR barely moves it.
+        // Asymmetric widths: 20,000 NSTAR lifts ~22.6% vs -12.6% down; 100,000 lifts ~50.6%
+        // vs -22.2% down (flat book: +49% and 7x).
+        let up20 = lift(20_000.0);
+        let up100 = lift(100_000.0);
+        let down20 = lift(-20_000.0);
+        assert!(up20 > 0.20 && up20 < 0.25, "{up20}");
+        assert!(up100 > 0.45 && up100 < 0.55, "{up100}");
+        assert!(down20 > -0.15 && down20 < -0.10, "{down20}");
+        assert!(lift(-100_000.0) > -0.25, "{}", lift(-100_000.0));
+        assert!(up20 > 1.6 * -down20);
+        // Sweeping across the anchor (x0 < 0 < x1 and x0 > 0 > x1) matches numerical quadrature.
+        let depth = depth("NSTAR");
+        let (wu, wd) = amm_widths("NSTAR");
+        for (x0, units) in [(-0.15, 35_000.0), (0.20, -45_000.0)] {
+            let x1 = amm_shift_asym(x0, units, depth, wu, wd);
+            let got = amm_avg_asym(x0, x1, wu, wd);
+            let quad = |a: f64, b: f64, w: f64| {
+                let n = 2_000;
+                let h = (b - a) / n as f64;
+                let f = |x: f64| (x - x0).exp() * (1.0 + x * x / (w * w));
+                let mut s = f(a) + f(b);
+                for i in 1..n {
+                    s += f(a + i as f64 * h) * if i % 2 == 1 { 4.0 } else { 2.0 };
+                }
+                s * h / 3.0 * depth
+            };
+            let w0 = if x0 < 0.0 { wd } else { wu };
+            let w1 = if x1 < 0.0 { wd } else { wu };
+            let expected = (quad(x0, 0.0, w0) + quad(0.0, x1, w1)) / units;
+            assert!(
+                (got - expected).abs() < 1e-9 * expected,
+                "{got} vs {expected}"
+            );
+        }
+        // Already pushed 20% above the anchor, the next 1,000 NSTAR is damped >3x vs flat book.
         let mut far = q.clone();
         far.anchor.insert("NSTAR".into(), (100.0f64 / 1.2).ln());
         let next = book_fill(&far, "NSTAR", 100.0, 1_000.0).unwrap().1 / 100.0 - 1.0;
-        assert!(next < 0.005, "{next}");
+        assert!(next < 0.007, "{next}");
     }
     #[test]
     fn amm_fills_stay_path_independent_off_anchor() {
@@ -2223,11 +2534,11 @@ mod exchange_tests {
         assert_eq!((t.kind.as_str(), t.side.as_str()), ("spot", "buy"));
         assert!(t.price > 100.0, "buy sweeps up: {}", t.price);
         let cost = 10_000.0 - a.balance;
-        assert!((cost - t.price * 10.0 * 1.001).abs() < 1e-6);
+        assert!((cost - t.price * 10.0 * (1.0 + SPOT_BUY_FEE)).abs() < 1e-6);
         let h = &a.spot["NSTAR"];
         assert!((h.cost - cost / 10.0).abs() < 1e-9);
         let eq = a.equity(&q(100.0)).unwrap();
-        assert!(eq < 10_000.0 && eq > 9_990.0, "{eq}");
+        assert!(eq < 10_000.0 && eq > 9_950.0, "{eq}");
         assert!(a.spot("NSTAR", -10.5, &q(100.0), 2).is_err(), "oversell");
         assert!(a.spot("NSTAR", 1_000.0, &q(100.0), 2).is_err(), "cash only");
         let t = a.spot("NSTAR", -10.0, &q(120.0), 3).unwrap();
@@ -2386,7 +2697,7 @@ mod exchange_tests {
         );
     }
     #[test]
-    fn funding_moves_cash_from_crowded_side_hourly() {
+    fn funding_moves_cash_from_crowded_side_every_fifteen_minutes() {
         let rates: BTreeMap<String, f64> = [("NSTAR".to_string(), 0.0005)].into();
         let mut a = Account::default();
         a.open("long", 10_000.0, "NSTAR", &q(100.0), 1, 0).unwrap();
@@ -2395,24 +2706,44 @@ mod exchange_tests {
                 .unwrap()
                 .is_empty()
         );
-        let hour = 3_600_000;
+        let period = FUNDING_INTERVAL_MS;
         let t = a
-            .settle_funding(&rates, &q(100.0), 1_000 + 2 * hour + 5)
+            .settle_funding(&rates, &q(100.0), 1_000 + 2 * period + 5)
             .unwrap();
-        // 100 NSTAR * $100 * 0.05% * 2 h = $10 paid by the long.
+        // 100 NSTAR * $100 * 0.05% * 2 periods = $10 paid by the long.
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].kind, "funding");
         assert!((t[0].pnl.unwrap() + 10.0).abs() < 1e-9);
         assert!(
-            a.settle_funding(&rates, &q(100.0), 1_000 + 2 * hour + 9)
+            a.settle_funding(&rates, &q(100.0), 1_000 + 2 * period + 9)
                 .unwrap()
                 .is_empty()
         );
         let mut s = Account::default();
         s.open("short", 10_000.0, "NSTAR", &q(100.0), 1, 0).unwrap();
         s.settle_funding(&rates, &q(100.0), 7).unwrap();
-        let t = s.settle_funding(&rates, &q(100.0), 7 + hour).unwrap();
+        let t = s.settle_funding(&rates, &q(100.0), 7 + period).unwrap();
         assert!((t[0].pnl.unwrap() - 5.0).abs() < 1e-9);
+    }
+    #[test]
+    fn asymmetric_dump_fees_and_risk_precheck_match_execution() {
+        let live = q(100.0);
+        let ask = execution_price(&live, "NSTAR", true).unwrap();
+        let bid = execution_price(&live, "NSTAR", false).unwrap();
+        let expected_offset = 100.0 * (0.00025 + PERP_DUMP_FEE);
+        assert!((ask - 100.025).abs() < 1e-9, "{ask}");
+        assert!((100.0 - bid - expected_offset).abs() < 1e-9, "{bid}");
+
+        let mut calm = Account::default();
+        calm.open("long", 1_000.0, "NSTAR", &live, 1, 0).unwrap();
+        calm.set_triggers(1, 110.0, 92.0, &live).unwrap();
+        calm.place_order(
+            "limit", "long", 500.0, "NSTAR", 95.0, 0.0, 0.0, 0.0, &live, 0,
+        )
+        .unwrap();
+        assert!(!calm.may_trigger_at(&live, &live.marked()));
+        assert!(calm.may_trigger_at(&q(110.5), &q(110.5)));
+        assert!(calm.may_trigger_at(&q(94.9), &q(94.9)));
     }
     #[test]
     fn legacy_account_json_without_new_fields_still_loads() {

@@ -713,7 +713,6 @@ async fn serve_ws(
     let mut view = View::default();
     let mut display = Display::default();
     let mut last_state: Arc<str> = Arc::from("");
-    let mut last_account = String::new();
     let mut state_sequence = 0;
     let mut account_revision = 0;
     let mut account_at = tokio::time::Instant::now() - Duration::from_secs(2);
@@ -773,13 +772,8 @@ async fn serve_ws(
                 if account_at.elapsed() >= Duration::from_secs(1) {
                     account_at = tokio::time::Instant::now();
                     if app.store.authenticate(&token).await.ok().flatten().as_deref() != Some(&name) { break; }
-                    let revision = app.store.revision();
-                    let mut account_changed = false;
-                    if revision != account_revision && let Ok(user) = app.store.user(&name).await {
-                        let key = json!([user.account,user.symbol,user.last_trade]).to_string();
-                        account_changed = key != last_account;
-                        last_account = key;
-                    }
+                    let user_rev = app.store.user_revision(&name).unwrap_or(0);
+                    let account_changed = account_revision != 0 && user_rev != account_revision;
                     if (!view.hidden || account_changed || force_state)
                         && let Ok(packet) = app.state_packet(&name).await {
                         if force_state || packet.key != last_state {
@@ -790,7 +784,7 @@ async fn serve_ws(
                         }
                         force_state = false;
                     }
-                    account_revision = revision;
+                    account_revision = user_rev;
                 }
                 if !view.hidden && quote_at.elapsed() >= Duration::from_millis(if view.low_power { 1000 } else { 200 }) {
                     quote_at = tokio::time::Instant::now();

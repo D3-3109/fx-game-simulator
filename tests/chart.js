@@ -963,6 +963,11 @@ const candle = price => {
   // Spacing does not flip as the price hovers around 100, but follows a doubled price.
   run('bookGrid=null');assert.equal(run('bookStep(99.5)'),.05);assert.equal(run('bookStep(100.9)'),.05);
   assert.equal(run('bookStep(99.5)'),.05);assert.equal(run('bookStep(205)'),.2);
+  // Asymmetric AMM & momentum indicator: deeper downward bid wall and pump heat display.
+  run("market={depth:50000,amm_width:.12,amm_width_down:.055,anchor:100,fair:100,mark:100,high_24h:105,low_24h:96,volume_24h:1200,turnover_24h:120000,funding_rate:-.003,funding_interval_ms:900000,momentum:.5,conviction_mult:2.6,tape:[],resting:{bids:[],asks:[]}};quoteLast=100;paintMarket(market)");
+  assert.equal(elements['stat-momentum'].textContent,'+50% · 2.6x');
+  assert.equal(elements['stat-momentum'].className,'green');
+  assert.ok(run('bookFill(20000)-100 > 1.5*(100-bookFill(-20000))'),'asymmetric AMM must favour upward rallies');
   run("market=null");
   console.log('PASS: legacy OHLC/history/safety/trading guards; 50 ticks zero setData; bounded bars; DOM/price-line/book/chat reuse; hidden WS zero DOM; rAF/2Hz/view commands; Top50/personal rank/pagination; init singleflight/abort/parallel K; local v5/SRI fallback; prev_close; expiry/heartbeat/backoff');
 })().catch(error => { console.error(error); process.exitCode = 1; });

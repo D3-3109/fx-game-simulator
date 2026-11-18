@@ -155,27 +155,33 @@ impl App {
         let _ = self.events.send(Event::Shutdown);
         let _ = self.controls.send(Event::Shutdown);
     }
-    pub fn broadcast(&self, message: Value) {
+    pub fn broadcast(&self, mut message: Value) {
         let symbol: Option<Arc<str>> = (message.get("type").is_none())
             .then(|| message["sym"].as_str().map(Arc::from))
             .flatten();
-        let text: Arc<str> = message.to_string().into();
-        if let Some(symbol) = &symbol {
+        if let Some(symbol) = symbol {
             let mut intervals = BTreeMap::new();
-            if let Some(bars) = message["klines"].as_object() {
-                // Serialize once per shared tick/interval, never parse or recode at each socket.
-                let mut variant = message.clone();
-                variant["klines"] = json!({});
-                for (interval, _) in symbols::INTERVALS {
-                    if let Some(rows) = bars.get(*interval) {
-                        variant["klines"] = json!({*interval:rows});
-                        intervals.insert((*interval).to_owned(), Arc::from(variant.to_string()));
+            let text: Arc<str> = if let Some(klines) =
+                message.as_object_mut().and_then(|map| map.remove("klines"))
+            {
+                // Serialize shared quote + market panel once instead of nine times per tick.
+                let base = message.to_string();
+                let prefix = &base[..base.len() - 1];
+                if let Some(bars) = klines.as_object() {
+                    for (interval, _) in symbols::INTERVALS {
+                        if let Some(rows) = bars.get(*interval) {
+                            let sliced = format!("{prefix},\"klines\":{{\"{interval}\":{rows}}}}}");
+                            intervals.insert((*interval).to_owned(), Arc::from(sliced));
+                        }
                     }
                 }
-            }
+                Arc::from(format!("{prefix},\"klines\":{klines}}}"))
+            } else {
+                message.to_string().into()
+            };
             let mut quotes = self.quotes.lock().unwrap();
             // Only known market symbols enter this bounded latest-value map.
-            if symbols::all().contains(&symbol.as_ref()) {
+            if symbols::spec(&symbol).is_some() {
                 quotes.insert(
                     symbol.to_string(),
                     QuotePacket {
@@ -185,10 +191,14 @@ impl App {
                     },
                 );
             }
-        } else if message["type"] != "lb" {
+            let _ = self.events.send(Event::Message(text, Some(symbol)));
+            return;
+        }
+        let text: Arc<str> = message.to_string().into();
+        if message["type"] != "lb" {
             let _ = self.controls.send(Event::Message(text.clone(), None));
         }
-        let _ = self.events.send(Event::Message(text, symbol));
+        let _ = self.events.send(Event::Message(text, None));
     }
     pub(crate) fn control_events(&self) -> broadcast::Receiver<Event> {
         self.controls.subscribe()
@@ -413,7 +423,7 @@ impl App {
             let mid = trading::market_price(&prices, symbol)?;
             let value = trading::book_fill(&prices, symbol, mid, -h.units)?.0
                 * h.units
-                * (1.0 - trading::SPOT_FEE);
+                * (1.0 - trading::SPOT_SELL_FEE);
             spot.push(
                 json!({"sym":symbol,"units":h.units,"cost":h.cost,"price":mid,
                 "value":value,"pnl":value-h.cost*h.units}),
@@ -464,7 +474,7 @@ impl App {
             "max_leverage": trading::MAX_LEVERAGE,
         });
         Ok(
-            json!({"ok":true,"type":"state","name":name,"symbol":user.symbol,"price":prices[&user.symbol],"bid":bid,"ask":ask,"quote_valid":quote_valid,"quote_at":if self.market.is_offline(){None}else{Some(quote.at)},"balance":acc.balance,"loan":acc.loan,"debt":acc.debt(),"debt_since":acc.debt_since,"debt_limit":trading::DEBT_LIMIT,"equity":equity,"used":used,"free":equity-used,"margin_level":if used==0.0 {None} else {Some(equity/used)},"leverage":acc.leverage,"positions":positions,"spot":spot,"nstar_price":nstar,"spot_fee":trading::SPOT_FEE,"contract":trading::contract(&user.symbol),"symbol_leverage":trading::leverage_for(&user.symbol,acc.leverage),"funding_at":acc.funding_at,"stopout_level":trading::STOPOUT,"currency":"USD","last_trade":user.last_trade,"limits":limits,"mark":prices.mark.get(&user.symbol),"orders":acc.orders}),
+            json!({"ok":true,"type":"state","name":name,"symbol":user.symbol,"price":prices[&user.symbol],"bid":bid,"ask":ask,"quote_valid":quote_valid,"quote_at":if self.market.is_offline(){None}else{Some(quote.at)},"balance":acc.balance,"loan":acc.loan,"debt":acc.debt(),"debt_since":acc.debt_since,"debt_limit":trading::DEBT_LIMIT,"equity":equity,"used":used,"free":equity-used,"margin_level":if used==0.0 {None} else {Some(equity/used)},"leverage":acc.leverage,"positions":positions,"spot":spot,"nstar_price":nstar,"spot_fee":trading::SPOT_BUY_FEE,"spot_buy_fee":trading::SPOT_BUY_FEE,"spot_sell_fee":trading::SPOT_SELL_FEE,"perp_dump_fee":trading::PERP_DUMP_FEE,"funding_interval_ms":trading::FUNDING_INTERVAL_MS,"contract":trading::contract(&user.symbol),"symbol_leverage":trading::leverage_for(&user.symbol,acc.leverage),"funding_at":acc.funding_at,"stopout_level":trading::STOPOUT,"currency":"USD","last_trade":user.last_trade,"limits":limits,"mark":prices.mark.get(&user.symbol),"orders":acc.orders}),
         )
     }
     /// Default public Top50. HTTP reads do not sample, refresh a warm cache, or write SQL.

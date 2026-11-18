@@ -353,14 +353,36 @@ async fn execute(
 fn publish(shared: &Shared, publication: Publication) {
     let mut cache = shared.cache.write().unwrap();
     let mut aliases = shared.aliases.lock().unwrap();
+    if !publication.deleted.is_empty() {
+        cache.orders_revision = cache.orders_revision.wrapping_add(1);
+    }
     for name in publication.deleted {
         cache.users.remove(&name);
         cache.tokens.retain(|_, owner| owner != &name);
         cache.deposits.remove(&name);
         aliases.retain(|_, owner| owner != &name);
     }
-    for user in publication.users {
+    let mut orders_changed = false;
+    for mut user in publication.users {
+        let next_rev = match cache.users.get(&user.name) {
+            Some(old) => {
+                if old.account.orders != user.account.orders {
+                    orders_changed = true;
+                }
+                old.revision.wrapping_add(1)
+            }
+            None => {
+                if !user.account.orders.is_empty() {
+                    orders_changed = true;
+                }
+                1
+            }
+        };
+        user.revision = next_rev;
         cache.users.insert(user.name.clone(), user);
+    }
+    if orders_changed {
+        cache.orders_revision = cache.orders_revision.wrapping_add(1);
     }
     for (token, name) in publication.aliases {
         cache.tokens.remove(&token);
